@@ -60,7 +60,7 @@ AllTypingClasses = tuple(filter(inspect.isclass,
                                 (getattr(typing, t) for t in typing.__all__)))
 
 
-class ResolutionFailed(TypeError, InvalidArgument):
+class ResolutionFailed(InvalidArgument):
     """Raised when a type cannot be resolved to a strategy."""
     pass
 
@@ -100,10 +100,8 @@ def resolve(thing: typing.Any, lookup: StratLookup=None) -> st.SearchStrategy:
         lookup = type_strategy_mapping(lookup)
         if thing in lookup:
             return lookup[thing]
-        strat = st.one_of([v for k, v in lookup.items()
-                           if inspect.isclass(k) and issubclass(k, thing)])
-        if not strat.is_empty:
-            return strat
+        return st.one_of([v for k, v in lookup.items()
+                          if inspect.isclass(k) and issubclass(k, thing)])
     raise ResolutionFailed('Could not find strategy for type %r' % thing)
 
 
@@ -125,14 +123,11 @@ def type_strategy_mapping(lookup: StratLookup=None) -> StratLookup:
         decimal.Decimal: st.decimals(),
         str: st.characters() | st.text(),
         bytes: st.binary(),
-        # Built-in collection types don't know their contents, hence are empty
-        # Use `resolve` to handle element types if possible.
-        tuple: st.tuples(),
-        list: st.lists(st.nothing()),
-        set: st.sets(st.nothing()),
-        frozenset: st.frozensets(st.nothing()),
-        dict: st.dictionaries(st.nothing(), st.nothing()),
     }
+    # build empty collections, as only generics know their contents
+    known_type_strats.extend({
+        t: st.builds(t) for t in (tuple, list, set, frozenset, dict)
+    })
     # TODO: add the equivalent entry for extra.django - model lookup??
     with contextlib.suppress(ImportError):
         import datetime as dt
@@ -169,22 +164,30 @@ def generators(draw, yield_strat, ret_strat=None):
 def nary_callable(args, retval):
     if args is None:
         return lambda: retval
-    if args is Ellipsis or len(args) >= 10:
+    if args is Ellipsis:
         return lambda *_: retval
-    assert 0 <= len(args) <= 9
-    return (
-        lambda: retval,
-        lambda __0: retval,
-        lambda __0, __1: retval,
-        lambda __0, __1, __2: retval,
-        lambda __0, __1, __2, __3: retval,
-        lambda __0, __1, __2, __3, __4: retval,
-        lambda __0, __1, __2, __3, __4, __5: retval,
-        lambda __0, __1, __2, __3, __4, __5, __6: retval,
-        lambda __0, __1, __2, __3, __4, __5, __6, __7: retval,
-        lambda __0, __1, __2, __3, __4, __5, __6, __7, __8: retval,
-        lambda __0, __1, __2, __3, __4, __5, __6, __7, __8, __9: retval,
-    )[len(args)]
+    args = ', '.join('_arg' + str(n) for n in range(len(args)))
+    return eval('lambda %s: retval' % args)
+
+
+class AsyncIteratorWrapper:
+    # based on https://www.python.org/dev/peps/pep-0492/
+    def __init__(self, obj):
+        self._obj = obj
+        self._it = iter(obj)
+
+    def __repr__(self):
+        return '%s(%r)' % (self.__class__.__name__, self._obj)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            value = next(self._it)
+        except StopIteration:
+            raise StopAsyncIteration
+        return value
 
 
 @functools.lru_cache()
@@ -195,19 +198,24 @@ def generic_type_strategy_mapping():
     with generic types as keys and a function to resolve that type as values.
 
     """
-    registry = dict()
+    registry = {
+        # TODO: better resolution for Generic... somehow
+        typing.Generic: lambda _: st.nothing(),
+        typing.ByteString: lambda _: st.binary(),
+    }
 
     def register(type_, fallback=None, attr='__args__'):
         assert type_ in AllTypingClasses
         def inner(func):
-            registry[type_] = func
             if fallback is None:
+                registry[type_] = func
                 return func
             @functools.wraps(func)
             def really_inner(thing):
                 if getattr(thing, attr, None) is None:
                     return fallback
                 return func(thing)
+            registry[type_] = really_inner
             return really_inner
         return inner
 
@@ -218,6 +226,11 @@ def generic_type_strategy_mapping():
         class CouldBeAnything(object):
             pass
         return st.builds(CouldBeAnything)
+
+    @register(typing.Type, st.just(type))
+    def resolve_Type(thing):
+        # Also super special case; seems reasonable but may be wrong
+        return st.just(thing.__args__[0])
 
     @register(Union)
     def resolve_Union(thing):
@@ -265,9 +278,37 @@ def generic_type_strategy_mapping():
         keys, vals = (resolve(t) for t in thing.__args__)
         return st.dictionaries(keys, vals)
 
+    @register(typing.DefaultDict, st.builds(collections.defaultdict))
+    def resolve_DefaultDict(thing):
+        keys, vals = (resolve(t) for t in thing.__args__)
+        return st.dictionaries(keys, vals).map(
+            lambda d: collections.defaultdict(None, d))
+
+    @register(typing.ItemsView)
+    def resolve_ItemsView(thing):
+        return resolve_Dict(thing).map(dict.items)
+
+    @register(typing.KeysView, st.builds(dict).map(dict.keys))
+    def resolve_KeysView(thing):
+        return st.dictionaries(resolve(thing.__args__[0]), st.none()
+                               ).map(dict.keys)
+
+    @register(typing.ValuesView, st.builds(dict).map(dict.values))
+    def resolve_ValuesView(thing):
+        return st.dictionaries(st.integers(), resolve(thing.__args__[0])
+                               ).map(dict.values)
+
     @register(Iterator, st.iterables(st.nothing()))
     def resolve_Iterator(thing):
         return st.iterables(resolve(thing.__args__[0]))
+
+    @register(typing.AsyncIterator)
+    def resolve_AsyncIterator(thing):
+        return resolve_Iterator(thing).map(AsyncIteratorWrapper)
+
+    @register(typing.Awaitable)
+    def resolve_Awaitable(thing):
+        return resolve_AsyncIterator(thing).map(lambda ai: ai.__anext__())
 
     @register(Generator, generators(st.nothing()))
     def resolve_Generator(thing):
