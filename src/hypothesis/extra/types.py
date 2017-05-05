@@ -47,8 +47,7 @@ import inspect
 import string
 import typing
 from typing import (
-    Dict, FrozenSet, Generator, Iterable, Iterator, List, Mapping,
-    Sequence, Set, Tuple, TypeVar, Union
+    Dict, FrozenSet, Generator, Iterator, List, Set, Tuple, TypeVar, Union
 )
 
 import hypothesis.strategies as st
@@ -56,6 +55,10 @@ from hypothesis.errors import InvalidArgument
 
 
 StratLookup = Dict[type, st.SearchStrategy]
+# TODO: use this to test that we can resolve all of them
+AllTypingClasses = tuple(filter(inspect.isclass,
+                                (getattr(typing, t) for t in typing.__all__)))
+
 
 class ResolutionFailed(TypeError, InvalidArgument):
     """Raised when a type cannot be resolved to a strategy."""
@@ -64,58 +67,44 @@ class ResolutionFailed(TypeError, InvalidArgument):
 
 def resolve(thing: typing.Any, lookup: StratLookup=None) -> st.SearchStrategy:
     # DRAFT ONLY
-    """Resolve a type or annotated function to an appropriate search strategy.
+    """Resolve a type to an appropriate search strategy.
 
-    This function basically does dispatch to more specialised resolvers,
-    but the generality is very useful when resolving recursively.
+    1. If ``thing`` is a subclass of something from the typing module, the
+       corresponding strategy is returned.  Note that while concrete types
+       have exact strategies, abstract types resolve to some combination of
+       concrete strategies.
 
-    1. If ``thing`` is a type that can be drawn from builtin strategies
-       (plus datetime and numpy extra strategies if available), or is in the
-       ``lookup`` mapping you supply, the corresponding strategy is returned.
-       Note that you can put any key in the lookup mapping, not just types -
-       allowing you to e.g. override the strategy chosen for a function.
+    2. If ``thing`` is a type that can be drawn from a builtin strategy or
+       an importable extra strategy, or is in the ``lookup`` mapping you
+       supply, the corresponding strategy is returned.  If there is no exact
+       match, do a subtype lookup in the chained mappings.
 
-    2. If ``thing`` is a generic type from the typing module, the resolution
-       logic is similar.  As these types are typically specialised (e.g.
-       ``List[int]`` -> ``lists(integers())``), no further customisation is
-       possible for these types.
+    The subtype lookup walks down the inheritance tree, adding each strategy
+    it finds to the mix and ignoring things further down that branch, e.g.::
 
-    3. If ``thing`` is an function, each argument will be resolved to a
-       strategy.  The returned strategy draws a value for each argument,
-       calls the function, and returns the result.  All arguments must have
-       either a resolvable type annotation or a default value.
+        List[int] -> lists(elements=integers())
+        int       -> integers()
+        Sequence  -> lists() | tuples()
 
-       TODO: or possibly a strategy over zero-argument callables, to force
-           exception handling back to the user?  Could store the arguments
-           on an attribute too; useful for eg round-trip tests...
-
-    Note that while types are used to infer the appropriate strategy,
-    Hypothesis will not check that returned values (etc) match the declared
-    types - you will need to write those tests for yourself.
+    TODO: possibly introspect and see if `builds` would work as a fallback?
 
     """
-    # First, try looking up the type in our mapping of things to strategies
-    if thing in type_strategy_mapping(lookup):
-        return type_strategy_mapping(lookup)[thing]
-
-    # Any, Union, Optional, TypeVar, etc - 'special types'
-    if thing is typing.Any:
-        # Any is a particularly special case
-        # Is this really the right way to handle it?  (if not fix TypeVar too)
-        class CouldBeAnything(object):
-            pass
-        return st.builds(CouldBeAnything)
-
-    if issubclass(thing, Union):
-        return st.one_of([resolve(t) for t in thing.__union_params__])
-    if isinstance(thing, TypeVar) and thing.__constraints__:
-        # A constrained TypeVar is like a Union of the constraining types
-        return st.one_of([resolve(t) for t in thing.__constraints__])
-    if isinstance(thing, typing.GenericMeta):
-        # Split out into it's own (large) function
-        return strategy_from_generic_type(thing)
-
-    raise ResolutionFailed("Could not find strategy for type %s" % thing)
+    if issubclass(thing, AllTypingClasses):
+        mapping = {k: v for k, v in generic_type_strategy_mapping().items()
+                  if issubclass(k, thing)}
+        strat = st.one_of([v(thing) for k, v in mapping.items()
+                           if sum(issubclass(k, T) for T in mapping) == 1])
+        if not strat.is_empty:
+            return strat
+    else:
+        lookup = type_strategy_mapping(lookup)
+        if thing in lookup:
+            return lookup[thing]
+        strat = st.one_of([v for k, v in lookup.items()
+                           if inspect.isclass(k) and issubclass(k, thing)])
+        if not strat.is_empty:
+            return strat
+    raise ResolutionFailed('Could not find strategy for type %r' % thing)
 
 
 @functools.lru_cache()
@@ -137,6 +126,7 @@ def type_strategy_mapping(lookup: StratLookup=None) -> StratLookup:
         str: st.characters() | st.text(),
         bytes: st.binary(),
         # Built-in collection types don't know their contents, hence are empty
+        # Use `resolve` to handle element types if possible.
         tuple: st.tuples(),
         list: st.lists(st.nothing()),
         set: st.sets(st.nothing()),
@@ -164,21 +154,81 @@ def type_strategy_mapping(lookup: StratLookup=None) -> StratLookup:
     return collections.ChainMap(dict(), known_type_strats, lookup or dict())
 
 
-def strategy_from_generic_type(thing):
-    # DRAFT ONLY
-    """Resolve generic types from the typing module to a strategy.
+@st.composite
+def generators(draw, yield_strat, ret_strat=None):
 
-    The goal is for this to handle all such types in the standard library.
+    def to_gen(alist):
+        for val in alist:
+            _ = yield val
+            _
+        if ret_strat is not None:
+            return draw(ret_strat)
+    return st.lists(yield_strat).map(to_gen)
 
-    TODO: implement the rest.  Work out how to test that it is in fact
-          exhaustive.  See typing.__all__
+
+def nary_callable(args, retval):
+    if args is None:
+        return lambda: retval
+    if args is Ellipsis or len(args) >= 10:
+        return lambda *_: retval
+    assert 0 <= len(args) <= 9
+    return (
+        lambda: retval,
+        lambda __0: retval,
+        lambda __0, __1: retval,
+        lambda __0, __1, __2: retval,
+        lambda __0, __1, __2, __3: retval,
+        lambda __0, __1, __2, __3, __4: retval,
+        lambda __0, __1, __2, __3, __4, __5: retval,
+        lambda __0, __1, __2, __3, __4, __5, __6: retval,
+        lambda __0, __1, __2, __3, __4, __5, __6, __7: retval,
+        lambda __0, __1, __2, __3, __4, __5, __6, __7, __8: retval,
+        lambda __0, __1, __2, __3, __4, __5, __6, __7, __8, __9: retval,
+    )[len(args)]
+
+
+@functools.lru_cache()
+def generic_type_strategy_mapping():
+    """Cache most of our generic type resolution logic.
+
+    :py:func:`resolve` does the heavy lifting, but here we supply a dictionary
+    with generic types as keys and a function to resolve that type as values.
 
     """
-    assert isinstance(thing, typing.GenericMeta)
-    # TODO: all of these assume that the dunder attribute is not None,
-    #       i.e. that we're seeing List[int] rather than plain List.
-    #       This is not always the case and should be fixed.
-    if issubclass(thing, Tuple):
+    registry = dict()
+
+    def register(type_, fallback=None, attr='__args__'):
+        assert type_ in AllTypingClasses
+        def inner(func):
+            registry[type_] = func
+            if fallback is None:
+                return func
+            @functools.wraps(func)
+            def really_inner(thing):
+                if getattr(thing, attr, None) is None:
+                    return fallback
+                return func(thing)
+            return really_inner
+        return inner
+
+    @register(typing.Any)
+    def resolve_Any(_):
+        # Any is a particularly special case
+        # Is this really the right way to handle it?  (if not fix TypeVar too)
+        class CouldBeAnything(object):
+            pass
+        return st.builds(CouldBeAnything)
+
+    @register(Union)
+    def resolve_Union(thing):
+        return st.one_of([resolve(t) for t in thing.__union_params__ or ()])
+
+    @register(TypeVar)
+    def resolve_TypeVar(thing):
+        return st.one_of([resolve(t) for t in thing.__constraints__ or ()])
+
+    @register(Tuple)
+    def resolve_Tuple(thing):
         if hasattr(thing, '_field_types'):
             # it's a typing.NamedTuple
             strats = tuple(resolve(thing._field_types[k])
@@ -187,35 +237,44 @@ def strategy_from_generic_type(thing):
         if hasattr(thing, '__tuple_params__'):
             # we're dealing with a typing.Tuple[something]
             elem_types = thing.__tuple_params__
+            if elem_types is None:
+                return st.tuples()
             if thing.__tuple_use_ellipsis__:
                 return st.lists(resolve(elem_types[0])).map(tuple)
             return st.tuples(*map(resolve, elem_types))
-        raise InvalidArgument('No strategy found')  # pragma: no cover
-    if issubclass(thing, (List, Sequence, typing.Reversible)):
+
+    @register(typing.Callable)
+    def resolve_Callable(thing):
+        return resolve(thing.__result__).map(
+            functools.partial(nary_callable, thing.__args__))
+
+    @register(List, st.builds(list))
+    def resolve_List(thing):
         return st.lists(resolve(thing.__args__[0]))
-    if issubclass(thing, Set):
+
+    @register(Set, st.builds(set))
+    def resolve_Set(thing):
         return st.sets(resolve(thing.__args__[0]))
-    if issubclass(thing, FrozenSet):
+
+    @register(FrozenSet, st.builds(frozenset))
+    def resolve_FrozenSet(thing):
         return st.frozensets(resolve(thing.__args__[0]))
-    if issubclass(thing, Dict) or issubclass(thing, Mapping):
+
+    @register(Dict, st.builds(dict))
+    def resolve_Dict(thing):
         keys, vals = (resolve(t) for t in thing.__args__)
         return st.dictionaries(keys, vals)
-    if issubclass(thing, (Iterator, Iterable)):
-        # TODO: use iterables strategy once merged
-        return st.lists(resolve(thing.__args__[0])).map(iter)
-    if issubclass(thing, Generator):
-        yieldtype, sendtype, returntype = thing.__args__
-        def to_gen(alist):
-            for val in alist:
-                _ = yield val
-            # TODO: proper drawing here so it minimises
-            return resolve(returntype).example()
-        return st.lists(resolve(yieldtype)).map(to_gen)
-    if issubclass(thing, typing.Callable):
-        return resolve(thing.__result__).map(lambda v: (lambda *_: v))
 
-    # TODO: support the rest of typing.__all__
-    raise ResolutionFailed('{} cannot be resolved to a type'.format(thing))
+    @register(Iterator, st.iterables(st.nothing()))
+    def resolve_Iterator(thing):
+        return st.iterables(resolve(thing.__args__[0]))
+
+    @register(Generator, generators(st.nothing()))
+    def resolve_Generator(thing):
+        yieldtype, _, returntype = thing.__args__
+        return generators(resolve(yieldtype), resolve(returntype))
+
+    return collections.ChainMap(dict(), registry)
 
 
 def check_all_annotated(thing, lookup):
@@ -237,7 +296,22 @@ def check_all_annotated(thing, lookup):
 @st.composite
 def from_type(draw, thing, lookup=None):
     # DRAFT ONLY
-    """Fiddly but I think fairly complete?"""
+    """Fiddly but I think fairly complete?
+
+    If ``thing`` is an function, each argument will be resolved to a
+    strategy.  The returned strategy draws a value for each argument,
+    calls the function, and returns the result.  All arguments must have
+    either a resolvable type annotation or a default value.
+
+    TODO: or possibly a strategy over zero-argument callables, to force
+          exception handling back to the user?  Could store the arguments
+          on an attribute too; useful for eg round-trip tests...
+
+    Note that while types are used to infer the appropriate strategy,
+    Hypothesis will not check that returned values (etc) match the declared
+    types - you will need to write those tests for yourself.
+
+    """
     # TODO: fix lookup (broken), add lookup to resolve
     # TODO: factor into a pure lookup function, and an execution helper
     # TODO: integrate into resolve
