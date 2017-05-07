@@ -49,6 +49,7 @@ import typing
 from typing import (
     Dict, FrozenSet, Generator, Iterator, List, Set, Tuple, TypeVar, Union
 )
+from unittest import mock
 
 import hypothesis.strategies as st
 from hypothesis.errors import InvalidArgument
@@ -166,6 +167,8 @@ def nary_callable(args, retval):
         return lambda: retval
     if args is Ellipsis:
         return lambda *_: retval
+    # TODO: handle more detailed argspec enabled by extended callable types
+    # See https://mypy-lang.blogspot.com.au/2017/05/mypy-0510-released.html
     args = ', '.join('_arg' + str(n) for n in range(len(args)))
     return eval('lambda %s: retval' % args)
 
@@ -201,6 +204,7 @@ def generic_type_strategy_mapping():
     registry = {
         # TODO: better resolution for Generic... somehow
         typing.Generic: lambda _: st.nothing(),
+        typing.Any: lambda _: st.builds(mock.MagicMock),
         typing.ByteString: lambda _: st.binary(),
     }
 
@@ -218,14 +222,6 @@ def generic_type_strategy_mapping():
             registry[type_] = really_inner
             return really_inner
         return inner
-
-    @register(typing.Any)
-    def resolve_Any(_):
-        # Any is a particularly special case
-        # Is this really the right way to handle it?  (if not fix TypeVar too)
-        class CouldBeAnything(object):
-            pass
-        return st.builds(CouldBeAnything)
 
     @register(typing.Type, st.just(type))
     def resolve_Type(thing):
