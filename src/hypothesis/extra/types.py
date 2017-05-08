@@ -92,23 +92,31 @@ def resolve(thing: typing.Any, lookup: StratLookup=None) -> st.SearchStrategy:
     TODO: possibly introspect and see if `builds` would work as a fallback?
 
     """
+    # I tried many more elegant checks, but `typing` tends to treat the type
+    # system as a loose guideline at best so they were all unreliable.
     if getattr(thing, '__module__', None) == 'typing':
+        # `Any` and `Type` mess up our subclass lookups, so handle them first
         if thing is typing.Any:
             return st.builds(mock.MagicMock)
         if thing is typing.Type:
             if thing.__args__ is None:
                 return st.just(type)
             return st.just(thing.__args__[0])
-
+        # We only want to consider types that `thing` is a subclass of
         mapping = {k: v for k, v in generic_type_strategy_mapping().items()
                   if issubclass(thing, k)}
+        # Then we take the union of strategies for types that do not have a
+        # subtype with a known strategy.
         strat = st.one_of([v(thing) for k, v in mapping.items()
                            if sum(issubclass(k, T) for T in mapping) == 1])
+        # If there are no such types, we'll fall through to a concrete lookup
         if not strat.is_empty:
             return strat
+    # Look for a known concrete type or user-defined mapping
     lookup = type_strategy_mapping(lookup)
     if thing in lookup:
         return lookup[thing]
+    # If there's no exact match, use similar subtype resolution logic
     lookup = {k: v for k, v in lookup.items() if inspect.isclass(k)}
     strat = st.one_of([
         v for k, v in lookup.items()
@@ -144,13 +152,13 @@ def type_strategy_mapping(lookup: StratLookup=None) -> StratLookup:
     })
     # TODO: add the equivalent entry for extra.django - model lookup??
     with contextlib.suppress(ImportError):
+        # TODO: use core datetime strategies, once pull is merged
         import datetime as dt
         import  hypothesis.extra.datetime as dt_strats
         known_type_strats.update({
             dt.datetime: dt_strats.datetimes(),
             dt.date: dt_strats.dates(),
             dt.time: dt_strats.times(),
-            # TODO: add timedeltas once pull is merged
         })
     with contextlib.suppress(ImportError):
         import numpy as np
@@ -185,11 +193,12 @@ def nary_callable(args, retval):
     # TODO: handle more detailed argspec enabled by extended callable types
     # See https://mypy-lang.blogspot.com.au/2017/05/mypy-0510-released.html
     args = ', '.join('_arg' + str(n) for n in range(len(args)))
+    # See (!) https://github.com/HypothesisWorks/hypothesis-python/issues/387
     return eval('lambda %s: retval' % args)
 
 
 class AsyncIteratorWrapper:
-    # based on https://www.python.org/dev/peps/pep-0492/
+    # based on example code from https://www.python.org/dev/peps/pep-0492/
     def __init__(self, obj):
         self._obj = obj
         self._it = iter(obj)
