@@ -57,8 +57,10 @@ from hypothesis.errors import InvalidArgument
 
 StratLookup = Dict[type, st.SearchStrategy]
 # TODO: use this to test that we can resolve all of them
-AllTypingClasses = tuple(filter(inspect.isclass,
-                                (getattr(typing, t) for t in typing.__all__)))
+AllTypingClasses = tuple(
+    cls for cls in (getattr(typing, name) for name in typing.__all__)
+    if inspect.isclass(cls) and cls is not typing.Generic
+)
 
 
 class ResolutionFailed(InvalidArgument):
@@ -90,19 +92,30 @@ def resolve(thing: typing.Any, lookup: StratLookup=None) -> st.SearchStrategy:
     TODO: possibly introspect and see if `builds` would work as a fallback?
 
     """
-    if issubclass(thing, AllTypingClasses):
+    if getattr(thing, '__module__', None) == 'typing':
+        if thing is typing.Any:
+            return st.builds(mock.MagicMock)
+        if thing is typing.Type:
+            if thing.__args__ is None:
+                return st.just(type)
+            return st.just(thing.__args__[0])
+
         mapping = {k: v for k, v in generic_type_strategy_mapping().items()
-                  if issubclass(k, thing)}
+                  if issubclass(thing, k)}
         strat = st.one_of([v(thing) for k, v in mapping.items()
                            if sum(issubclass(k, T) for T in mapping) == 1])
         if not strat.is_empty:
             return strat
-    else:
-        lookup = type_strategy_mapping(lookup)
-        if thing in lookup:
-            return lookup[thing]
-        return st.one_of([v for k, v in lookup.items()
-                          if inspect.isclass(k) and issubclass(k, thing)])
+    lookup = type_strategy_mapping(lookup)
+    if thing in lookup:
+        return lookup[thing]
+    lookup = {k: v for k, v in lookup.items() if inspect.isclass(k)}
+    strat = st.one_of([
+        v for k, v in lookup.items()
+        if issubclass(k, thing) and sum(issubclass(k, T) for T in lookup) == 1
+    ])
+    if not strat.is_empty:
+        return strat
     raise ResolutionFailed('Could not find strategy for type %r' % thing)
 
 
@@ -126,7 +139,7 @@ def type_strategy_mapping(lookup: StratLookup=None) -> StratLookup:
         bytes: st.binary(),
     }
     # build empty collections, as only generics know their contents
-    known_type_strats.extend({
+    known_type_strats.update({
         t: st.builds(t) for t in (tuple, list, set, frozenset, dict)
     })
     # TODO: add the equivalent entry for extra.django - model lookup??
@@ -147,7 +160,9 @@ def type_strategy_mapping(lookup: StratLookup=None) -> StratLookup:
             np.ndarray: arrays(scalar_dtypes(), array_shapes(max_dims=2)),
             np.dtype: nested_dtypes(),
         })
-    return collections.ChainMap(dict(), known_type_strats, lookup or dict())
+    if lookup:
+        known_type_strats.update(lookup)
+    return known_type_strats
 
 
 @st.composite
@@ -159,7 +174,7 @@ def generators(draw, yield_strat, ret_strat=None):
             _
         if ret_strat is not None:
             return draw(ret_strat)
-    return st.lists(yield_strat).map(to_gen)
+    return draw(st.lists(yield_strat).map(to_gen))
 
 
 def nary_callable(args, retval):
@@ -202,14 +217,10 @@ def generic_type_strategy_mapping():
 
     """
     registry = {
-        # TODO: better resolution for Generic... somehow
-        typing.Generic: lambda _: st.nothing(),
-        typing.Any: lambda _: st.builds(mock.MagicMock),
         typing.ByteString: lambda _: st.binary(),
     }
 
     def register(type_, fallback=None, attr='__args__'):
-        assert type_ in AllTypingClasses
         def inner(func):
             if fallback is None:
                 registry[type_] = func
@@ -223,18 +234,15 @@ def generic_type_strategy_mapping():
             return really_inner
         return inner
 
-    @register(typing.Type, st.just(type))
-    def resolve_Type(thing):
-        # Also super special case; seems reasonable but may be wrong
-        return st.just(thing.__args__[0])
-
     @register(Union)
     def resolve_Union(thing):
-        return st.one_of([resolve(t) for t in thing.__union_params__ or ()])
+        return st.one_of([resolve(t) for t in
+                          getattr(thing, '__union_params__', None) or ()])
 
     @register(TypeVar)
     def resolve_TypeVar(thing):
-        return st.one_of([resolve(t) for t in thing.__constraints__ or ()])
+        return st.one_of([resolve(t) for t in
+                          getattr(thing, '__constraints__', ())])
 
     @register(Tuple)
     def resolve_Tuple(thing):
@@ -252,7 +260,7 @@ def generic_type_strategy_mapping():
                 return st.lists(resolve(elem_types[0])).map(tuple)
             return st.tuples(*map(resolve, elem_types))
 
-    @register(typing.Callable)
+    @register(typing.Callable, st.just(lambda: None))
     def resolve_Callable(thing):
         return resolve(thing.__result__).map(
             functools.partial(nary_callable, thing.__args__))
@@ -311,7 +319,7 @@ def generic_type_strategy_mapping():
         yieldtype, _, returntype = thing.__args__
         return generators(resolve(yieldtype), resolve(returntype))
 
-    return collections.ChainMap(dict(), registry)
+    return registry
 
 
 def check_all_annotated(thing, lookup):
