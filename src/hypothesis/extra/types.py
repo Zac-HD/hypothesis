@@ -248,6 +248,10 @@ def generic_type_strategy_mapping():
         return st.one_of([resolve(t) for t in
                           getattr(thing, '__union_params__', None) or ()])
 
+    @register(typing.Optional, st.none())
+    def resolve_Optional(thing):
+        return st.none() | resolve(thing.__union_params__[0])
+
     @register(TypeVar)
     def resolve_TypeVar(thing):
         return st.one_of([resolve(t) for t in
