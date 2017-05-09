@@ -37,9 +37,10 @@ def test_resolve_typing_module(typ):
     try:
         @given(types.resolve(typ))
         def inner(ex):
-            if typ is typing.Any or isinstance(typ, typing.TypeVar) \
-                    or issubclass(typ, typing._Protocol):
+            if typ is typing.Any or isinstance(typ, typing.TypeVar):
                 pass
+            elif getattr(typ, '_is_protocol', False):
+                assert all(hasattr(ex, att) for att in typ.__abstractmethods__)
             elif typ is typing.Tuple:
                 assert isinstance(ex, tuple)
             else:
