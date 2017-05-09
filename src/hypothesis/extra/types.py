@@ -44,6 +44,8 @@ import decimal
 import fractions
 import functools
 import inspect
+import io
+import re
 import string
 import typing
 from typing import (
@@ -53,29 +55,28 @@ from unittest import mock
 
 import hypothesis.strategies as st
 from hypothesis.errors import InvalidArgument
+from hypothesis.internal.compat import text_type
 
 
 StratLookup = Dict[type, st.SearchStrategy]
-# TODO: use this to test that we can resolve all of them
+
 AllTypingClasses = tuple(
     cls for cls in (getattr(typing, name) for name in typing.__all__)
     if inspect.isclass(cls) and cls is not typing.Generic
-)
+) + (typing.BinaryIO, typing.TextIO, typing.re.Pattern, typing.re.Match)
 
 
-class ResolutionFailed(InvalidArgument):
+class ResolutionFailed(InvalidArgument, NotImplementedError):
     """Raised when a type cannot be resolved to a strategy."""
     pass
 
 
 def resolve(thing: typing.Any, lookup: StratLookup=None) -> st.SearchStrategy:
-    # DRAFT ONLY
     """Resolve a type to an appropriate search strategy.
 
     1. If ``thing`` is a subclass of something from the typing module, the
-       corresponding strategy is returned.  Note that while concrete types
-       have exact strategies, abstract types resolve to some combination of
-       concrete strategies.
+       corresponding strategy is returned.  For abstract types this may be
+       the union of one or more strategies for concrete subtypes.
 
     2. If ``thing`` is a type that can be drawn from a builtin strategy or
        an importable extra strategy, or is in the ``lookup`` mapping you
@@ -88,8 +89,6 @@ def resolve(thing: typing.Any, lookup: StratLookup=None) -> st.SearchStrategy:
         List[int] -> lists(elements=integers())
         int       -> integers()
         Sequence  -> lists() | tuples()
-
-    TODO: possibly introspect and see if `builds` would work as a fallback?
 
     """
     # I tried many more elegant checks, but `typing` tends to treat the type
@@ -143,7 +142,7 @@ def type_strategy_mapping(lookup: StratLookup=None) -> StratLookup:
         complex: st.complex_numbers(),
         fractions.Fraction: st.fractions(),
         decimal.Decimal: st.decimals(),
-        str: st.characters() | st.text(),
+        text_type: st.characters() | st.text(),
         bytes: st.binary(),
     }
     # build empty collections, as only generics know their contents
@@ -174,15 +173,15 @@ def type_strategy_mapping(lookup: StratLookup=None) -> StratLookup:
 
 
 @st.composite
-def generators(draw, yield_strat, ret_strat=None):
+def generators(draw, yield_strat, ret_strat=st.none()):
 
-    def to_gen(alist):
+    def to_gen(alist, retval):
         for val in alist:
             _ = yield val
             _
-        if ret_strat is not None:
-            return draw(ret_strat)
-    return draw(st.lists(yield_strat).map(to_gen))
+        return retval
+
+    return to_gen(draw(st.lists(yield_strat)), draw(ret_strat))
 
 
 def nary_callable(args, retval):
@@ -225,8 +224,20 @@ def generic_type_strategy_mapping():
     with generic types as keys and a function to resolve that type as values.
 
     """
+    # TODO: work out why io.StringIO is not a typing.io.TextIO thing
+    # TODO: likewise BinaryIO
+
     registry = {
+        # Some types are not generic, so we can write the lookup immediately
         typing.ByteString: lambda _: st.binary(),
+        typing.io.BinaryIO: lambda _: st.builds(io.BytesIO, st.binary()),
+        typing.io.TextIO: lambda _: st.builds(io.StringIO, st.text()),
+        typing.re.Match[text_type]: lambda _: \
+            st.builds(lambda s: re.match(u'.*', s), st.text()),
+        typing.re.Match[bytes]: lambda _: \
+            st.builds(lambda s: re.match(b'.*', s), st.binary()),
+        typing.re.Pattern[text_type]: lambda _: st.text().map(re.compile),
+        typing.re.Pattern[bytes]: lambda _: st.binary().map(re.compile),
     }
 
     def register(type_, fallback=None, attr='__args__'):
@@ -254,6 +265,8 @@ def generic_type_strategy_mapping():
 
     @register(TypeVar)
     def resolve_TypeVar(thing):
+        if getattr(thing, '__contravariant__', False):
+            raise ResolutionFailed('Cannot resolve contravariant %s' % thing)
         return st.one_of([resolve(t) for t in
                           getattr(thing, '__constraints__', ())])
 
@@ -331,6 +344,13 @@ def generic_type_strategy_mapping():
     def resolve_Generator(thing):
         yieldtype, _, returntype = thing.__args__
         return generators(resolve(yieldtype), resolve(returntype))
+
+    @register(typing.re.Match)
+    def resolve_re_Match(_):
+        return st.one_of(
+            st.builds(lambda s: re.match(u'.*', s), st.text()),
+            st.builds(lambda s: re.match(b'.*', s), st.binary())
+            )
 
     return registry
 

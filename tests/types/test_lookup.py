@@ -37,7 +37,14 @@ def test_resolve_typing_module(typ):
     try:
         @given(types.resolve(typ))
         def inner(ex):
-            if typ is typing.Any or isinstance(typ, typing.TypeVar):
+            try:
+                # Hackish way to check for _TypeAlias before it explodes below
+                issubclass(typ, type)
+            except TypeError:
+                return
+
+            if typ is typing.Any or isinstance(typ, typing.TypeVar) \
+                    or typ is typing.Type or issubclass(typ, typing.Optional):
                 pass
             elif getattr(typ, '_is_protocol', False):
                 assert all(hasattr(ex, att) for att in typ.__abstractmethods__)
