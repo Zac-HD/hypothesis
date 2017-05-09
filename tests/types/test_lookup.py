@@ -33,28 +33,25 @@ from hypothesis.extra import types
 
 @pytest.mark.parametrize('typ', types.AllTypingClasses)
 def test_resolve_typing_module(typ):
+    # TODO: new test which includes parameters, ie List[...] or Dict[..., ...]
 
-    try:
-        @given(types.resolve(typ))
-        def inner(ex):
-            try:
-                # Hackish way to check for _TypeAlias before it explodes below
-                issubclass(typ, type)
-            except TypeError:
-                return
+    @given(types.resolve(typ))
+    def inner(ex):
+        try:
+            # Hackish way to check for _TypeAlias before it explodes below
+            issubclass(typ, type)
+        except TypeError:
+            return
+        if typ is typing.Any or isinstance(typ, typing.TypeVar) \
+                or typ is typing.Type or issubclass(typ, typing.Optional):
+            pass
+        elif getattr(typ, '_is_protocol', False):
+            assert all(hasattr(ex, att) for att in typ.__abstractmethods__)
+        elif typ is typing.Tuple:
+            assert isinstance(ex, tuple)
+        else:
+            assert isinstance(ex, typ)
 
-            if typ is typing.Any or isinstance(typ, typing.TypeVar) \
-                    or typ is typing.Type or issubclass(typ, typing.Optional):
-                pass
-            elif getattr(typ, '_is_protocol', False):
-                assert all(hasattr(ex, att) for att in typ.__abstractmethods__)
-            elif typ is typing.Tuple:
-                assert isinstance(ex, tuple)
-            else:
-                assert isinstance(ex, typ)
-
-    except types.ResolutionFailed:
-        pytest.skip()
     inner()
 
 
