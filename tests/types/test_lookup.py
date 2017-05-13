@@ -35,7 +35,12 @@ from hypothesis.extra import types
 def test_resolve_typing_module(typ):
     # TODO: new test which includes parameters, ie List[...] or Dict[..., ...]
 
-    @given(types.resolve(typ))
+    strategy = types.resolve(typ)
+    if strategy.is_empty:
+        assert issubclass(typ, (typing.Union, typing.TypeVar))
+        pytest.skip()
+
+    @given(strategy)
     def inner(ex):
         try:
             # Hackish way to check for _TypeAlias before it explodes below
@@ -43,8 +48,10 @@ def test_resolve_typing_module(typ):
         except TypeError:
             return
         if typ is typing.Any or isinstance(typ, typing.TypeVar) \
-                or typ is typing.Type or issubclass(typ, typing.Optional):
+                or typ is typing.Type:
             pass
+        elif ex is None and issubclass(typ, typing.Optional):
+            assert True
         elif getattr(typ, '_is_protocol', False):
             assert all(hasattr(ex, att) for att in typ.__abstractmethods__)
         elif typ is typing.Tuple:

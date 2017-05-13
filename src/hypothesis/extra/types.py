@@ -63,12 +63,22 @@ StratLookup = Dict[type, st.SearchStrategy]
 AllTypingClasses = tuple(
     cls for cls in (getattr(typing, name) for name in typing.__all__)
     if inspect.isclass(cls) and cls is not typing.Generic
+    and not isinstance(cls, typing._ProtocolMeta)
 ) + (typing.BinaryIO, typing.TextIO, typing.re.Pattern, typing.re.Match)
 
 
 class ResolutionFailed(InvalidArgument, NotImplementedError):
     """Raised when a type cannot be resolved to a strategy."""
     pass
+
+
+def try_issubclass(thing, maybe_superclass):
+    try:
+        return issubclass(thing, maybe_superclass)
+    except TypeError:
+        # TODO:  upstream report.  `issubclass` with typing._TypeAlias fails
+        # when it reaches collections.abc, because it can't be weakrefed
+        return None
 
 
 def resolve(thing: typing.Any, lookup: StratLookup=None) -> st.SearchStrategy:
@@ -103,14 +113,13 @@ def resolve(thing: typing.Any, lookup: StratLookup=None) -> st.SearchStrategy:
             return st.just(thing.__args__[0])
         # We only want to consider types that `thing` is a subclass of
         mapping = {k: v for k, v in generic_type_strategy_mapping().items()
-                  if issubclass(thing, k)}
-        # Then we take the union of strategies for types that do not have a
-        # subtype with a known strategy.
-        strat = st.one_of([v(thing) for k, v in mapping.items()
-                           if sum(issubclass(k, T) for T in mapping) == 1])
-        # If there are no such types, we'll fall through to a concrete lookup
-        if not strat.is_empty:
-            return strat
+                   if try_issubclass(k, thing)}
+        if mapping:
+            # Then we take the union of strategies for types that do not
+            # have a subtype with a known strategy.
+            return st.one_of([v(thing) for k, v in mapping.items()
+                              if sum(issubclass(k, T) for T in mapping) == 1])
+        raise ResolutionFailed('Could not find strategy for type %r' % thing)
     # Look for a known concrete type or user-defined mapping
     lookup = type_strategy_mapping(lookup)
     if thing in lookup:
@@ -126,7 +135,7 @@ def resolve(thing: typing.Any, lookup: StratLookup=None) -> st.SearchStrategy:
     raise ResolutionFailed('Could not find strategy for type %r' % thing)
 
 
-@functools.lru_cache()
+@st.cacheable
 def type_strategy_mapping(lookup: StratLookup=None) -> StratLookup:
     """Return a mapping from types to corresponding search strategies.
 
@@ -216,7 +225,7 @@ class AsyncIteratorWrapper:
         return value
 
 
-@functools.lru_cache()
+@st.cacheable
 def generic_type_strategy_mapping():
     """Cache most of our generic type resolution logic.
 
@@ -269,6 +278,10 @@ def generic_type_strategy_mapping():
             raise ResolutionFailed('Cannot resolve contravariant %s' % thing)
         return st.one_of([resolve(t) for t in
                           getattr(thing, '__constraints__', ())])
+
+    @register(typing.AnyStr)
+    def resolve_AnyStr(thing):
+        return st.one_of([resolve(t) for t in typing.AnyStr.__constraints__])
 
     @register(Tuple)
     def resolve_Tuple(thing):
