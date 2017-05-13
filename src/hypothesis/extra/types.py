@@ -101,6 +101,10 @@ def resolve(thing: typing.Any, lookup: StratLookup=None) -> st.SearchStrategy:
         Sequence  -> lists() | tuples()
 
     """
+    # Look for a known concrete type or user-defined mapping
+    lookup = type_strategy_mapping(lookup)
+    if thing in lookup:
+        return lookup[thing]
     # I tried many more elegant checks, but `typing` tends to treat the type
     # system as a loose guideline at best so they were all unreliable.
     if getattr(thing, '__module__', None) == 'typing':
@@ -120,11 +124,7 @@ def resolve(thing: typing.Any, lookup: StratLookup=None) -> st.SearchStrategy:
             return st.one_of([v(thing) for k, v in mapping.items()
                               if sum(issubclass(k, T) for T in mapping) == 1])
         raise ResolutionFailed('Could not find strategy for type %r' % thing)
-    # Look for a known concrete type or user-defined mapping
-    lookup = type_strategy_mapping(lookup)
-    if thing in lookup:
-        return lookup[thing]
-    # If there's no exact match, use similar subtype resolution logic
+    # If there's no exact match above, use similar subtype resolution logic
     lookup = {k: v for k, v in lookup.items() if inspect.isclass(k)}
     strat = st.one_of([
         v for k, v in lookup.items()
