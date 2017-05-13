@@ -241,12 +241,13 @@ def generic_type_strategy_mapping():
         typing.ByteString: lambda _: st.binary(),
         typing.io.BinaryIO: lambda _: st.builds(io.BytesIO, st.binary()),
         typing.io.TextIO: lambda _: st.builds(io.StringIO, st.text()),
+        # TODO:  strategy for generating valid regex patterns
         typing.re.Match[text_type]: lambda _: \
             st.builds(lambda s: re.match(u'.*', s), st.text()),
         typing.re.Match[bytes]: lambda _: \
             st.builds(lambda s: re.match(b'.*', s), st.binary()),
-        typing.re.Pattern[text_type]: lambda _: st.text().map(re.compile),
-        typing.re.Pattern[bytes]: lambda _: st.binary().map(re.compile),
+        typing.re.Pattern[text_type]: lambda _: st.just(re.compile(u'.*')),
+        typing.re.Pattern[bytes]: lambda _: st.just(re.compile(b'.*')),
     }
 
     def register(type_, fallback=None, attr='__args__'):

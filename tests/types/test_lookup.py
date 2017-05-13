@@ -23,6 +23,7 @@ can handle.
 
 from __future__ import division, print_function, absolute_import
 
+import io
 import typing
 
 import pytest
@@ -33,6 +34,9 @@ from hypothesis.extra import types
 
 @pytest.mark.parametrize('typ', types.AllTypingClasses)
 def test_resolve_typing_module(typ):
+    # This is covered in special cases; the real purpose is to make sure we
+    # notice if something (else) odd is added to the typing module.
+
     # TODO: new test which includes parameters, ie List[...] or Dict[..., ...]
 
     strategy = types.resolve(typ)
@@ -56,6 +60,8 @@ def test_resolve_typing_module(typ):
             assert all(hasattr(ex, att) for att in typ.__abstractmethods__)
         elif typ is typing.Tuple:
             assert isinstance(ex, tuple)
+        elif typ in (typing.BinaryIO, typing.TextIO):
+            assert isinstance(ex, io.IOBase)
         else:
             assert isinstance(ex, typ)
 
