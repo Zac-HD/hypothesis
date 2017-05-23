@@ -267,11 +267,11 @@ def generic_type_strategy_mapping():
     @register(Union)
     def resolve_Union(thing):
         return st.one_of([resolve(t) for t in
-                          getattr(thing, '__union_params__', None) or ()])
+                          getattr(thing, '__args__', None) or ()])
 
     @register(typing.Optional, st.none())
     def resolve_Optional(thing):
-        return st.none() | resolve(thing.__union_params__[0])
+        return st.none() | resolve(thing.__args__[0])
 
     @register(TypeVar)
     def resolve_TypeVar(thing):
@@ -432,4 +432,3 @@ def from_type(draw, thing, lookup=None):
             .format(ret_val, ret_type.__name__, thing.__name__, varargs,
                     varkw, other_args))
     return ret_val
-
