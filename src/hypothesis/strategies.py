@@ -46,7 +46,7 @@ __all__ = [
     'dictionaries', 'fixed_dictionaries',
     'sampled_from', 'permutations',
     'datetimes', 'dates', 'times', 'timedeltas',
-    'builds',
+    'builds', 'from_type',
     'randoms', 'random_module',
     'recursive', 'composite',
     'shared', 'runner', 'data',
@@ -793,6 +793,20 @@ def builds(target, *args, **kwargs):
     return tuples(tuples(*args), fixed_dictionaries(kwargs)).map(
         lambda value: target(*value[0], **value[1])
     )
+
+
+@cacheable
+def from_type(thing, lookup=None):
+    """Looks up the appropriate search strategy for the given type.
+
+    This works for builtin and standard-library types that Hypothesis has a
+    strategy for, types with strategies in ``hypothesis.extras`` if you have
+    the dependencies installed, and anything else you supply in the
+    ``lookup`` argument.
+
+    """
+    from hypothesis.searchstrategy import types
+    return types.from_type(thing, lookup)
 
 
 @cacheable
