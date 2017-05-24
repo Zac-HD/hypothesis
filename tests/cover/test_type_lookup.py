@@ -45,10 +45,14 @@ core_strats = {}
 for thing in dir(st):
     thing = getattr(st, thing)
     if inspect.isfunction(thing):
-        with contextlib.suppress(TypeError, hypothesis.errors.NoExamples):
-            strat = thing()
-            if hasattr(strat, 'example'):
-                core_strats[type(strat.example())] = strat
+        with contextlib.suppress(hypothesis.errors.NoExamples, TypeError):
+            try:
+                strat = thing()
+                strat.example()
+            except hypothesis.errors.InvalidArgument:
+                strat = thing(elements=st.integers())
+                strat.example()
+            core_strats[type(strat.example())] = strat
 
 @pytest.mark.parametrize('typ', core_strats.keys())
 def test_resolve_core_strategies(typ):
