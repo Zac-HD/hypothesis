@@ -23,6 +23,7 @@ import typing
 import pytest
 
 from hypothesis import given
+from hypothesis.strategies import from_type
 from hypothesis.searchstrategy import types
 
 
@@ -32,19 +33,16 @@ def test_resolve_typing_module(typ):
     # notice if something (else) odd is added to the typing module.
 
     # TODO: new test which includes parameters, ie List[...] or Dict[..., ...]
-
-    strategy = types.resolve(typ)
-    if strategy.is_empty:
-        assert issubclass(typ, (typing.Union, typing.TypeVar))
+    try:
+        # Hackish way to check for _TypeAlias before it explodes below
+        issubclass(typ, type)
+    except TypeError:
         pytest.skip()
+
+    strategy = from_type(typ)
 
     @given(strategy)
     def inner(ex):
-        try:
-            # Hackish way to check for _TypeAlias before it explodes below
-            issubclass(typ, type)
-        except TypeError:
-            return
         if typ is typing.Any or isinstance(typ, typing.TypeVar) \
                 or typ is typing.Type:
             pass

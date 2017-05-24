@@ -799,14 +799,21 @@ def builds(target, *args, **kwargs):
 def from_type(thing, lookup=None):
     """Looks up the appropriate search strategy for the given type.
 
-    This works for builtin and standard-library types that Hypothesis has a
-    strategy for, types with strategies in ``hypothesis.extras`` if you have
-    the dependencies installed, and anything else you supply in the
-    ``lookup`` argument.
+    This works for builtin and standard-library types that Hypothesis
+    has a strategy for, types with strategies in ``hypothesis.extras``
+    if you have the dependencies installed, and anything else you supply
+    in the ``lookup`` argument.
 
     """
     from hypothesis.searchstrategy import types
-    return types.from_type(thing, lookup)
+    bad_strats = ['{}={}'.format(k, v) for k, v in (lookup or {}).items()
+                  if not isinstance(v, SearchStrategy)]
+    if bad_strats:
+        raise InvalidArgument('Bad values in lookup: ' + ', '.join(bad_strats))
+    strat = types.from_type(thing, lookup)
+    if not strat.is_empty:
+        return strat
+    raise InvalidArgument('Could not find strategy for type %r' % thing)
 
 
 @cacheable

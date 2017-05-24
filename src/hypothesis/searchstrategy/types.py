@@ -17,13 +17,12 @@
 
 from __future__ import division, print_function, absolute_import
 
-from inspect import isclass
 import functools
 import collections
+from inspect import isclass
 
 import hypothesis.strategies as st
 from hypothesis.errors import InvalidArgument
-from hypothesis.searchstrategy import SearchStrategy
 from hypothesis.internal.compat import text_type
 
 
@@ -49,10 +48,6 @@ def from_type(thing, lookup=None):
         Sequence  -> lists() | tuples()
 
     """
-    bad_strats = ['{}={}'.format(k, v) for k, v in (lookup or {}).items()
-                  if not isinstance(v, SearchStrategy)]
-    if bad_strats:
-        raise InvalidArgument('Bad values in lookup: ' + ', '.join(bad_strats))
     # Look for a known concrete type or user-defined mapping
     lookup = type_strategy_mapping(lookup)
     if thing in lookup:
@@ -60,18 +55,13 @@ def from_type(thing, lookup=None):
     # I tried many more elegant checks, but `typing` tends to treat the type
     # system as a loose guideline at best so they were all unreliable.
     if getattr(thing, '__module__', None) == 'typing':
-        strat = from_typing_type(thing)
-        if not strat.is_empty:
-            return strat
+        return from_typing_type(thing)
     # If there's no exact match above, use similar subtype resolution logic
     lookup = {k: v for k, v in lookup.items() if isclass(k)}
-    strat = st.one_of([
+    return st.one_of([
         v for k, v in lookup.items()
         if issubclass(k, thing) and sum(issubclass(k, T) for T in lookup) == 1
     ])
-    if not strat.is_empty:
-        return strat
-    raise InvalidArgument('Could not find strategy for type %r' % thing)
 
 
 @st.cacheable
@@ -227,7 +217,11 @@ class AsyncIteratorWrapper:
 
 @st.cacheable
 def generic_type_strategy_mapping():
-    """Cache most of our generic type resolution logic.  Requires typing."""
+    """Cache most of our generic type resolution logic.
+
+    Requires the ``typing`` module to be importable.
+
+    """
     import io
     import re
     import typing
@@ -241,10 +235,12 @@ def generic_type_strategy_mapping():
         typing.io.BinaryIO: lambda _: st.builds(io.BytesIO, st.binary()),
         typing.io.TextIO: lambda _: st.builds(io.StringIO, st.text()),
         # TODO:  strategy for generating valid regex patterns
-        typing.re.Match[text_type]: lambda _: \
-            st.builds(lambda s: re.match(u'.*', s), st.text()),
-        typing.re.Match[bytes]: lambda _: \
-            st.builds(lambda s: re.match(b'.*', s), st.binary()),
+        typing.re.Match[text_type]: (
+            lambda _: st.builds(lambda s: re.match(u'.*', s), st.binary())
+        ),
+        typing.re.Match[bytes]: (
+            lambda _: st.builds(lambda s: re.match(b'.*', s), st.binary())
+        ),
         typing.re.Pattern[text_type]: lambda _: st.just(re.compile(u'.*')),
         typing.re.Pattern[bytes]: lambda _: st.just(re.compile(b'.*')),
     }
@@ -364,6 +360,6 @@ def generic_type_strategy_mapping():
         return st.one_of(
             st.builds(lambda s: re.match(u'.*', s), st.text()),
             st.builds(lambda s: re.match(b'.*', s), st.binary())
-            )
+        )
 
     return registry
