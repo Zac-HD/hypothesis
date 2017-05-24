@@ -64,7 +64,6 @@ def from_type(thing, lookup=None):
     ])
 
 
-@st.cacheable
 def type_strategy_mapping(lookup=None):
     """Return a dict mapping from types to corresponding search strategies.
 
@@ -145,7 +144,7 @@ def from_typing_type(thing):
     def try_issubclass(thing, maybe_superclass):
         try:
             return issubclass(thing, maybe_superclass)
-        except TypeError:
+        except (AttributeError, TypeError):
             # TODO:  upstream report:  issubclass(x, typing._TypeAlias) fails
             # when it reaches collections.abc, because it can't be weakrefed
             return None
@@ -215,7 +214,14 @@ class AsyncIteratorWrapper:
         return value
 
 
-@st.cacheable
+class AwaitableWrapper:
+    def __init__(self, iterator):
+        self._iter = iterator
+
+    def __await__(self):
+        return self._iter
+
+
 def generic_type_strategy_mapping():
     """Cache most of our generic type resolution logic.
 
@@ -250,6 +256,7 @@ def generic_type_strategy_mapping():
             if fallback is None:
                 registry[type_] = func
                 return func
+
             @functools.wraps(func)
             def really_inner(thing):
                 if getattr(thing, attr, None) is None:
@@ -348,7 +355,7 @@ def generic_type_strategy_mapping():
 
     @register(typing.Awaitable)
     def resolve_Awaitable(thing):
-        return resolve_AsyncIterator(thing).map(lambda ai: ai.__anext__())
+        return resolve_Iterator(thing).map(AwaitableWrapper)
 
     @register(typing.Generator, generators(st.nothing()))
     def resolve_Generator(thing):

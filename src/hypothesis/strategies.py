@@ -795,7 +795,6 @@ def builds(target, *args, **kwargs):
     )
 
 
-@cacheable
 def from_type(thing, lookup=None):
     """Looks up the appropriate search strategy for the given type.
 

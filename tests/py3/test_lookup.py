@@ -23,6 +23,7 @@ import typing
 import pytest
 
 from hypothesis import given
+from hypothesis.errors import InvalidArgument
 from hypothesis.strategies import from_type
 from hypothesis.searchstrategy import types
 
@@ -34,19 +35,21 @@ def test_resolve_typing_module(typ):
 
     # TODO: new test which includes parameters, ie List[...] or Dict[..., ...]
     try:
-        # Hackish way to check for _TypeAlias before it explodes below
-        issubclass(typ, type)
-    except TypeError:
-        pytest.skip()
-
-    strategy = from_type(typ)
+        strategy = from_type(typ)
+    except InvalidArgument:
+        pytest.skip(msg='TODO: implement strategy for this type')
 
     @given(strategy)
     def inner(ex):
+        try:
+            # Hackish way to check for _TypeAlias before it explodes below
+            issubclass(typ, type)
+        except TypeError:
+            pytest.skip()
         if typ is typing.Any or isinstance(typ, typing.TypeVar) \
                 or typ is typing.Type:
             pass
-        elif ex is None and issubclass(typ, typing.Optional):
+        elif ex is None and typ == typing.Optional:
             assert True
         elif getattr(typ, '_is_protocol', False):
             assert all(hasattr(ex, att) for att in typ.__abstractmethods__)
