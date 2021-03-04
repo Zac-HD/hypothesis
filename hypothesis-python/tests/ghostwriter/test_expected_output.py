@@ -21,6 +21,7 @@ To update the recorded outputs, run `pytest --hypothesis-update-outputs ...`.
 
 import ast
 import base64
+import math
 import operator
 import pathlib
 import re
@@ -49,6 +50,10 @@ def get_recorded(name, actual=""):
 
 def timsort(seq: Sequence[int]) -> Sequence[int]:
     return sorted(seq)
+
+
+def gcd(a: int, b: int) -> int:
+    return math.gcd(a, b)
 
 
 class A_Class:
@@ -82,6 +87,8 @@ def add(a: float, b: float) -> float:
         ("sorted_idempotent", ghostwriter.idempotent(sorted)),
         ("timsort_idempotent", ghostwriter.idempotent(timsort)),
         ("eval_equivalent", ghostwriter.equivalent(eval, ast.literal_eval)),
+        ("posonly_gcd_equivalent", ghostwriter.equivalent(gcd, math.gcd)),
+        ("posonly_gcd_equivalent2", ghostwriter.equivalent(math.gcd, gcd)),
         ("sorted_self_equivalent", ghostwriter.equivalent(sorted, sorted, sorted)),
         ("addition_op_magic", ghostwriter.magic(add)),
         ("addition_op_multimagic", ghostwriter.magic(add, operator.add, numpy.add)),

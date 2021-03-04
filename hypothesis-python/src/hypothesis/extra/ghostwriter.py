@@ -420,14 +420,14 @@ def _get_qualname(obj, include_module=False):
     return qname
 
 
-def _write_call(func: Callable, *pass_variables: str) -> str:
+def _write_call(func: Callable, *pass_variables: str, **posonly_map: str) -> str:
     """Write a call to `func` with explicit and implicit arguments.
 
     >>> _write_call(sorted, "my_seq", "func")
     "builtins.sorted(my_seq, key=func, reverse=reverse)"
     """
     args = ", ".join(
-        (v or p.name)
+        (v or posonly_map.get(p.name) or p.name)
         if p.kind is inspect.Parameter.POSITIONAL_ONLY
         else f"{p.name}={v or p.name}"
         for v, p in zip_longest(pass_variables, _get_params(func).values())
@@ -843,6 +843,35 @@ def roundtrip(*funcs: Callable, except_: Except = (), style: str = "pytest") -> 
 
 
 def _make_equiv_body(funcs, except_, style):
+    # For the equivalence ghostwriter, it's important that positional-only args
+    # should use the same input values; but we can't just do this by name as for
+    # the rest of the ghostwriter logic.  We therefore go to some length to choose
+    # consistent and non-colliding names for such arguments.  For more detail,
+    # see https://github.com/HypothesisWorks/hypothesis/issues/2855
+    given_strategies = _get_strategies(*funcs)
+    posonly_argname_map = {}
+
+    for names in zip_longest(*[_get_params(f) for f in funcs]):
+        for n in names:
+            s = given_strategies[n]
+            if _valid_syntax_repr(s)[1] == "nothing()":
+                pass
+
+    # varnames_for_posonly_args = defaultdict(set)
+    # non_posonly_argnames = set()
+    # given_strategies = {}
+    # posonly_argname_map = {}
+    # for f in funcs:
+    #     with _with_any_registered():
+    #         strategies = _get_strategies(f)
+    #     for i, param in enumerate(inspect.signature(f).parameters.values()):
+    #         if param.kind is inspect.Parameter.POSITIONAL_ONLY:
+    #             s = strategies.pop(param.name)
+    #             varnames_for_posonly_args[i].add((param.name, s))
+    #         else:
+    #             non_posonly_argnames.add(param.name)
+    #     _merge_strategies_dicts(given_strategies, strategies, get_type_hints(f))
+
     var_names = [f"result_{f.__name__}" for f in funcs]
     if len(set(var_names)) < len(var_names):
         var_names = [f"result_{i}_{ f.__name__}" for i, f in enumerate(funcs)]
@@ -856,6 +885,7 @@ def _make_equiv_body(funcs, except_, style):
         except_=except_,
         ghost="equivalent",
         style=style,
+        given_strategies=given_strategies,
     )
 
 
