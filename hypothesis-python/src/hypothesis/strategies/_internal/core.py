@@ -1062,7 +1062,7 @@ def _from_type(thing: Type[Ex]) -> SearchStrategy[Ex]:
         as_strategy(v, thing, final=False)
         for k, v in sorted(types._global_type_lookup.items(), key=repr)
         if isinstance(k, type)
-        and issubclass(k, thing)
+        and types.try_issubclass(k, thing)
         and sum(types.try_issubclass(k, typ) for typ in types._global_type_lookup) == 1
     ]
     if any(not s.is_empty for s in strategies):
@@ -1071,6 +1071,13 @@ def _from_type(thing: Type[Ex]) -> SearchStrategy[Ex]:
     # may be able to fall back on type annotations.
     if issubclass(thing, enum.Enum):
         return sampled_from(thing)
+    # If it's a protocol, and we haven't registered a strategy for it, and we couldn't
+    # find a subclass (perhaps because it's not runtime-checkable), give up now.
+    if getattr(thing, "_is_protocol", False):
+        raise ResolutionFailed(
+            f"Could not resolve {thing!r} to a strategy, because Protocols cannot "
+            "be instantiated.  Consider using register_type_strategy"
+        )
 
     # Finally, try to build an instance by calling the type object.  Unlike builds(),
     # this block *does* try to infer strategies for arguments with default values.
