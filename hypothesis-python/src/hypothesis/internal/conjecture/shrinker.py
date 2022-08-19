@@ -9,7 +9,7 @@
 # obtain one at https://mozilla.org/MPL/2.0/.
 
 from collections import defaultdict
-from typing import Dict
+from typing import TYPE_CHECKING, Callable, Dict, Union
 
 import attr
 
@@ -19,7 +19,12 @@ from hypothesis.internal.conjecture.choicetree import (
     prefix_selection_order,
     random_selection_order,
 )
-from hypothesis.internal.conjecture.data import ConjectureResult, Status
+from hypothesis.internal.conjecture.data import (
+    ConjectureData,
+    ConjectureResult,
+    Status,
+    _Overrun,
+)
 from hypothesis.internal.conjecture.floats import (
     DRAW_FLOAT_LABEL,
     float_to_lex,
@@ -32,6 +37,9 @@ from hypothesis.internal.conjecture.junkdrawer import (
 )
 from hypothesis.internal.conjecture.shrinking import Float, Integer, Lexical, Ordering
 from hypothesis.internal.conjecture.shrinking.learned_dfas import SHRINKING_DFAS
+
+if TYPE_CHECKING:
+    from hypothesis.internal.conjecture.engine import ConjectureRunner
 
 
 def sort_key(buffer):
@@ -258,14 +266,17 @@ class Shrinker:
         accept.__name__ = fn.__name__
         return property(accept)
 
-    def __init__(self, engine, initial, predicate, allow_transition):
+    def __init__(
+        self,
+        engine: "ConjectureRunner",
+        initial: ConjectureData,
+        predicate: Callable[[ConjectureData], bool],
+        allow_transition: Callable[[ConjectureData, ConjectureData], bool],
+    ):
         """Create a shrinker for a particular engine, with a given starting
         point and predicate. When shrink() is called it will attempt to find an
         example for which predicate is True and which is strictly smaller than
         initial.
-
-        Note that initial is a ConjectureData object, and predicate
-        takes ConjectureData objects.
         """
         assert predicate is not None or allow_transition is not None
         self.engine = engine
@@ -385,7 +396,7 @@ class Shrinker:
         self.cached_test_function(buffer)
         return previous is not self.shrink_target
 
-    def incorporate_test_data(self, data):
+    def incorporate_test_data(self, data: Union[_Overrun, ConjectureData]):
         """Takes a ConjectureData or Overrun object updates the current
         shrink_target if this data represents an improvement over it."""
         if data.status < Status.VALID or data is self.shrink_target:
@@ -397,7 +408,7 @@ class Shrinker:
         ):
             self.update_shrink_target(data)
 
-    def cached_test_function(self, buffer):
+    def cached_test_function(self, buffer: bytes) -> Union[_Overrun, ConjectureResult]:
         """Returns a cached version of the underlying test function, so
         that the result is either an Overrun object (if the buffer is
         too short to be a valid test case) or a ConjectureData object

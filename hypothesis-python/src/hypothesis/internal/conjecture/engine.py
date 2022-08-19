@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 from enum import Enum
 from random import Random, getrandbits
+from typing import Dict, Union
 from weakref import WeakKeyDictionary
 
 import attr
@@ -29,8 +30,10 @@ from hypothesis.internal.conjecture.data import (
     ConjectureData,
     ConjectureResult,
     DataObserver,
+    InterestingOrigin,
     Overrun,
     Status,
+    _Overrun,
 )
 from hypothesis.internal.conjecture.datatree import (
     DataTree,
@@ -103,7 +106,7 @@ class ConjectureRunner:
 
         self.events_to_strings = WeakKeyDictionary()
 
-        self.interesting_examples = {}
+        self.interesting_examples: Dict[InterestingOrigin, ConjectureResult] = {}
         # We use call_count because there may be few possible valid_examples.
         self.first_bug_found_at = None
         self.last_bug_found_at = None
@@ -987,7 +990,9 @@ class ConjectureRunner:
     def new_shrinker(self, example, predicate=None, allow_transition=None):
         return Shrinker(self, example, predicate, allow_transition)
 
-    def cached_test_function(self, buffer, error_on_discard=False, extend=0):
+    def cached_test_function(
+        self, buffer: bytes, error_on_discard: bool = False, extend: int = 0
+    ) -> Union[_Overrun, ConjectureResult]:
         """Checks the tree to see if we've tested this buffer, and returns the
         previous result if we have.
 

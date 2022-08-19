@@ -9,12 +9,16 @@
 # obtain one at https://mozilla.org/MPL/2.0/.
 
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from sortedcontainers import SortedList
 
 from hypothesis.internal.conjecture.data import ConjectureData, ConjectureResult, Status
 from hypothesis.internal.conjecture.junkdrawer import LazySequenceCopy, swap
 from hypothesis.internal.conjecture.shrinker import sort_key
+
+if TYPE_CHECKING:
+    from hypothesis.internal.conjecture.engine import ConjectureRunner
 
 NO_SCORE = float("-inf")
 
@@ -275,7 +279,7 @@ class ParetoOptimiser:
     """
 
     def __init__(self, engine):
-        self.__engine = engine
+        self.__engine: "ConjectureRunner" = engine
         self.front = self.__engine.pareto_front
 
     def run(self):
