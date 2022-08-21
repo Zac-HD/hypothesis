@@ -5148,7 +5148,7 @@ instead of a sequence for :func:`~hypothesis.strategies.sampled_from`, which
 standardises the distribution of examples and the shrinking behaviour.
 
 You can get the previous behaviour by using
-``lists(sampled_from(alphabet)).map("".map)`` instead.
+``lists(sampled_from(alphabet)).map("".join)`` instead.
 
 .. _v4.28.0:
 
