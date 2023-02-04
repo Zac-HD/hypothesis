@@ -62,6 +62,9 @@ class FeatureFlags:
     def is_enabled(self, name):
         """Tests whether the feature named ``name`` should be enabled on this
         test run."""
+        # ABLATION: no use of swarm testing
+        return True
+
         if self.__data is None or self.__data.frozen:
             # Feature set objects might hang around after data generation has
             # finished. If this happens then we just report all new features as
