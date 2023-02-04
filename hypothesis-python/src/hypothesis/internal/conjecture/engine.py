@@ -86,7 +86,9 @@ class ConjectureRunner:
         ignore_limits=False,
     ):
         self._test_function = test_function
-        self.settings = settings or Settings()
+        # ABLATION: no internal usage of previous examples (e.g. mutation)
+        #           here, via force-disabling the database.
+        self.settings = Settings(database=None, parent=settings)
         self.shrinks = 0
         self.finish_shrinking_deadline = None
         self.call_count = 0
@@ -315,7 +317,9 @@ class ConjectureRunner:
         least one novel prefix left to find. If there were not, then the
         test run should have already stopped due to tree exhaustion.
         """
-        return self.tree.generate_novel_prefix(self.random)
+        # ABLATION: no internal usage of previous examples (e.g. mutation)
+        return b""
+        # return self.tree.generate_novel_prefix(self.random)
 
     def record_for_health_check(self, data):
         # Once we've actually found a bug, there's no point in trying to run
@@ -715,6 +719,9 @@ class ConjectureRunner:
             data = self.new_conjecture_data(prefix=prefix, max_length=max_length)
 
             self.test_function(data)
+
+            # ABLATION: no internal usage of previous examples (e.g. mutation)
+            continue
 
             self.generate_mutations_from(data)
 
