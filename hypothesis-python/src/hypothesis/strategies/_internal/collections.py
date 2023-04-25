@@ -11,6 +11,7 @@
 import copy
 from typing import Any, Iterable, Tuple, overload
 
+from hypothesis.control import current_build_context
 from hypothesis.errors import InvalidArgument
 from hypothesis.internal.conjecture import utils as cu
 from hypothesis.internal.conjecture.junkdrawer import LazySequenceCopy
@@ -28,6 +29,11 @@ from hypothesis.strategies._internal.strategies import (
     filter_not_satisfied,
 )
 from hypothesis.strategies._internal.utils import cacheable, defines_strategy
+from hypothesis.vendor.pretty import (
+    IDKey,
+    _dict_pprinter_factory,
+    _seq_pprinter_factory,
+)
 
 
 class TupleStrategy(SearchStrategy):
@@ -55,7 +61,16 @@ class TupleStrategy(SearchStrategy):
         return all(recur(e) for e in self.element_strategies)
 
     def do_draw(self, data):
-        return tuple(data.draw(e) for e in self.element_strategies)
+        context = current_build_context()
+        assert data is context.data
+        args, _, arg_slices = context.prep_args_kwargs_from_strategies(
+            self.element_strategies, {}
+        )
+        result = tuple(args)
+        context.known_object_printers[IDKey(result)].append(
+            _seq_pprinter_factory("(", ")", tuple, arg_slices)
+        )
+        return result
 
     def calc_is_empty(self, recur):
         return any(recur(e) for e in self.element_strategies)
@@ -299,7 +314,15 @@ class FixedKeysDictStrategy(MappedSearchStrategy):
         return f"FixedKeysDictStrategy({self.keys!r}, {self.mapped_strategy!r})"
 
     def pack(self, value):
-        return self.dict_type(zip(self.keys, value))
+        result = self.dict_type(zip(self.keys, value))
+        known_printers = current_build_context().known_object_printers
+        try:
+            known_printers[IDKey(result)].append(
+                _dict_pprinter_factory(known_printers[IDKey(value)].pop().arg_slices)
+            )
+        except Exception:  # pragma: no cover
+            pass  # just paranoia about evil user-defined dictionary types
+        return result
 
 
 class FixedAndOptionalKeysDictStrategy(SearchStrategy):
