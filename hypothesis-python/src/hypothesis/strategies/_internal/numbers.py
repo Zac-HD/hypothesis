@@ -98,12 +98,7 @@ class IntegersStrategy(SearchStrategy):
         forced = None
         if self.end - self.start > 127:
             forced = {
-                122: self.start,
-                123: self.start,
-                124: self.end,
-                125: self.end,
-                126: self.start + 1,
-                127: self.end - 1,
+                # ABLATION: no upweighting of endpoints
             }.get(data.draw_bits(7))
 
         return d.integer_range(data, self.start, self.end, center=0, forced=forced)
@@ -254,7 +249,7 @@ class FloatStrategy(SearchStrategy):
             max_value,
         ]
         self.nasty_floats = [
-            f for f in NASTY_FLOATS + boundary_values if self.permitted(f)
+            # ABLATION: no heuristic for nasty or boundary floats
         ]
         weights = [0.2 * len(self.nasty_floats)] + [0.8] * len(self.nasty_floats)
         self.sampler = d.Sampler(weights) if self.nasty_floats else None
