@@ -77,6 +77,7 @@ from hypothesis.internal.compat import (
 from hypothesis.internal.conjecture.data import ConjectureData, Status
 from hypothesis.internal.conjecture.engine import BUFFER_SIZE, ConjectureRunner
 from hypothesis.internal.conjecture.junkdrawer import ensure_free_stackframes
+from hypothesis.internal.conjecture.providers import PrimitiveProvider, Provider
 from hypothesis.internal.conjecture.shrinker import sort_key
 from hypothesis.internal.entropy import deterministic_PRNG
 from hypothesis.internal.escalation import (
@@ -490,7 +491,7 @@ def execute_explicit_examples(state, wrapped_test, arguments, kwargs, original_s
                 )
                 execute_example = partial(
                     state.execute_once,
-                    ConjectureData.for_buffer(b""),
+                    Provider(PrimitiveProvider(ConjectureData.for_buffer(b""))),
                     is_final=True,
                     print_example=True,
                     example_kwargs=example_kwargs,
@@ -805,6 +806,7 @@ class StateForActualGivenExecution:
                 return result
 
         def run(data):
+            assert isinstance(data, Provider), data
             # Set up dynamic context needed by a single test run.
             if self.stuff.selfy is not None:
                 data.hypothesis_runner = self.stuff.selfy
@@ -1037,7 +1039,9 @@ class StateForActualGivenExecution:
             info = falsifying_example.extra_information
             fragments = []
 
-            ran_example = ConjectureData.for_buffer(falsifying_example.buffer)
+            ran_example = runner.new_conjecture_data_for_buffer(
+                falsifying_example.buffer
+            )
             ran_example.slice_comments = falsifying_example.slice_comments
             assert info.__expected_exception is not None
             try:
@@ -1513,7 +1517,7 @@ def given(
                 assert isinstance(buffer, (bytes, bytearray, memoryview))
                 data = ConjectureData.for_buffer(buffer)
                 try:
-                    state.execute_once(data)
+                    state.execute_once(Provider(PrimitiveProvider(data)))
                 except (StopTest, UnsatisfiedAssumption):
                     return None
                 except BaseException:

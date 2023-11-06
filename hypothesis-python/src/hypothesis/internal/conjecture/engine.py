@@ -875,15 +875,27 @@ class ConjectureRunner:
         self.exit_with(ExitReason.finished)
 
     def new_conjecture_data(self, prefix, max_length=BUFFER_SIZE, observer=None):
-        return ConjectureData(
-            prefix=prefix,
-            max_length=max_length,
-            random=self.random,
-            observer=observer or self.tree.new_observer(),
+        from .providers import Provider, PrimitiveProvider
+
+        return Provider(
+            PrimitiveProvider(
+                ConjectureData(
+                    prefix=prefix,
+                    max_length=max_length,
+                    random=self.random,
+                    observer=observer or self.tree.new_observer(),
+                )
+            )
         )
 
     def new_conjecture_data_for_buffer(self, buffer):
-        return ConjectureData.for_buffer(buffer, observer=self.tree.new_observer())
+        from .providers import Provider, PrimitiveProvider
+
+        return Provider(
+            PrimitiveProvider(
+                ConjectureData.for_buffer(buffer, observer=self.tree.new_observer())
+            )
+        )
 
     def shrink_interesting_examples(self):
         """If we've found interesting examples, try to replace each of them

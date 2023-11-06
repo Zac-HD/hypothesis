@@ -17,6 +17,7 @@ from hypothesis._settings import note_deprecation
 from hypothesis.errors import InvalidArgument, UnsatisfiedAssumption
 from hypothesis.internal.compat import BaseExceptionGroup
 from hypothesis.internal.conjecture.data import ConjectureData
+from hypothesis.internal.conjecture.providers import Provider
 from hypothesis.internal.reflection import get_pretty_function_description
 from hypothesis.internal.validation import check_type
 from hypothesis.reporting import report, verbose_report
@@ -76,7 +77,7 @@ def current_build_context() -> "BuildContext":
 
 class BuildContext:
     def __init__(self, data, *, is_final=False, close_on_capture=True):
-        assert isinstance(data, ConjectureData)
+        assert isinstance(data, Provider), data
         self.data = data
         self.tasks = []
         self.is_final = is_final

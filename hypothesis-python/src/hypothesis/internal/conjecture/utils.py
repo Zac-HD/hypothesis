@@ -52,14 +52,15 @@ SAMPLE_IN_SAMPLER_LABEL = calc_label_from_name("a sample() in Sampler")
 ONE_FROM_MANY_LABEL = calc_label_from_name("one more from many()")
 
 
-def unbounded_integers(data: "ConjectureData") -> int:
+def unbounded_integers(data: "ConjectureData", *, forced: Optional[int] = None) -> int:
+    assert forced is None
     size = INT_SIZES[INT_SIZES_SAMPLER.sample(data)]
     r = data.draw_bits(size)
     sign = r & 1
     r >>= 1
     if sign:
-        r = -r
-    return int(r)
+        return -r
+    return r
 
 
 def integer_range(
