@@ -91,6 +91,7 @@ from hypothesis.internal.observability import (
     TESTCASE_CALLBACKS,
     deliver_json_blob,
     make_testcase,
+    maybe_recommend_tyche,
 )
 from hypothesis.internal.reflection import (
     convert_positional_arguments,
@@ -1402,6 +1403,8 @@ def given(
                     "@given(booleans()) @given(integers()), you could write "
                     "@given(booleans(), integers())"
                 )
+
+            maybe_recommend_tyche()
 
             settings = wrapped_test._hypothesis_internal_use_settings
 

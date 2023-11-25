@@ -159,7 +159,7 @@ def to_jsonable(obj: object) -> object:
     """
     if isinstance(obj, (str, int, float, bool, type(None))):
         if isinstance(obj, int) and abs(obj) >= 2**63:
-            return float(obj)
+            return float(obj)  # See https://github.com/simonw/sqlite-utils/issues/605
         return obj
     if isinstance(obj, (list, tuple, set, frozenset)):
         if isinstance(obj, tuple) and hasattr(obj, "_asdict"):

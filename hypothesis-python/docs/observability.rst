@@ -44,6 +44,13 @@ or by using the :pypi:`sqlite-utils` and :pypi:`datasette` libraries::
     sqlite-utils insert testcases.db testcases .hypothesis/observed/*_testcases.jsonl --nl --flatten
     datasette serve testcases.db
 
+As an *experimental and unsupported* interface, you can also register other callbacks
+to deliver observations by appending a function to the list
+``hypothesis.internal.observability.TESTCASE_CALLBACKS``.  This is designed to support
+third-party integrations such as `the Tyche VS Code extension
+<https://marketplace.visualstudio.com/items?itemName=HarrisonGoldstein.tyche>`__,
+and is subject to change without notice at any time.
+
 
 Collecting more information
 ---------------------------

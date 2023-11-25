@@ -12,6 +12,8 @@
 
 import json
 import os
+import sys
+import warnings
 from datetime import date, timedelta
 from typing import Callable, Dict, List, Optional
 
@@ -90,3 +92,39 @@ if "HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY" in os.environ:  # pragma: no cover
     for f in storage_directory("observed").glob("*.jsonl"):
         if f.stem < max_age:  # pragma: no branch
             f.unlink(missing_ok=True)
+
+
+def maybe_recommend_tyche():
+    # Introspect whether we're being run from a VS Code testing session; if so we'll
+    # recommend installing the Tyche frontend.  For module names, see
+    # https://github.com/microsoft/vscode-python/tree/main/pythonFiles
+    # NOTE: we'd be delighted to support other editors such as PyCharm too :-)
+    if "testing_tools" in sys.modules and {
+        "vscode_pytest",
+        "unittestadapter",
+    }.intersection(sys.modules):
+        try:
+            # FIXME: this would have the side-effect of loading the shim, when we really
+            #        only want to check whether it's already present.  Let's wait and
+            #        see if Tyche can integrate everything into the VSCode plugin, as
+            #        for microsoft's Python plugin which we detected above.
+            #
+            # pip install git+https://github.com/tyche-pbt/tyche-hypothesis.git
+            pass
+        except ImportError:
+            # TODO: this whole setup assumes that:
+            #   (a) we do in fact endorse Tyche for ~all users in VS Code,
+            #       which I'm unsure of - does it get out of the way enough
+            #       when it's not providing much value?
+            #       We need some easy way to disable this warning if not!
+            #   (b) installing the VSC plugin is sufficient, i.e. that hooks
+            #       up an entrypoint which will add a delivery callback to
+            #       TESTCASE_CALLBACKS.
+            warnings.warn(
+                "We recommend using the HarrisonGoldstein.tyche extension when running "
+                "property-based tests in VS Code; it provides some nice visualizations "
+                "including highlighting lines of code covered by passing and/or failing "
+                "inputs to your test function.",
+                category=UserWarning,
+                stacklevel=4,
+            )

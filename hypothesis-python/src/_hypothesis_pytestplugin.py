@@ -379,6 +379,7 @@ else:
             terminalreporter.section("Hypothesis")
             for fname in sorted(_WROTE_TO):
                 terminalreporter.write_line(f"observations written to {fname}")
+                # TODO: this message would be a good place to suggest Tyche
 
         if failing_examples:
             # This must have been imported already to write the failing examples
