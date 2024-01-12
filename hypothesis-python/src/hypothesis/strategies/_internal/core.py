@@ -2201,7 +2201,19 @@ def register_type_strategy(
             f"{strategy=} must be a SearchStrategy, or a function that takes "
             "a generic type and returns a specific SearchStrategy"
         )
-    elif isinstance(strategy, SearchStrategy) and strategy.is_empty:
+    elif (
+        isinstance(strategy, SearchStrategy)
+        and not (
+            # We don't want to materialize any lazily-evaluated strategies while
+            # we're part-way through loading third-party plugins, but we'll scope
+            # the exemption to this check as narrowly as possible.  See
+            # https://github.com/HypothesisWorks/hypothesis/issues/3836 for more.
+            hasattr(sys.modules["hypothesis"], "run")
+            and isinstance(strategy, (LazyStrategy, DeferredStrategy))
+            and strategy._wrapped_strategy is None
+        )
+        and strategy.is_empty
+    ):
         raise InvalidArgument(f"{strategy=} must not be empty")
     elif types.has_type_arguments(custom_type):
         raise InvalidArgument(

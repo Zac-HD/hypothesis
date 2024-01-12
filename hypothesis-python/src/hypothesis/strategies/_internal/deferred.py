@@ -10,6 +10,7 @@
 
 import inspect
 
+from hypothesis.configuration import check_not_loading_plugins
 from hypothesis.errors import InvalidArgument
 from hypothesis.internal.reflection import get_pretty_function_description
 from hypothesis.strategies._internal.strategies import SearchStrategy, check_strategy
@@ -20,13 +21,14 @@ class DeferredStrategy(SearchStrategy):
 
     def __init__(self, definition):
         super().__init__()
-        self.__wrapped_strategy = None
+        self._wrapped_strategy = None
         self.__in_repr = False
         self.__definition = definition
 
     @property
     def wrapped_strategy(self):
-        if self.__wrapped_strategy is None:
+        if self._wrapped_strategy is None:
+            check_not_loading_plugins(f"lazy evaluation of {self!r}")
             if not inspect.isfunction(self.__definition):
                 raise InvalidArgument(
                     f"Expected definition to be a function but got {self.__definition!r} "
@@ -36,9 +38,9 @@ class DeferredStrategy(SearchStrategy):
             if result is self:
                 raise InvalidArgument("Cannot define a deferred strategy to be itself")
             check_strategy(result, "definition()")
-            self.__wrapped_strategy = result
+            self._wrapped_strategy = result
             self.__definition = None
-        return self.__wrapped_strategy
+        return self._wrapped_strategy
 
     @property
     def branches(self):
@@ -68,12 +70,12 @@ class DeferredStrategy(SearchStrategy):
         return recur(self.wrapped_strategy)
 
     def __repr__(self):
-        if self.__wrapped_strategy is not None:
+        if self._wrapped_strategy is not None:
             if self.__in_repr:
                 return f"(deferred@{id(self)!r})"
             try:
                 self.__in_repr = True
-                return repr(self.__wrapped_strategy)
+                return repr(self._wrapped_strategy)
             finally:
                 self.__in_repr = False
         else:

@@ -12,6 +12,7 @@ from inspect import signature
 from typing import MutableMapping
 from weakref import WeakKeyDictionary
 
+from hypothesis.configuration import check_not_loading_plugins
 from hypothesis.internal.reflection import (
     convert_keyword_arguments,
     convert_positional_arguments,
@@ -73,7 +74,7 @@ class LazyStrategy(SearchStrategy):
 
     def __init__(self, function, args, kwargs, filters=(), *, force_repr=None):
         super().__init__()
-        self.__wrapped_strategy = None
+        self._wrapped_strategy = None
         self.__representation = force_repr
         self.function = function
         self.__args = args
@@ -99,7 +100,8 @@ class LazyStrategy(SearchStrategy):
 
     @property
     def wrapped_strategy(self):
-        if self.__wrapped_strategy is None:
+        if self._wrapped_strategy is None:
+            check_not_loading_plugins(f"lazy evaluation of {self!r}")
             unwrapped_args = tuple(unwrap_strategies(s) for s in self.__args)
             unwrapped_kwargs = {
                 k: unwrap_strategies(v) for k, v in self.__kwargs.items()
@@ -107,14 +109,14 @@ class LazyStrategy(SearchStrategy):
 
             base = self.function(*self.__args, **self.__kwargs)
             if unwrapped_args == self.__args and unwrapped_kwargs == self.__kwargs:
-                self.__wrapped_strategy = base
+                self._wrapped_strategy = base
             else:
-                self.__wrapped_strategy = self.function(
+                self._wrapped_strategy = self.function(
                     *unwrapped_args, **unwrapped_kwargs
                 )
             for f in self.__filters:
-                self.__wrapped_strategy = self.__wrapped_strategy.filter(f)
-        return self.__wrapped_strategy
+                self._wrapped_strategy = self._wrapped_strategy.filter(f)
+        return self._wrapped_strategy
 
     def filter(self, condition):
         try:
