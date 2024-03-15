@@ -8,6 +8,7 @@
 # v. 2.0. If a copy of the MPL was not distributed with this file, You can
 # obtain one at https://mozilla.org/MPL/2.0/.
 
+from math import isnan
 import os
 import re
 import tempfile
@@ -28,6 +29,8 @@ from hypothesis.database import (
     InMemoryExampleDatabase,
     MultiplexedDatabase,
     ReadOnlyDatabase,
+    ir_from_bytes,
+    ir_to_bytes,
 )
 from hypothesis.errors import HypothesisWarning
 from hypothesis.stateful import Bundle, RuleBasedStateMachine, rule
@@ -426,3 +429,26 @@ def test_gadb_coverage():
     state = GitHubArtifactMocks()
     state.save(b"key", b"value")
     state.values_agree(b"key")
+
+
+@given(
+    st.lists(
+        st.booleans()
+        | st.integers()
+        | st.floats()
+        | st.text(st.characters())
+        | st.binary()
+    )
+)
+def test_ir_serialization(ir):
+    s = ir_to_bytes(ir)
+    assert isinstance(s, bytes)
+    ir2 = ir_from_bytes(s)
+    assert len(ir) == len(ir2)
+    assert all(
+        a == b
+        or (isinstance(a, float) and isinstance(b, float) and isnan(a) and isnan(b))
+        for a, b in zip(ir, ir2, strict=True)
+    ), f"{ir=} {ir2=}"
+    s2 = ir_to_bytes(ir2)
+    assert s == s2
