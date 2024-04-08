@@ -42,6 +42,8 @@ from hypothesis.internal.conjecture.shrinker import Shrinker, sort_key
 from hypothesis.internal.healthcheck import fail_health_check
 from hypothesis.reporting import base_report, report
 
+from hypothesis.internal.observability import TESTCASE_CALLBACKS
+
 MAX_SHRINKS = 500
 CACHE_SIZE = 10000
 MUTATION_POOL_SIZE = 100
@@ -309,18 +311,19 @@ class ConjectureRunner:
         if data.status == Status.VALID:
             self.valid_examples += 1
 
+        def _post_test_case_hook():
+            for node in data.examples.ir_tree_nodes:
+                value = data.provider.post_test_case_hook(node.value)
+                # require providers to return something valid here.
+                assert (
+                    value is not None
+                ), "providers must return a non-null value from post_test_case_hook"
+                node.value = value
+
         if data.status == Status.INTERESTING:
             if self.settings.backend != "hypothesis":
-                for node in data.examples.ir_tree_nodes:
-                    value = data.provider.post_test_case_hook(node.value)
-                    # require providers to return something valid here.
-                    assert (
-                        value is not None
-                    ), "providers must return a non-null value from post_test_case_hook"
-                    node.value = value
-
-                # drive the ir tree through the test function to convert it
-                # to a buffer
+                # drive the ir tree through the test function to convert it to a buffer
+                _post_test_case_hook()
                 data = self.ir_tree_to_data(data.examples.ir_tree_nodes)
                 self.__data_cache[data.buffer] = data.as_result()
 
@@ -348,6 +351,10 @@ class ConjectureRunner:
 
             if self.shrinks >= MAX_SHRINKS:
                 self.exit_with(ExitReason.max_shrinks)
+        elif TESTCASE_CALLBACKS and self.settings.backend != "hypothesis":
+            print("HERE")
+            # FIXME
+            _post_test_case_hook()
 
         if (
             not self.ignore_limits
