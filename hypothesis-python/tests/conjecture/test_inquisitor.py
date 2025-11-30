@@ -115,3 +115,117 @@ def test_inquisitor_doesnt_break_on_varying_forced_nodes(n1, n2):
 def test_issue_3755_regression(start_date, data):
     data.draw(st.datetimes(min_value=start_date))
     raise ZeroDivisionError
+
+
+# Tests for sub-argument explanations
+
+
+class MyClass:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+@fails_with_output(
+    """
+Falsifying example: test_inquisitor_builds_subargs(
+    obj=MyClass(
+        0,  # or any other generated value
+        True,
+    ),
+)
+"""
+)
+@settings(print_blob=False, derandomize=True)
+@given(st.builds(MyClass, st.integers(), st.booleans()))
+def test_inquisitor_builds_subargs(obj):
+    assert not obj.y
+
+
+@fails_with_output(
+    """
+Falsifying example: test_inquisitor_builds_kwargs_subargs(
+    obj=MyClass(
+        x=0,  # or any other generated value
+        y=True,
+    ),
+)
+"""
+)
+@settings(print_blob=False, derandomize=True)
+@given(st.builds(MyClass, x=st.integers(), y=st.booleans()))
+def test_inquisitor_builds_kwargs_subargs(obj):
+    assert not obj.y
+
+
+@fails_with_output(
+    """
+Falsifying example: test_inquisitor_tuple_subargs(
+    t=(
+        0,  # or any other generated value
+        True,
+    ),
+)
+"""
+)
+@settings(print_blob=False, derandomize=True)
+@given(st.tuples(st.integers(), st.booleans()))
+def test_inquisitor_tuple_subargs(t):
+    assert not t[1]
+
+
+@fails_with_output(
+    """
+Falsifying example: test_inquisitor_fixeddict_subargs(
+    d={
+        'x': 0,  # or any other generated value
+        'y': True,
+    },
+)
+"""
+)
+@settings(print_blob=False, derandomize=True)
+@given(st.fixed_dictionaries({"x": st.integers(), "y": st.booleans()}))
+def test_inquisitor_fixeddict_subargs(d):
+    assert not d["y"]
+
+
+@fails_with_output(
+    """
+Falsifying example: test_inquisitor_tuple_multiple_varying(
+    t=(
+        0,  # or any other generated value
+        '',  # or any other generated value
+        True,
+    ),
+)
+"""
+)
+@settings(print_blob=False, derandomize=True)
+@given(st.tuples(st.integers(), st.text(), st.booleans()))
+def test_inquisitor_tuple_multiple_varying(t):
+    # Multiple sub-arguments can vary, but the "together" comment only applies
+    # to top-level test arguments, not to sub-arguments within composites.
+    assert not t[2]
+
+
+@fails_with_output(
+    """
+Falsifying example: test_inquisitor_skip_subset_slices(
+    obj=MyClass(
+        (0, False),  # or any other generated value
+        y=False,
+    ),
+)
+"""
+)
+@settings(print_blob=False, derandomize=True)
+@given(
+    st.builds(
+        MyClass, st.tuples(st.integers(), st.booleans()), y=st.booleans()
+    )
+)
+def test_inquisitor_skip_subset_slices(obj):
+    # The tuple can vary freely, but the booleans inside it shouldn't
+    # get individual comments since they're part of a larger varying slice.
+    assert obj.y

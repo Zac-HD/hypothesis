@@ -158,36 +158,61 @@ class BuildContext:
         *,
         args: Sequence[object],
         kwargs: dict[str, object],
+        arg_labels: "dict[int | str, tuple[int, int]] | None" = None,
     ) -> None:
         self.known_object_printers[IDKey(obj)].append(
             # _func=func prevents mypy from inferring lambda type. Would need
             # paramspec I think - not worth it.
-            lambda obj, p, cycle, *, _func=func: p.maybe_repr_known_object_as_call(  # type: ignore
-                obj, cycle, get_pretty_function_description(_func), args, kwargs
+            lambda obj, p, cycle, *, _func=func, _arg_labels=arg_labels: p.maybe_repr_known_object_as_call(  # type: ignore
+                obj,
+                cycle,
+                get_pretty_function_description(_func),
+                args,
+                kwargs,
+                arg_labels=_arg_labels,
             )
         )
 
-    def prep_args_kwargs_from_strategies(self, kwarg_strategies):
-        arg_labels = {}
-        kwargs = {}
-        for k, s in kwarg_strategies.items():
-            start_idx = len(self.data.nodes)
-            with deprecate_random_in_strategy("from {}={!r}", k, s):
-                obj = self.data.draw(s, observe_as=f"generate:{k}")
-            end_idx = len(self.data.nodes)
-            kwargs[k] = obj
+    def prep_args_kwargs_from_strategies(
+        self,
+        args_strategies: "Sequence[Any]" = (),
+        kwarg_strategies: "dict[str, Any] | None" = None,
+    ) -> "tuple[list[Any], dict[str, Any], dict[int | str, tuple[int, int]]]":
+        arg_labels: dict[int | str, tuple[int, int]] = {}
+        args: list[Any] = []
+        kwargs: dict[str, Any] = {}
 
-            # This high up the stack, we can't see or really do much with the conjecture
-            # Example objects - not least because they're only materialized after the
-            # test case is completed.  Instead, we'll stash the (start_idx, end_idx)
-            # pair on our data object for the ConjectureRunner engine to deal with, and
-            # pass a dict of such out so that the pretty-printer knows where to place
-            # the which-parts-matter comments later.
+        # Draw positional args
+        for i, s in enumerate(args_strategies):
+            start_idx = len(self.data.nodes)
+            with deprecate_random_in_strategy("from arg[{}]={!r}", i, s):
+                obj = self.data.draw(s, observe_as=f"generate:arg[{i}]")
+            end_idx = len(self.data.nodes)
+            args.append(obj)
             if start_idx != end_idx:
-                arg_labels[k] = (start_idx, end_idx)
+                arg_labels[i] = (start_idx, end_idx)
                 self.data.arg_slices.add((start_idx, end_idx))
 
-        return kwargs, arg_labels
+        # Draw keyword args
+        if kwarg_strategies:
+            for k, s in kwarg_strategies.items():
+                start_idx = len(self.data.nodes)
+                with deprecate_random_in_strategy("from {}={!r}", k, s):
+                    obj = self.data.draw(s, observe_as=f"generate:{k}")
+                end_idx = len(self.data.nodes)
+                kwargs[k] = obj
+
+                # This high up the stack, we can't see or really do much with the conjecture
+                # Example objects - not least because they're only materialized after the
+                # test case is completed.  Instead, we'll stash the (start_idx, end_idx)
+                # pair on our data object for the ConjectureRunner engine to deal with, and
+                # pass a dict of such out so that the pretty-printer knows where to place
+                # the which-parts-matter comments later.
+                if start_idx != end_idx:
+                    arg_labels[k] = (start_idx, end_idx)
+                    self.data.arg_slices.add((start_idx, end_idx))
+
+        return args, kwargs, arg_labels
 
     def __enter__(self):
         self.assign_variable = _current_build_context.with_value(self)
