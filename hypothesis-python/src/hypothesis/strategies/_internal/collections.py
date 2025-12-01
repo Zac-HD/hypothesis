@@ -68,16 +68,11 @@ class TupleStrategy(SearchStrategy[tuple[Ex, ...]]):
         from hypothesis.vendor.pretty import IDKey, _tuple_pprinter
 
         context = current_build_context()
-        arg_labels: dict[int, tuple[int, int]] = {}
-        elements = []
-        for i, strategy in enumerate(self.element_strategies):
-            start_idx = len(data.nodes)
-            elem = data.draw(strategy)
-            end_idx = len(data.nodes)
-            elements.append(elem)
-            if start_idx != end_idx:
-                arg_labels[i] = (start_idx, end_idx)
-                data.arg_slices.add((start_idx, end_idx))
+        arg_labels: dict[str, tuple[int, int]] = {}
+        elements = [
+            context.draw_and_record_slice(s, f"arg[{i}]", arg_labels)
+            for i, s in enumerate(self.element_strategies)
+        ]
         result = tuple(elements)
         if arg_labels:
             context.known_object_printers[IDKey(result)].append(
@@ -389,20 +384,13 @@ class FixedDictStrategy(SearchStrategy[dict[Any, Any]]):
         from hypothesis.vendor.pretty import IDKey, _fixeddict_pprinter
 
         context = current_build_context()
-        arg_labels: dict[Any, tuple[int, int]] = {}
-
-        # Draw fixed keys with tracking
+        arg_labels: dict[str, tuple[int, int]] = {}
         dict_type = type(self.mapping)
         value = dict_type()
-        for key, strategy in self.mapping.items():
-            start_idx = len(data.nodes)
-            value[key] = data.draw(strategy)
-            end_idx = len(data.nodes)
-            if start_idx != end_idx:
-                arg_labels[key] = (start_idx, end_idx)
-                data.arg_slices.add((start_idx, end_idx))
 
-        # Draw optional keys
+        for key, strategy in self.mapping.items():
+            value[key] = context.draw_and_record_slice(strategy, str(key), arg_labels)
+
         if self.optional is not None:
             remaining = [k for k, v in self.optional.items() if not v.is_empty]
             should_draw = cu.many(
@@ -415,12 +403,9 @@ class FixedDictStrategy(SearchStrategy[dict[Any, Any]]):
                 j = data.draw_integer(0, len(remaining) - 1)
                 remaining[-1], remaining[j] = remaining[j], remaining[-1]
                 key = remaining.pop()
-                start_idx = len(data.nodes)
-                value[key] = data.draw(self.optional[key])
-                end_idx = len(data.nodes)
-                if start_idx != end_idx:
-                    arg_labels[key] = (start_idx, end_idx)
-                    data.arg_slices.add((start_idx, end_idx))
+                value[key] = context.draw_and_record_slice(
+                    self.optional[key], str(key), arg_labels
+                )
 
         if arg_labels:
             context.known_object_printers[IDKey(value)].append(

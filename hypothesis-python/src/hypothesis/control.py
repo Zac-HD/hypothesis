@@ -151,6 +151,35 @@ class BuildContext:
             defaultdict(list)
         )
 
+        # Stack of labels for tracking nested strategy calls (e.g., "b.kw" for
+        # a kwarg "kw" inside a builds() assigned to "b")
+        self._label_path: list[str] = []
+
+    @contextmanager
+    def _with_label(self, label: str):
+        """Context manager to track the current label path for nested calls."""
+        self._label_path.append(label)
+        try:
+            yield
+        finally:
+            self._label_path.pop()
+
+    def draw_and_record_slice(
+        self,
+        strategy: Any,
+        label: str,
+        arg_labels: "dict[str, tuple[int, int]]",
+    ) -> Any:
+        """Draw from strategy and record slice for explain-phase comments."""
+        start_idx = len(self.data.nodes)
+        with self._with_label(label):
+            obj = self.data.draw(strategy)
+        end_idx = len(self.data.nodes)
+        if start_idx < end_idx:
+            arg_labels[label] = (start_idx, end_idx)
+            self.data.arg_slices.add((start_idx, end_idx))
+        return obj
+
     def record_call(
         self,
         obj: object,
@@ -158,11 +187,9 @@ class BuildContext:
         *,
         args: Sequence[object],
         kwargs: dict[str, object],
-        arg_labels: "dict[int | str, tuple[int, int]] | None" = None,
+        arg_labels: "dict[str, tuple[int, int]] | None" = None,
     ) -> None:
         self.known_object_printers[IDKey(obj)].append(
-            # _func=func prevents mypy from inferring lambda type. Would need
-            # paramspec I think - not worth it.
             lambda obj, p, cycle, *, _func=func, _arg_labels=arg_labels: p.maybe_repr_known_object_as_call(  # type: ignore
                 obj,
                 cycle,
@@ -177,40 +204,37 @@ class BuildContext:
         self,
         args_strategies: "Sequence[Any]" = (),
         kwarg_strategies: "dict[str, Any] | None" = None,
-    ) -> "tuple[list[Any], dict[str, Any], dict[int | str, tuple[int, int]]]":
-        arg_labels: dict[int | str, tuple[int, int]] = {}
+    ) -> "tuple[list[Any], dict[str, Any], dict[str, tuple[int, int]]]":
+        arg_labels: dict[str, tuple[int, int]] = {}
         args: list[Any] = []
         kwargs: dict[str, Any] = {}
 
-        # Draw positional args
-        for i, s in enumerate(args_strategies):
-            start_idx = len(self.data.nodes)
-            with deprecate_random_in_strategy("from arg[{}]={!r}", i, s):
-                obj = self.data.draw(s, observe_as=f"generate:arg[{i}]")
-            end_idx = len(self.data.nodes)
-            args.append(obj)
-            if start_idx != end_idx:
-                arg_labels[i] = (start_idx, end_idx)
-                self.data.arg_slices.add((start_idx, end_idx))
-
-        # Draw keyword args
+        # Combine all strategies with their labels
+        all_strategies: list[tuple[str, Any]] = [
+            (f"arg[{i}]", s) for i, s in enumerate(args_strategies)
+        ]
         if kwarg_strategies:
-            for k, s in kwarg_strategies.items():
-                start_idx = len(self.data.nodes)
-                with deprecate_random_in_strategy("from {}={!r}", k, s):
-                    obj = self.data.draw(s, observe_as=f"generate:{k}")
-                end_idx = len(self.data.nodes)
-                kwargs[k] = obj
+            all_strategies.extend(kwarg_strategies.items())
 
-                # This high up the stack, we can't see or really do much with the conjecture
-                # Example objects - not least because they're only materialized after the
-                # test case is completed.  Instead, we'll stash the (start_idx, end_idx)
-                # pair on our data object for the ConjectureRunner engine to deal with, and
-                # pass a dict of such out so that the pretty-printer knows where to place
-                # the which-parts-matter comments later.
-                if start_idx != end_idx:
-                    arg_labels[k] = (start_idx, end_idx)
-                    self.data.arg_slices.add((start_idx, end_idx))
+        for label, s in all_strategies:
+            prefix = ".".join(self._label_path)
+            full_label = f"{prefix}.{label}" if prefix else label
+            start_idx = len(self.data.nodes)
+            with (
+                deprecate_random_in_strategy("from {}={!r}", full_label, s),
+                self._with_label(label),
+            ):
+                obj = self.data.draw(s, observe_as=f"generate:{full_label}")
+            end_idx = len(self.data.nodes)
+
+            if label.startswith("arg["):
+                args.append(obj)
+            else:
+                kwargs[label] = obj
+
+            if start_idx < end_idx:
+                arg_labels[label] = (start_idx, end_idx)
+                self.data.arg_slices.add((start_idx, end_idx))
 
         return args, kwargs, arg_labels
 

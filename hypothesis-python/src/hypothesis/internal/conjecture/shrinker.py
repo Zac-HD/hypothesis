@@ -492,6 +492,8 @@ class Shrinker:
 
             # Skip slices that are subsets of already-explained slices.
             # If a larger slice can vary freely, so can its sub-slices.
+            # Note: (0, 0) is a special marker for the "together" comment that
+            # applies to the whole test, not a specific slice, so we exclude it.
             if any(
                 s <= start and end <= e
                 for s, e in self.shrink_target.slice_comments

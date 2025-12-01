@@ -229,3 +229,59 @@ def test_inquisitor_skip_subset_slices(obj):
     # The tuple can vary freely, but the booleans inside it shouldn't
     # get individual comments since they're part of a larger varying slice.
     assert obj.y
+
+
+# Test for duplicate param names at different nesting levels
+@fails_with_output(
+    """
+Falsifying example: test_inquisitor_duplicate_param_names(
+    # The test always failed when commented parts were varied together.
+    kw=0,  # or any other generated value
+    b={'kw': ''},  # or any other generated value
+)
+"""
+)
+@settings(print_blob=False, derandomize=True)
+@given(kw=st.integers(), b=st.fixed_dictionaries({"kw": st.text()}))
+def test_inquisitor_duplicate_param_names(kw, b):
+    # Both "kw" (top-level) and "b" (which contains "kw") can vary. The comment
+    # appears on b, not on b['kw'], because the outer slice takes precedence.
+    assert False
+
+
+# Test for multi-level nesting: bare, nested, and double-nested
+class Outer:
+    def __init__(self, inner, value):
+        self.inner = inner
+        self.value = value
+
+
+class Inner:
+    def __init__(self, x):
+        self.x = x
+
+
+@fails_with_output(
+    """
+Falsifying example: test_inquisitor_multi_level_nesting(
+    bare=0,  # or any other generated value
+    outer=Outer(
+        inner=Inner(x=0),  # or any other generated value
+        value=True,
+    ),
+)
+"""
+)
+@settings(print_blob=False, derandomize=True)
+@given(
+    bare=st.integers(),
+    outer=st.builds(
+        Outer, inner=st.builds(Inner, x=st.integers()), value=st.booleans()
+    ),
+)
+def test_inquisitor_multi_level_nesting(bare, outer):
+    # Comments on: bare (top-level) and outer.inner (nested). The inner.x slice
+    # is the same as inner's slice since Inner has only one argument, so the
+    # comment appears only once on inner. outer.value doesn't get a comment
+    # because it's the critical value that determines the failure.
+    assert not outer.value

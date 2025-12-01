@@ -188,6 +188,9 @@ class RepresentationPrinter:
             self.known_object_printers = context.known_object_printers
             self.slice_comments = context.data.slice_comments
         assert all(isinstance(k, IDKey) for k in self.known_object_printers)
+        # Track which slices we've already printed comments for, to avoid
+        # duplicating comments when nested objects share the same slice range.
+        self._commented_slices: set[tuple[int, int]] = set()
 
     def pretty(self, obj: object, *, cycle: bool = False) -> None:
         """Pretty print the given object."""
@@ -416,7 +419,7 @@ class RepresentationPrinter:
         name: str,
         args: Sequence[object],
         kwargs: dict[str, object],
-        arg_labels: "dict[int | str, tuple[int, int]] | None" = None,
+        arg_labels: "dict[str, tuple[int, int]] | None" = None,
     ) -> None:
         # pprint this object as a call, _unless_ the call would be invalid syntax
         # and the repr would be valid and there are not comments on arguments.
@@ -468,17 +471,20 @@ class RepresentationPrinter:
         if func_name.startswith(("lambda:", "lambda ")):
             func_name = f"({func_name})"
         self.text(func_name)
+        # Build list of (key, value) pairs where key is None for positional args
+        # and a string for keyword args. We use "arg[i]" format for looking up
+        # comments on positional args. Skip slices that have already been commented
+        # at a higher level (e.g., when inner and outer objects share the same slice).
         all_args = [(None, v) for v in args] + list(kwargs.items())
-        # int indicates the position of a positional argument, rather than a keyword
-        # argument. Currently no callers use this; see #3624.
-        comments: dict[int | str, object] = {
-            k: self.slice_comments[v]
-            for k, v in (arg_slices or {}).items()
-            if v in self.slice_comments
-        }
+        arg_slices = arg_slices or {}
+        comments: dict[str, tuple[str, tuple[int, int]]] = {}
+        for label, sr in arg_slices.items():
+            if sr in self.slice_comments and sr not in self._commented_slices:
+                comments[label] = (self.slice_comments[sr], sr)
 
         if leading_comment or any(
-            i in comments or k in comments for i, (k, _) in enumerate(all_args)
+            f"arg[{i}]" in comments or (k and k in comments)
+            for i, (k, _) in enumerate(all_args)
         ):
             # We have to split one arg per line in order to leave comments on them.
             force_split = True
@@ -504,15 +510,19 @@ class RepresentationPrinter:
                     self.breakable(" " if i else "")
                 if k:
                     self.text(f"{k}=")
+                # Mark slice as commented BEFORE printing value, so nested printers skip it
+                label = f"arg[{i}]" if k is None else k
+                entry = comments.get(label)
+                if entry:
+                    self._commented_slices.add(entry[1])
                 if avoid_realization:
                     self.text("<symbolic>")
                 else:
                     self.pretty(v)
                 if force_split or i + 1 < len(all_args):
                     self.text(",")
-                comment = comments.get(i) or (comments.get(k) if k else None)
-                if comment:
-                    self.text(f"  # {comment}")
+                if entry:
+                    self.text(f"  # {entry[0]}")
         if all_args and force_split:
             self.break_()
         self.text(")")  # after dedent
@@ -813,33 +823,35 @@ def pprint_fields(
 
 
 def _tuple_pprinter(
-    arg_labels: "dict[int, tuple[int, int]]",
+    arg_labels: "dict[str, tuple[int, int]]",
 ) -> PrettyPrintFunction:
-    """Create a pretty printer for tuples that shows sub-argument comments."""
+    """Pretty printer for tuples that shows sub-argument comments."""
 
     def inner(obj: tuple, p: RepresentationPrinter, cycle: bool) -> None:
         if cycle:
             return p.text("(...)")
-        comments = {
-            idx: p.slice_comments[sr]
-            for idx, sr in arg_labels.items()
-            if sr in p.slice_comments
-        }
-        force_split = bool(comments)
-        length = len(obj)
+
+        def get_comment(idx: int) -> tuple[str, tuple[int, int]] | None:
+            sr = arg_labels.get(f"arg[{idx}]")
+            if sr and sr in p.slice_comments and sr not in p._commented_slices:
+                return (p.slice_comments[sr], sr)
+            return None
+
+        has_comments = any(get_comment(i) for i in range(len(obj)))
         with p.group(indent=4, open="(", close=""):
             for idx, x in p._enumerate(obj):
-                if force_split:
+                if has_comments:
                     p.break_()
                 elif idx:
                     p.breakable()
                 p.pretty(x)
-                # Add comma: always if force_split, or if not last, or if single element
-                if force_split or idx + 1 < length or length == 1:
+                if has_comments or idx + 1 < len(obj) or len(obj) == 1:
                     p.text(",")
-                if idx in comments:
-                    p.text(f"  # {comments[idx]}")
-        if force_split and obj:
+                if entry := get_comment(idx):
+                    comment, sr = entry
+                    p._commented_slices.add(sr)
+                    p.text(f"  # {comment}")
+        if has_comments and obj:
             p.break_()
         p.text(")")
 
@@ -847,39 +859,42 @@ def _tuple_pprinter(
 
 
 def _fixeddict_pprinter(
-    arg_labels: "dict[Any, tuple[int, int]]",
+    arg_labels: "dict[str, tuple[int, int]]",
     mapping: "dict[Any, Any]",
 ) -> PrettyPrintFunction:
-    """Create a pretty printer for fixed_dictionaries that shows sub-argument comments."""
+    """Pretty printer for fixed_dictionaries that shows sub-argument comments."""
 
     def inner(obj: dict, p: RepresentationPrinter, cycle: bool) -> None:
         if cycle:
             return p.text("{...}")
-        comments = {
-            key: p.slice_comments[sr]
-            for key, sr in arg_labels.items()
-            if sr in p.slice_comments
-        }
-        force_split = bool(comments)
-        # Use mapping key order for fixed keys
-        keys = list(mapping.keys()) + [k for k in obj if k not in mapping]
-        keys = [k for k in keys if k in obj]
-        length = len(keys)
+
+        def get_comment(key: Any) -> tuple[str, tuple[int, int]] | None:
+            sr = arg_labels.get(key)
+            if sr and sr in p.slice_comments and sr not in p._commented_slices:
+                return (p.slice_comments[sr], sr)
+            return None
+
+        # Preserve mapping key order, then any optional keys
+        keys = [k for k in list(mapping) + list(obj) if k in obj]
+        keys = list(dict.fromkeys(keys))  # dedupe while preserving order
+        has_comments = any(get_comment(k) for k in keys)
+
         with p.group(indent=4, open="{", close=""):
             for idx, key in p._enumerate(keys):
-                if force_split:
+                if has_comments:
                     p.break_()
                 elif idx:
                     p.breakable()
                 p.pretty(key)
                 p.text(": ")
                 p.pretty(obj[key])
-                # Add comma: always if force_split, or if not last
-                if force_split or idx + 1 < length:
+                if has_comments or idx + 1 < len(keys):
                     p.text(",")
-                if key in comments:
-                    p.text(f"  # {comments[key]}")
-        if force_split and obj:
+                if entry := get_comment(key):
+                    comment, sr = entry
+                    p._commented_slices.add(sr)
+                    p.text(f"  # {comment}")
+        if has_comments and obj:
             p.break_()
         p.text("}")
 
