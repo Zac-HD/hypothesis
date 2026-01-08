@@ -75,6 +75,30 @@ def test_issue_1502_regression(s):
     pass
 
 
+def test_recursive_with_max_leaves_can_generate_nested_structures():
+    # Regression test for issue #4638
+    # st.recursive() with max_leaves should be able to generate nested structures
+    useful_values = st.booleans() | st.integers() | st.text()
+    useful_list = st.lists(st.deferred(lambda: useful_values), max_size=5)
+    useful_dict = st.dictionaries(st.text(), st.deferred(lambda: useful_values), max_size=5)
+
+    json = st.dictionaries(
+        st.text(),
+        st.recursive(
+            useful_values,
+            lambda x: useful_list | useful_dict,
+            max_leaves=20,
+        ),
+        max_size=10,
+    )
+
+    # Should be able to find examples with nested lists
+    def has_list_value(d):
+        return any(isinstance(v, list) for v in d.values())
+
+    find_any(json, has_list_value)
+
+
 @pytest.mark.parametrize(
     "s",
     [

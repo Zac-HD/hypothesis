@@ -1300,14 +1300,19 @@ class StateForActualGivenExecution:
             # Conditional here so we can save some time constructing the payload; in
             # other cases (without coverage) it's cheap enough to do that regardless.
             #
-            # Note that we have to unconditionally realize data.events, because
-            # the statistics reported by the pytest plugin use a different flow
-            # than observability, but still access symbolic events.
+            # Realize data.events for solver-based backends (which use symbolic
+            # values) and when observability is enabled. For the standard provider,
+            # skip realization to avoid disrupting internal state (e.g., breaking
+            # retry loops in recursive strategies). See issue #4638.
 
-            try:
-                data.events = data.provider.realize(data.events)
-            except BackendCannotProceed:
-                data.events = {}
+            # Only realize if observability is enabled, or if this provider uses
+            # symbolic values (avoid_realization=True indicates solver-based backends
+            # that need explicit realization).
+            if observability_enabled() or data.provider.avoid_realization:
+                try:
+                    data.events = data.provider.realize(data.events)
+                except BackendCannotProceed:
+                    data.events = {}
 
             if observability_enabled():
                 if runner := getattr(self, "_runner", None):
