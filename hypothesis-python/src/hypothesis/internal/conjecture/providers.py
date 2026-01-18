@@ -384,7 +384,7 @@ class PrimitiveProvider(abc.ABC):
 
     #: If ``True``, |PrimitiveProvider.on_observation| will be added as a
     #: an observability callback, enabling observability during
-    # the lifetime of this provider. If ``False``, |PrimitiveProvider.on_observation|
+    #: the lifetime of this provider. If ``False``, |PrimitiveProvider.on_observation|
     #: will never be called by Hypothesis.
     #:
     #: The opt-in behavior of observability is because enabling observability
