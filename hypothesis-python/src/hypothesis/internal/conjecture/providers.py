@@ -13,7 +13,7 @@ import contextlib
 import math
 import sys
 import warnings
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, contextmanager
 from functools import cached_property
 from random import Random
@@ -64,7 +64,8 @@ from hypothesis.internal.floats import (
     next_up,
 )
 from hypothesis.internal.intervalsets import IntervalSet
-from hypothesis.internal.observability import InfoObservationType, TestCaseObservation
+from hypothesis.internal.observability import InfoObservationType, ObservabilityConfig
+from hypothesis.utils.deprecation import note_deprecation
 
 if TYPE_CHECKING:
     from hypothesis.internal.conjecture.data import ConjectureData
@@ -382,17 +383,35 @@ class PrimitiveProvider(abc.ABC):
     #: Only set this to ``True`` if it is necessary for your backend.
     avoid_realization: ClassVar[bool] = False
 
-    #: If ``True``, |PrimitiveProvider.on_observation| will be added as a
-    #: an observability callback, enabling observability during
-    #: the lifetime of this provider. If ``False``, |PrimitiveProvider.on_observation|
-    #: will never be called by Hypothesis.
+    #: An |ObservabilityConfig| describing what observability options this
+    #: provider requests. If set to an |ObservabilityConfig|, observability will
+    #: be enabled during the lifetime of this provider, even if the test's
+    #: ``settings.observability`` is otherwise ``None``. Additionally,
+    #: |PrimitiveProvider.on_observation| will be called for each test case
+    #: observation.
+    #:
+    #: If ``None`` (the default), |PrimitiveProvider.on_observation| will never
+    #: be called.
     #:
     #: The opt-in behavior of observability is because enabling observability
     #: might increase runtime or memory usage.
-    add_observability_callback: ClassVar[bool] = False
+    observability: ObservabilityConfig | None = None
 
     def __init__(self, conjecturedata: Optional["ConjectureData"], /) -> None:
         self._cd = conjecturedata
+
+        if self.observability is None:
+            callback: Callable[..., None] | None
+            if callback := getattr(self, "on_observation", None):
+                note_deprecation(
+                    "",
+                    since="RELEASEDAY",
+                    stacklevel=2,
+                    has_codemod=False,
+                )
+                self.observability = ObservabilityConfig(
+                    coverage=False, callbacks=(callback,)
+                )
 
     @abc.abstractmethod
     def draw_boolean(
@@ -578,42 +597,6 @@ class PrimitiveProvider(abc.ABC):
         """
         assert lifetime in ("test_case", "test_function")
         yield from []
-
-    def on_observation(self, observation: TestCaseObservation) -> None:  # noqa: B027
-        """
-        Called at the end of each test case which uses this provider, with the same
-        ``observation["type"] == "test_case"`` observation that is passed to
-        other callbacks. This method is not
-        called with ``observation["type"] in {"info", "alert", "error"}``
-        observations.
-
-        .. important::
-
-            For |PrimitiveProvider.on_observation| to be called by Hypothesis,
-            |PrimitiveProvider.add_observability_callback| must be set to ``True``.
-
-            |PrimitiveProvider.on_observation| is explicitly opt-in, as enabling
-            observability might increase runtime or memory usage.
-
-        Calls to this method are guaranteed to alternate with calls to
-        |PrimitiveProvider.per_test_case_context_manager|. For example:
-
-        .. code-block:: python
-
-            # test function starts
-            per_test_case_context_manager()
-            on_observation()
-            per_test_case_context_manager()
-            on_observation()
-            ...
-            # test function ends
-
-        Note that |PrimitiveProvider.on_observation| will not be called for test
-        cases which did not use this provider during generation, for example
-        during |Phase.reuse| or |Phase.shrink|, or because Hypothesis switched
-        to the standard Hypothesis backend after this backend raised too many
-        |BackendCannotProceed| exceptions.
-        """
 
     def span_start(self, label: int, /) -> None:  # noqa: B027  # non-abstract noop
         """Marks the beginning of a semantically meaningful span of choices.

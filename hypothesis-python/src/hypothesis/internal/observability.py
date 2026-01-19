@@ -125,6 +125,8 @@ class ObservabilityConfig:
         to a file in ``.hypothesis/observed``.
     """
 
+    # TODO: split coverage into line/branch both or neither,
+    #       choices into none/values/nodes (?)
     coverage: bool = True
     choices: bool = False
     callbacks: tuple[Callable, ...] = field(default=(_deliver_to_file,))

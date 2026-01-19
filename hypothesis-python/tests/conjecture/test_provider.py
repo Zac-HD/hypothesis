@@ -744,7 +744,8 @@ def test_replay_choices():
 
 
 class ObservationProvider(TrivialProvider):
-    add_observability_callback = True
+    # callbacks is replaced by the engine, so we use a noop here
+    observability = ObservabilityConfig(callbacks=(lambda _: None,))
 
     def __init__(self, conjecturedata: "ConjectureData", /) -> None:
         super().__init__(conjecturedata)

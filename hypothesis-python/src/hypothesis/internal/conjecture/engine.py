@@ -70,10 +70,7 @@ from hypothesis.internal.conjecture.providers import (
 from hypothesis.internal.conjecture.shrinker import Shrinker, ShrinkPredicateT, sort_key
 from hypothesis.internal.escalation import InterestingOrigin
 from hypothesis.internal.healthcheck import fail_health_check
-from hypothesis.internal.observability import (
-    ObservabilityConfig,
-    Observation,
-)
+from hypothesis.internal.observability import Observation
 from hypothesis.reporting import base_report, report, verbose_report
 from hypothesis.utils.deprecation import note_deprecation
 
@@ -937,7 +934,7 @@ class ConjectureRunner:
             # by this isinstance check)
             and isinstance(self.provider, PrimitiveProvider)
             # and the provider opted-in to observations
-            and self.provider.add_observability_callback
+            and self.provider.observability is not None
         ):
 
             def callback(observation: Observation) -> None:
@@ -949,12 +946,11 @@ class ConjectureRunner:
                     self.provider.on_observation(observation)
 
             old_value = self.settings.observability
+            provider_config = dataclasses.replace(
+                self.provider.observability, callbacks=(callback,)
+            )
             self.settings._observability = (
-                ObservabilityConfig(callbacks=[callback])
-                if old_value is None
-                else dataclasses.replace(
-                    old_value, callbacks=old_value.callbacks + (callback,)
-                )
+                provider_config if old_value is None else old_value | provider_config
             )
             try:
                 yield
