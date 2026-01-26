@@ -13,7 +13,7 @@ import contextlib
 import math
 import sys
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from contextlib import AbstractContextManager, contextmanager
 from functools import cached_property
 from random import Random
@@ -65,7 +65,6 @@ from hypothesis.internal.floats import (
 )
 from hypothesis.internal.intervalsets import IntervalSet
 from hypothesis.internal.observability import InfoObservationType, ObservabilityConfig
-from hypothesis.utils.deprecation import note_deprecation
 
 if TYPE_CHECKING:
     from hypothesis.internal.conjecture.data import ConjectureData
@@ -386,12 +385,12 @@ class PrimitiveProvider(abc.ABC):
     #: An |ObservabilityConfig| describing what observability options this
     #: provider requests. If set to an |ObservabilityConfig|, observability will
     #: be enabled during the lifetime of this provider, even if the test's
-    #: ``settings.observability`` is otherwise ``None``. Additionally,
-    #: |PrimitiveProvider.on_observation| will be called for each test case
-    #: observation.
+    #: ``settings.observability`` is ``None``.
     #:
-    #: If ``None`` (the default), |PrimitiveProvider.on_observation| will never
-    #: be called.
+    #: The provider's |ObservabilityConfig| is merged with the test's
+    #: ``settings.observability`` (if any). Any callbacks in the provider's
+    #: config will be called for each test case observation generated while
+    #: using this provider.
     #:
     #: The opt-in behavior of observability is because enabling observability
     #: might increase runtime or memory usage.
@@ -399,19 +398,6 @@ class PrimitiveProvider(abc.ABC):
 
     def __init__(self, conjecturedata: Optional["ConjectureData"], /) -> None:
         self._cd = conjecturedata
-
-        if self.observability is None:
-            callback: Callable[..., None] | None
-            if callback := getattr(self, "on_observation", None):
-                note_deprecation(
-                    "",
-                    since="RELEASEDAY",
-                    stacklevel=2,
-                    has_codemod=False,
-                )
-                self.observability = ObservabilityConfig(
-                    coverage=False, callbacks=(callback,)
-                )
 
     @abc.abstractmethod
     def draw_boolean(

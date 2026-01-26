@@ -744,23 +744,22 @@ def test_replay_choices():
 
 
 class ObservationProvider(TrivialProvider):
-    # callbacks is replaced by the engine, so we use a noop here
-    observability = ObservabilityConfig(callbacks=(lambda _: None,))
-
     def __init__(self, conjecturedata: "ConjectureData", /) -> None:
         super().__init__(conjecturedata)
-        # calls to per_test_case_context_manager and on_observation alternate,
+        # calls to per_test_case_context_manager and _on_observation alternate,
         # starting with per_test_case_context_manager
         self.expected = "per_test_case_context_manager"
+        # Set observability with our callback
+        self.observability = ObservabilityConfig(callbacks=(self._on_observation,))
 
     @contextmanager
     def per_test_case_context_manager(self):
         assert self.expected == "per_test_case_context_manager"
-        self.expected = "on_observation"
+        self.expected = "_on_observation"
         yield
 
-    def on_observation(self, observation: Observation) -> None:
-        assert self.expected == "on_observation"
+    def _on_observation(self, observation: Observation) -> None:
+        assert self.expected == "_on_observation"
         self.expected = "per_test_case_context_manager"
 
 

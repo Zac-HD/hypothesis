@@ -137,7 +137,6 @@
 .. |PrimitiveProvider.draw_float| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.draw_float`
 .. |PrimitiveProvider.draw_string| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.draw_string`
 .. |PrimitiveProvider.draw_bytes| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.draw_bytes`
-.. |PrimitiveProvider.on_observation| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.on_observation`
 .. |PrimitiveProvider.observe_test_case| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.observe_test_case`
 .. |PrimitiveProvider.observe_information_messages| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.observe_information_messages`
 .. |PrimitiveProvider.per_test_case_context_manager| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.per_test_case_context_manager`
