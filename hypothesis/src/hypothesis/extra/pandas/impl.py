@@ -82,11 +82,20 @@ def timezone_aware_datetimes(dtype):
         # the representable range.
         min_value = (pandas.Timestamp.min + pandas.Timedelta(days=1)).floor("D")
         max_value = (pandas.Timestamp.max - pandas.Timedelta(days=1)).floor("D")
-        min_value = min_value.to_pydatetime()
-        max_value = max_value.to_pydatetime()
-    else:
-        min_value = datetime.min + timedelta(days=2)
-        max_value = datetime.max - timedelta(days=2)
+        datetimes = st.datetimes(
+            min_value.to_pydatetime(),
+            max_value.to_pydatetime(),
+            timezones=st.just(dtype.tz),
+        )
+        # Python datetimes only have microsecond resolution, so draw the
+        # remaining nanoseconds separately to exercise the full ns precision.
+        return st.builds(
+            lambda d, ns: pandas.Timestamp(d) + pandas.Timedelta(ns, unit="ns"),
+            datetimes,
+            st.integers(0, 999),
+        )
+    min_value = datetime.min + timedelta(days=2)
+    max_value = datetime.max - timedelta(days=2)
     return st.datetimes(min_value, max_value, timezones=st.just(dtype.tz))
 
 

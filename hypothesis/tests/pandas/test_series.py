@@ -150,6 +150,13 @@ def test_tz_aware_series_from_string_dtype():
     )
 
 
+def test_ns_resolution_series_exercise_sub_microsecond_values():
+    find_any(
+        pdst.series(dtype="datetime64[ns, UTC]", index=pdst.range_indexes(min_size=1)),
+        lambda s: (s.dt.nanosecond != 0).any(),
+    )
+
+
 def test_tz_aware_series_accepts_custom_elements():
     tz = dt.timezone.utc
     elements = st.datetimes(timezones=st.just(tz)).map(lambda d: d.replace(year=2000))
