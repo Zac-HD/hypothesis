@@ -396,11 +396,11 @@ class FixedDictStrategy(SearchStrategy[dict[Any, Any]]):
     def do_draw(self, data: ConjectureData) -> dict[Any, Any]:
         context = current_build_context()
         arg_labels: ArgLabelsT = {}
-        value = type(self.mapping)()
+        pairs: list[tuple[Any, Any]] = []
 
         for key, strategy in self.mapping.items():
             with context.track_arg_label(str(key)) as arg_label:
-                value[key] = data.draw(strategy)
+                pairs.append((key, data.draw(strategy)))
             arg_labels |= arg_label
 
         if self.optional is not None:
@@ -416,8 +416,20 @@ class FixedDictStrategy(SearchStrategy[dict[Any, Any]]):
                 remaining[-1], remaining[j] = remaining[j], remaining[-1]
                 key = remaining.pop()
                 with context.track_arg_label(str(key)) as arg_label:
-                    value[key] = data.draw(self.optional[key])
+                    pairs.append((key, data.draw(self.optional[key])))
                 arg_labels |= arg_label
+
+        # Vary the iteration order of the resulting dict (#3906).  We permute
+        # *after* choosing which optional keys to include, so the set of keys -
+        # and thus the length distribution - is unaffected; only order varies.
+        # Permutations shrink towards the original order, i.e. required keys in
+        # declared order followed by optional keys.  We only do this for plain
+        # dicts, where iteration order is incidental; for an OrderedDict (or
+        # other subclass) the declared order may be semantically meaningful.
+        dict_type = type(self.mapping)
+        if dict_type is dict:
+            pairs = data.draw(st.permutations(pairs))
+        value = dict_type(pairs)
 
         if arg_labels:
             context.known_object_printers[IDKey(value)].append(
