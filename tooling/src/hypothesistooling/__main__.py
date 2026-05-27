@@ -220,13 +220,15 @@ def format(*, format_all=False):
     if not (paths_to_format or doc_paths_to_format):
         return
 
-    # .coveragerc lists several regex patterns to treat as nocover pragmas, and
-    # we want to find (and delete) cases where # pragma: no cover is redundant.
+    # pyproject.toml lists several regex patterns to treat as nocover pragmas,
+    # and we want to find (and delete) cases where # pragma: no cover is redundant.
     def warn(msg):
         raise Exception(msg)
 
     config = CoverageConfig()
-    config.from_file(os.path.join(hp.BASE_DIR, ".coveragerc"), warn=warn, our_file=True)
+    config.from_file(
+        os.path.join(hp.BASE_DIR, "pyproject.toml"), warn=warn, our_file=False
+    )
     pattern = "|".join(l for l in config.exclude_list if "pragma" not in l)
     unused_pragma_pattern = re.compile(f"(({pattern}).*)  # pragma: no (branch|cover)")
     last_header_line = HEADER.splitlines()[-1].rstrip()
@@ -761,8 +763,6 @@ standard_tox_task("threading")
 standard_tox_task("py310-oldestnumpy", py="3.10")
 standard_tox_task("numpy-nightly", py="3.12")
 
-standard_tox_task("coverage")
-standard_tox_task("conjecture-coverage")
 standard_tox_task("snapshots")
 
 

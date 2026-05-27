@@ -4,6 +4,8 @@
 #
 #    ./build.sh upgrade-requirements
 #
+coverage[toml]==7.14.0
+    # via pytest-cov
 execnet==2.1.2
     # via pytest-xdist
 iniconfig==2.3.0
@@ -21,8 +23,11 @@ pygments==2.20.0
 pytest==9.0.3
     # via
     #   -r requirements/test.in
+    #   pytest-cov
     #   pytest-xdist
     #   syrupy
+pytest-cov==7.1.0
+    # via -r requirements/test.in
 pytest-xdist==3.8.0
     # via -r requirements/test.in
 sortedcontainers==2.4.0

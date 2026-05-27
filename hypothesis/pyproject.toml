@@ -141,7 +141,14 @@ hypothesispytest = "_hypothesis_pytestplugin"
 [tool.coverage.run]
 parallel = true
 branch = true
-source = ["hypothesis"]
+# Record paths relative to the source tree so that data files from different
+# CI jobs (which install Hypothesis into per-environment site-packages dirs)
+# can be combined; see [tool.coverage.paths] below.
+relative_files = true
+source_pkgs = ["hypothesis"]
+# On 3.12 and 3.13 sys.monitoring can't measure branches, so coverage falls
+# back to the default core; that's expected, and we don't want the warning.
+disable_warnings = ["no-sysmon"]
 omit = [
     "**/_hypothesis_ftz_detector.py",
     "**/_hypothesis_pytestplugin.py",
@@ -156,6 +163,15 @@ omit = [
     "**/internal/conjecture/provider_conformance.py",
     # covered by our attrs tests in check-niche
     "**/strategies/_internal/attrs.py"
+]
+
+[tool.coverage.paths]
+# Map the installed package (measured at runtime) back onto the source tree,
+# and unify the per-environment install paths of each CI job so that their
+# coverage data combines into a single set of files.
+source = [
+    "src/hypothesis",
+    "*/site-packages/hypothesis",
 ]
 
 [tool.coverage.report]

@@ -14,9 +14,14 @@ from collections import defaultdict
 from pathlib import Path
 
 if __name__ == "__main__":
+    # Search the given directories (or the cwd) recursively, so that we can
+    # validate branch-check files collected from many CI jobs and downloaded
+    # into per-job subdirectories.
+    roots = [Path(a) for a in sys.argv[1:]] or [Path.cwd()]
     data = []
-    for p in Path.cwd().glob("branch-check*"):
-        data.extend(json.loads(l) for l in p.read_text("utf-8").splitlines())
+    for root in roots:
+        for p in root.rglob("branch-check*"):
+            data.extend(json.loads(l) for l in p.read_text("utf-8").splitlines())
 
     checks = defaultdict(set)
 

@@ -184,8 +184,15 @@ If you try it and find it doesn't work, please do submit patches to fix that.
 
 Some notable commands:
 
-``./build.sh check-coverage`` will verify 100% code coverage by running a
-curated subset of the test suite.
+Our self-tests must maintain 100% branch coverage.  Rather than a single
+dedicated task, coverage is collected by the regular ``cover``/``nocover``/
+``niche``/``rest`` test jobs on CI and combined by the ``coverage`` job, which
+asserts that the union reaches 100%.  To collect coverage from one task
+locally, set the ``COV`` environment variable to the :pypi:`pytest-cov`
+arguments and afterwards combine and report from the ``hypothesis/`` directory::
+
+    COV="--cov=hypothesis --cov-append" ./build.sh check-py314-cover
+    cd hypothesis && coverage combine && coverage report
 
 ``./build.sh check-py311`` (etc.) will run most of the test suite against a
 particular python version.

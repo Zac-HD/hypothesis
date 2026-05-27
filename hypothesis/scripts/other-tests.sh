@@ -7,7 +7,7 @@ cd "$HERE/.."
 pip install .
 
 
-PYTEST="python -bb -X dev -m pytest -nauto --durations-min=1.0"
+PYTEST="python -bb -X dev -m pytest -nauto --durations-min=1.0 ${COV:-}"
 
 # Run some tests without docstrings or assertions, to catch bugs
 # like issue #822 in one of the test decorators.  See also #1541.
