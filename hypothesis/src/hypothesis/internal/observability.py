@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import warnings
+from collections import defaultdict, deque
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -479,7 +480,9 @@ def make_testcase(
 
 
 _WROTE_TO: set[Path] = set()
-_deliver_to_file_lock = Lock()
+_deliver_to_file_state: dict[Path, tuple[Lock, deque[bytes]]] = defaultdict(
+    lambda: (Lock(), deque())
+)
 
 
 def _deliver_to_file(
@@ -490,21 +493,34 @@ def _deliver_to_file(
     kind = "testcases" if observation.type == "test_case" else "info"
     observed_dir = storage_directory("observed")
     observed_dir.create_if_missing()
-    observation_p = observed_dir.path / f"{date.today().isoformat()}_{kind}.jsonl"
+    fname = observed_dir.path / f"{date.today().isoformat()}_{kind}.jsonl"
+    _WROTE_TO.add(fname)
+    fname = fname.resolve()
 
     observation_bytes = (
         json.dumps(to_jsonable(observation, avoid_realization=False)) + "\n"
-    )
-    # only allow one conccurent file write to avoid write races. This is likely to make
-    # HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY quite slow under threading. A queue
-    # would be an improvement, but that requires a background thread, and I
-    # would prefer to avoid a thread in the single-threaded case. We could
-    # switch over to a queue if we detect multithreading, but it's tricky to get
-    # right.
-    with _deliver_to_file_lock:
-        _WROTE_TO.add(observation_p)
-        with observation_p.open(mode="a") as f:
-            f.write(observation_bytes)
+    ).encode()
+
+    # This is a little fiddly, because we want it to be cheap in both single-threaded
+    # and contended-multithreaded setups.  We therefore use a cheap queue, but instead
+    # of a dedicated worker thread the enqueuing thread attempts to write whatever has
+    # been enqueued, leaving the work for later if someone else currently has the lock.
+    # In exchange for simple shutdown it could lose a little data in the worst case.
+    lock, queue = _deliver_to_file_state[fname]
+    queue.append(observation_bytes)
+    got_lock = False
+    try:
+        got_lock = lock.acquire(blocking=False)
+        if got_lock:
+            with fname.open(mode="ab") as f:
+                try:
+                    while value := queue.popleft():
+                        f.write(value)
+                except IndexError:
+                    pass
+    finally:
+        if got_lock:
+            lock.release()
 
 
 _imported_at = time.time()
