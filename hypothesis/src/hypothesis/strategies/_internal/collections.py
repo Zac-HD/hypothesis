@@ -419,12 +419,8 @@ class FixedDictStrategy(SearchStrategy[dict[Any, Any]]):
                     pairs.append((key, data.draw(self.optional[key])))
                 arg_labels |= arg_label
 
-        # Vary the iteration order of the resulting dict (#3906).  We shuffle
-        # *after* choosing which optional keys to include, so the set of keys -
-        # and thus the length distribution - is unaffected; only order varies.
-        # The shuffle shrinks towards the original order, i.e. required keys in
-        # declared order followed by optional keys.  Callers who need a specific
-        # key order should build it themselves, e.g. tuples(...).map(dict).
+        # Vary the dict's iteration order (#3906).  We shuffle after choosing
+        # the optional keys, so only order varies, not the set of keys.
         cu.fisher_yates_shuffle(data, pairs)
         value = type(self.mapping)(pairs)
 
