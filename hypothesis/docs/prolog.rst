@@ -27,6 +27,7 @@
 .. |settings.suppress_health_check| replace:: :obj:`settings.suppress_health_check <hypothesis.settings.suppress_health_check>`
 .. |settings.stateful_step_count| replace:: :obj:`settings.stateful_step_count <hypothesis.settings.stateful_step_count>`
 .. |settings.backend| replace:: :obj:`settings.backend <hypothesis.settings.backend>`
+.. |settings.observability| replace:: :obj:`settings.observability <hypothesis.settings.observability>`
 
 .. |~settings.max_examples| replace:: :obj:`~hypothesis.settings.max_examples`
 .. |~settings.database| replace:: :obj:`~hypothesis.settings.database`
@@ -39,6 +40,7 @@
 .. |~settings.suppress_health_check| replace:: :obj:`~hypothesis.settings.suppress_health_check`
 .. |~settings.stateful_step_count| replace:: :obj:`~hypothesis.settings.stateful_step_count`
 .. |~settings.backend| replace:: :obj:`~hypothesis.settings.backend`
+.. |~settings.observability| replace:: :obj:`~hypothesis.settings.observability`
 
 .. |settings.register_profile| replace:: :func:`~hypothesis.settings.register_profile`
 .. |settings.get_profile| replace:: :func:`~hypothesis.settings.get_profile`
@@ -65,6 +67,8 @@
 .. |Verbosity.debug| replace:: :obj:`Verbosity.debug <hypothesis.Verbosity.debug>`
 .. |Verbosity.normal| replace:: :obj:`Verbosity.normal <hypothesis.Verbosity.normal>`
 .. |Verbosity.quiet| replace:: :obj:`Verbosity.quiet <hypothesis.Verbosity.quiet>`
+
+.. |ObservabilityConfig| replace:: :obj:`ObservabilityConfig <hypothesis.ObservabilityConfig>`
 
 .. |HypothesisException| replace:: :obj:`HypothesisException <hypothesis.errors.HypothesisException>`
 .. |HypothesisDeprecationWarning| replace:: :obj:`HypothesisDeprecationWarning <hypothesis.errors.HypothesisDeprecationWarning>`
@@ -134,11 +138,10 @@
 .. |PrimitiveProvider.draw_float| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.draw_float`
 .. |PrimitiveProvider.draw_string| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.draw_string`
 .. |PrimitiveProvider.draw_bytes| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.draw_bytes`
-.. |PrimitiveProvider.on_observation| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.on_observation`
 .. |PrimitiveProvider.observe_test_case| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.observe_test_case`
 .. |PrimitiveProvider.observe_information_messages| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.observe_information_messages`
 .. |PrimitiveProvider.per_test_case_context_manager| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.per_test_case_context_manager`
-.. |PrimitiveProvider.add_observability_callback| replace:: :data:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.add_observability_callback`
+.. |PrimitiveProvider.observability| replace:: :data:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.observability`
 .. |PrimitiveProvider.span_start| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.span_start`
 .. |PrimitiveProvider.span_end| replace:: :func:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.span_end`
 .. |PrimitiveProvider.avoid_realization| replace:: :data:`~hypothesis.internal.conjecture.providers.PrimitiveProvider.avoid_realization`
@@ -146,12 +149,6 @@
 .. |AVAILABLE_PROVIDERS| replace:: :data:`~hypothesis.internal.conjecture.providers.AVAILABLE_PROVIDERS`
 .. |run_conformance_test| replace:: :func:`~hypothesis.internal.conjecture.provider_conformance.run_conformance_test`
 
-.. |add_observability_callback| replace:: :data:`~hypothesis.internal.observability.add_observability_callback`
-.. |remove_observability_callback| replace:: :data:`~hypothesis.internal.observability.remove_observability_callback`
-.. |with_observability_callback| replace:: :data:`~hypothesis.internal.observability.with_observability_callback`
-.. |observability_enabled| replace:: :data:`~hypothesis.internal.observability.observability_enabled`
-.. |TESTCASE_CALLBACKS| replace:: :data:`~hypothesis.internal.observability.TESTCASE_CALLBACKS`
-.. |OBSERVABILITY_CHOICES| replace:: :data:`~hypothesis.internal.observability.OBSERVABILITY_CHOICES`
 .. |BUFFER_SIZE| replace:: :data:`~hypothesis.internal.conjecture.engine.BUFFER_SIZE`
 .. |MAX_SHRINKS| replace:: :data:`~hypothesis.internal.conjecture.engine.MAX_SHRINKS`
 .. |MAX_SHRINKING_SECONDS| replace:: :data:`~hypothesis.internal.conjecture.engine.MAX_SHRINKING_SECONDS`
