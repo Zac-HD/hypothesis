@@ -1,0 +1,11 @@
+RELEASE_TYPE: minor
+
+This release adds experimental support for generating timezone-aware datetimes
+in :ref:`hypothesis.extra.pandas <hypothesis-pandas>`.  You can now pass a
+:class:`~pandas.DatetimeTZDtype` - such as ``"datetime64[ns, UTC]"`` - as the
+``dtype`` of a :func:`~hypothesis.extra.pandas.series`,
+:func:`~hypothesis.extra.pandas.indexes`, or
+:func:`~hypothesis.extra.pandas.column`, and every value will share that single
+timezone (the only arrangement pandas supports outside of the ``object``
+dtype).  The datetime resolution is taken from the dtype, so you can also
+generate e.g. ``"datetime64[us, UTC]"`` columns (:issue:`4020`).

@@ -31,6 +31,29 @@ def test_can_have_columns_of_distinct_types(df):
     assert df["b"].dtype == np.dtype(float)
 
 
+def test_can_have_tz_aware_datetime_columns():
+    dtype = pd.DatetimeTZDtype(unit="us", tz="UTC")
+    assert_all_examples(
+        pdst.data_frames(
+            [pdst.column("a", dtype=dtype), pdst.column("b", dtype=dtype, unique=True)],
+            index=pdst.range_indexes(min_size=1),
+        ),
+        lambda df: df["a"].dtype == dtype
+        and df["b"].dtype == dtype
+        and df["b"].is_unique,
+    )
+
+
+def test_can_have_tz_aware_datetime_index():
+    dtype = pd.DatetimeTZDtype(unit="ns", tz="UTC")
+    assert_all_examples(
+        pdst.data_frames(
+            [pdst.column("a", dtype=int)], index=pdst.indexes(dtype=dtype, min_size=1)
+        ),
+        lambda df: df.index.dtype == dtype,
+    )
+
+
 @given(
     pdst.data_frames(
         [pdst.column(dtype=int)], index=pdst.range_indexes(min_size=1, max_size=5)

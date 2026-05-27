@@ -8,6 +8,8 @@
 # v. 2.0. If a copy of the MPL was not distributed with this file, You can
 # obtain one at https://mozilla.org/MPL/2.0/.
 
+import datetime as dt
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -121,6 +123,40 @@ def test_unique_series_are_unique(s):
 @given(pdst.series(dtype="int8", name=st.just("test_name")))
 def test_name_passed_on(s):
     assert s.name == "test_name"
+
+
+TIMEZONES = [
+    "UTC",
+    dt.timezone.utc,
+    dt.timezone(dt.timedelta(hours=5, minutes=30)),
+    dt.timezone(dt.timedelta(hours=-8)),
+]
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+@pytest.mark.parametrize("tz", TIMEZONES)
+def test_tz_aware_series_share_one_timezone(unit, tz):
+    dtype = pd.DatetimeTZDtype(unit=unit, tz=tz)
+    assert_all_examples(
+        pdst.series(dtype=dtype, index=pdst.range_indexes(min_size=1)),
+        lambda s: s.dtype == dtype and (s.dt.tz == dtype.tz),
+    )
+
+
+def test_tz_aware_series_from_string_dtype():
+    assert_all_examples(
+        pdst.series(dtype="datetime64[ns, UTC]"),
+        lambda s: str(s.dtype) == "datetime64[ns, UTC]",
+    )
+
+
+def test_tz_aware_series_accepts_custom_elements():
+    tz = dt.timezone.utc
+    elements = st.datetimes(timezones=st.just(tz)).map(lambda d: d.replace(year=2000))
+    assert_all_examples(
+        pdst.series(dtype=pd.DatetimeTZDtype("ns", tz), elements=elements),
+        lambda s: (s.dt.year == 2000).all(),
+    )
 
 
 @pytest.mark.skipif(

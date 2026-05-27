@@ -53,6 +53,43 @@ def infer_dtype_if_necessary(dtype, values, elements, draw):
     return dtype
 
 
+def datetime_tz_dtype(dtype):
+    """Return a normalised :class:`~pandas.DatetimeTZDtype` if ``dtype`` is a
+    timezone-aware datetime dtype (e.g. ``"datetime64[ns, UTC]"``), else None.
+
+    This is experimental support for generating timezone-aware datetimes,
+    where every value in a column or index shares a single timezone (the only
+    arrangement pandas supports outside of the ``object`` dtype).
+    """
+    if isinstance(dtype, pandas.DatetimeTZDtype):
+        return dtype
+    if isinstance(dtype, str):
+        try:
+            converted = pandas.api.types.pandas_dtype(dtype)
+        except TypeError:
+            return None
+        if isinstance(converted, pandas.DatetimeTZDtype):
+            return converted
+    return None
+
+
+def timezone_aware_datetimes(dtype):
+    """Default element strategy for a :class:`~pandas.DatetimeTZDtype`."""
+    if dtype.unit == "ns":
+        # datetime64[ns] is limited to roughly 1677-2262, while coarser
+        # resolutions cover the full range of Python's datetime type.  We pad
+        # the bounds so that applying a UTC offset can't push a value out of
+        # the representable range.
+        min_value = (pandas.Timestamp.min + pandas.Timedelta(days=1)).floor("D")
+        max_value = (pandas.Timestamp.max - pandas.Timedelta(days=1)).floor("D")
+        min_value = min_value.to_pydatetime()
+        max_value = max_value.to_pydatetime()
+    else:
+        min_value = datetime.min + timedelta(days=2)
+        max_value = datetime.max - timedelta(days=2)
+    return st.datetimes(min_value, max_value, timezones=st.just(dtype.tz))
+
+
 @check_function
 def elements_and_dtype(elements, dtype, source=None):
     if source is None:
@@ -102,6 +139,12 @@ def elements_and_dtype(elements, dtype, source=None):
             f"Passed {dtype=} is a strategy, but we require a concrete dtype "
             "here.  See https://stackoverflow.com/q/74355937 for workaround patterns."
         )
+
+    tz_dtype = datetime_tz_dtype(dtype)
+    if tz_dtype is not None:
+        if elements is None:
+            elements = timezone_aware_datetimes(tz_dtype)
+        return elements, tz_dtype
 
     _get_subclasses = getattr(IntegerDtype, "__subclasses__", list)
     dtype = {t.name: t() for t in _get_subclasses()}.get(dtype, dtype)
@@ -282,6 +325,10 @@ def series(
       values. Note that if the type of values that comes out of your
       elements strategy varies, then so will the resulting dtype of the
       series.
+
+      As an experimental feature, you may also pass a timezone-aware
+      :class:`~pandas.DatetimeTZDtype` (e.g. ``"datetime64[ns, UTC]"``), in
+      which case every value in the series will share that single timezone.
 
     * index: If not None, a strategy for generating indexes for the
       resulting Series. This can generate either :class:`pandas.Index`

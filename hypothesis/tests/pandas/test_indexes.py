@@ -18,7 +18,7 @@ from hypothesis import HealthCheck, given, reject, settings, strategies as st
 from hypothesis.errors import Unsatisfiable
 from hypothesis.extra import numpy as npst, pandas as pdst
 
-from tests.common.debug import check_can_generate_examples
+from tests.common.debug import assert_all_examples, check_can_generate_examples
 from tests.pandas.helpers import supported_by_pandas
 
 
@@ -61,6 +61,16 @@ def test_unique_indexes_of_many_small_values(ix):
 @given(pdst.indexes(dtype="int8", name=st.just("test_name")))
 def test_name_passed_on_indexes(s):
     assert s.name == "test_name"
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+def test_tz_aware_datetime_indexes(unit):
+    dtype = pandas.DatetimeTZDtype(unit=unit, tz="UTC")
+    check_can_generate_examples(pdst.indexes(dtype=dtype, min_size=1))
+    assert_all_examples(
+        pdst.indexes(dtype=dtype, min_size=1, unique=True),
+        lambda ix: ix.dtype == dtype and ix.is_unique,
+    )
 
 
 # Sizes that fit into an int64 without overflow
