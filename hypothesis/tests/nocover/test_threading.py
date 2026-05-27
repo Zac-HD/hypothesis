@@ -220,3 +220,52 @@ def test_one_of_branches_lock():
     # there are 4 independent strategies, but only 2 distinct ones -
     # st.integers(), and st.text().
     assert branch_counts == {2}
+
+
+def test_recursive_property_concurrent():
+    # recursive_property caches is_empty / has_reusable_values / is_cacheable by
+    # writing cached_* attributes onto every strategy in the graph. All three
+    # properties mutate the same strategy __dict__s, so computing them
+    # concurrently from multiple threads used to race on those attributes and
+    # could raise e.g. "AttributeError: 'IntegersStrategy' object has no
+    # attribute 'cached_has_reusable_values'".
+    class SlowStrategy(SearchStrategy):
+        def calc_is_empty(self, recur):
+            do_work()
+            return False
+
+        def calc_has_reusable_values(self, recur):
+            do_work()
+            return True
+
+        def calc_is_cacheable(self, recur):
+            do_work()
+            return True
+
+    s = st.tuples(SlowStrategy(), st.integers(), st.text(), SlowStrategy())
+    properties = ("is_empty", "has_reusable_values", "is_cacheable")
+
+    n_threads = 8
+    barrier = Barrier(n_threads)
+    results = []
+    errors = []
+
+    def worker(offset):
+        # access the properties in a different order per thread, so that
+        # different cached_* keys are being written to the same objects at once.
+        order = properties[offset:] + properties[:offset]
+        barrier.wait()
+        try:
+            results.append({p: getattr(s, p) for p in order})
+        except Exception as e:
+            errors.append(e)
+
+    threads = [Thread(target=worker, args=(i % 3,)) for i in range(n_threads)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors, errors
+    expected = {"is_empty": False, "has_reusable_values": True, "is_cacheable": True}
+    assert results == [expected] * n_threads

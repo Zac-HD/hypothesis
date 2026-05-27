@@ -78,6 +78,11 @@ FILTERED_SEARCH_STRATEGY_DO_DRAW_LABEL = calc_label_from_name(
 )
 
 label_lock = RLock()
+# recursive_property reads and writes the shared cached_* attributes of many
+# strategies, so concurrent calls (even for different property names, which all
+# mutate the same strategy __dict__s) can race under free-threading. Serialise
+# the whole calculation behind a single lock; cached reads stay lock-free.
+recursive_property_lock = RLock()
 
 
 def recursive_property(strategy: "SearchStrategy", name: str, default: object) -> Any:
@@ -122,101 +127,109 @@ def recursive_property(strategy: "SearchStrategy", name: str, default: object) -
     except AttributeError:
         pass
 
-    mapping: dict[SearchStrategy, Any] = {}
-    sentinel = object()
-    hit_recursion = False
-
-    # For a first pass we do a direct recursive calculation of the
-    # property, but we block recursively visiting a value in the
-    # computation of its property: When that happens, we simply
-    # note that it happened and return the default value.
-    def recur(strat: SearchStrategy) -> Any:
-        nonlocal hit_recursion
+    with recursive_property_lock:
+        # Another thread may have computed and cached the value while we were
+        # waiting for the lock, in which case we can just return it.
         try:
-            return forced_value(strat)
+            return forced_value(strategy)
         except AttributeError:
             pass
-        result = mapping.get(strat, sentinel)
-        if result is calculating:
-            hit_recursion = True
-            return default
-        elif result is sentinel:
-            mapping[strat] = calculating
-            mapping[strat] = getattr(strat, calculation)(recur)
-            return mapping[strat]
-        return result
 
-    recur(strategy)
+        mapping: dict[SearchStrategy, Any] = {}
+        sentinel = object()
+        hit_recursion = False
 
-    # If we hit self-recursion in the computation of any strategy
-    # value, our mapping at the end is imprecise - it may or may
-    # not have the right values in it. We now need to proceed with
-    # a more careful fixed point calculation to get the exact
-    # values. Hopefully our mapping is still pretty good and it
-    # won't take a large number of updates to reach a fixed point.
-    if hit_recursion:
-        needs_update = set(mapping)
-
-        # We track which strategies use which in the course of
-        # calculating their property value. If A ever uses B in
-        # the course of calculating its value, then whenever the
-        # value of B changes we might need to update the value of
-        # A.
-        listeners: dict[SearchStrategy, set[SearchStrategy]] = defaultdict(set)
-    else:
-        needs_update = None
-
-    def recur2(strat: SearchStrategy) -> Any:
-        def recur_inner(other: SearchStrategy) -> Any:
+        # For a first pass we do a direct recursive calculation of the
+        # property, but we block recursively visiting a value in the
+        # computation of its property: When that happens, we simply
+        # note that it happened and return the default value.
+        def recur(strat: SearchStrategy) -> Any:
+            nonlocal hit_recursion
             try:
-                return forced_value(other)
+                return forced_value(strat)
             except AttributeError:
                 pass
-            listeners[other].add(strat)
-            result = mapping.get(other, sentinel)
-            if result is sentinel:
-                assert needs_update is not None
-                needs_update.add(other)
-                mapping[other] = default
+            result = mapping.get(strat, sentinel)
+            if result is calculating:
+                hit_recursion = True
                 return default
+            elif result is sentinel:
+                mapping[strat] = calculating
+                mapping[strat] = getattr(strat, calculation)(recur)
+                return mapping[strat]
             return result
 
-        return recur_inner
+        recur(strategy)
 
-    count = 0
-    seen = set()
-    while needs_update:
-        count += 1
-        # If we seem to be taking a really long time to stabilize we
-        # start tracking seen values to attempt to detect an infinite
-        # loop. This should be impossible, and most code will never
-        # hit the count, but having an assertion for it means that
-        # testing is easier to debug and we don't just have a hung
-        # test.
-        # Note: This is actually covered, by test_very_deep_deferral
-        # in tests/cover/test_deferred_strategies.py. Unfortunately it
-        # runs into a coverage bug. See
-        # https://github.com/nedbat/coveragepy/issues/605
-        # for details.
-        if count > 50:  # pragma: no cover
-            key = frozenset(mapping.items())
-            assert key not in seen, (key, name)
-            seen.add(key)
-        to_update = needs_update
-        needs_update = set()
-        for strat in to_update:
-            new_value = getattr(strat, calculation)(recur2(strat))
-            if new_value != mapping[strat]:
-                needs_update.update(listeners[strat])
-                mapping[strat] = new_value
+        # If we hit self-recursion in the computation of any strategy
+        # value, our mapping at the end is imprecise - it may or may
+        # not have the right values in it. We now need to proceed with
+        # a more careful fixed point calculation to get the exact
+        # values. Hopefully our mapping is still pretty good and it
+        # won't take a large number of updates to reach a fixed point.
+        if hit_recursion:
+            needs_update = set(mapping)
 
-    # We now have a complete and accurate calculation of the
-    # property values for everything we have seen in the course of
-    # running this calculation. We simultaneously update all of
-    # them (not just the strategy we started out with).
-    for k, v in mapping.items():
-        setattr(k, cache_key, v)
-    return getattr(strategy, cache_key)
+            # We track which strategies use which in the course of
+            # calculating their property value. If A ever uses B in
+            # the course of calculating its value, then whenever the
+            # value of B changes we might need to update the value of
+            # A.
+            listeners: dict[SearchStrategy, set[SearchStrategy]] = defaultdict(set)
+        else:
+            needs_update = None
+
+        def recur2(strat: SearchStrategy) -> Any:
+            def recur_inner(other: SearchStrategy) -> Any:
+                try:
+                    return forced_value(other)
+                except AttributeError:
+                    pass
+                listeners[other].add(strat)
+                result = mapping.get(other, sentinel)
+                if result is sentinel:
+                    assert needs_update is not None
+                    needs_update.add(other)
+                    mapping[other] = default
+                    return default
+                return result
+
+            return recur_inner
+
+        count = 0
+        seen = set()
+        while needs_update:
+            count += 1
+            # If we seem to be taking a really long time to stabilize we
+            # start tracking seen values to attempt to detect an infinite
+            # loop. This should be impossible, and most code will never
+            # hit the count, but having an assertion for it means that
+            # testing is easier to debug and we don't just have a hung
+            # test.
+            # Note: This is actually covered, by test_very_deep_deferral
+            # in tests/cover/test_deferred_strategies.py. Unfortunately it
+            # runs into a coverage bug. See
+            # https://github.com/nedbat/coveragepy/issues/605
+            # for details.
+            if count > 50:  # pragma: no cover
+                key = frozenset(mapping.items())
+                assert key not in seen, (key, name)
+                seen.add(key)
+            to_update = needs_update
+            needs_update = set()
+            for strat in to_update:
+                new_value = getattr(strat, calculation)(recur2(strat))
+                if new_value != mapping[strat]:
+                    needs_update.update(listeners[strat])
+                    mapping[strat] = new_value
+
+        # We now have a complete and accurate calculation of the
+        # property values for everything we have seen in the course of
+        # running this calculation. We simultaneously update all of
+        # them (not just the strategy we started out with).
+        for k, v in mapping.items():
+            setattr(k, cache_key, v)
+        return getattr(strategy, cache_key)
 
 
 class SearchStrategy(Generic[Ex]):
