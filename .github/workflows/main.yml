@@ -50,8 +50,10 @@ jobs:
         pip install tox
     - name: Run tests
       env:
-        # The tox-{cover,nocover,rest} tasks collect coverage (see the `coverage`
-        # job below); sysmon gives low-overhead collection on Python 3.12+.
+        # The tox-{cover,nocover,rest} tasks collect coverage, combined by the
+        # `coverage` job below.  We collect on 3.14 only: sys.monitoring gives
+        # low-overhead *branch* coverage there, but can't measure branches on
+        # 3.12/3.13 (where it would fall back to the slow default core).
         COVERAGE_CORE: sysmon
         COV: ${{ startsWith(matrix.task, 'tox-') && '--cov=hypothesis --cov-config=pyproject.toml --cov-append --cov-report= --cov-fail-under=0' || '' }}
         COVERAGE_FILE: .coverage.${{ matrix.task }}
@@ -119,14 +121,6 @@ jobs:
       fail-fast: false
     env:
       PYTHON_VERSION: "3.14"
-      # Collect coverage on the 3.12/3.13 cover/nocover/niche tasks; combined
-      # with the 3.14 tox-* tasks in the `coverage` job below.  sysmon gives
-      # low-overhead collection on Python 3.12+.  COV is non-empty exactly for
-      # the tasks we collect from, which also gates the upload step below.
-      COVERAGE_CORE: sysmon
-      COV: ${{ (contains(matrix.task, 'py312-') || contains(matrix.task, 'py313-')) && (endsWith(matrix.task, '-cover') || endsWith(matrix.task, '-nocover') || endsWith(matrix.task, '-niche')) && '--cov=hypothesis --cov-config=pyproject.toml --cov-append --cov-report= --cov-fail-under=0' || '' }}
-      COVERAGE_FILE: .coverage.${{ matrix.task }}
-      HYPOTHESIS_INTERNAL_COVERAGE: ${{ (contains(matrix.task, 'py312-') || contains(matrix.task, 'py313-')) && (endsWith(matrix.task, '-cover') || endsWith(matrix.task, '-nocover') || endsWith(matrix.task, '-niche')) && 'true' || '' }}
     steps:
     - uses: actions/checkout@v3
       with:
@@ -145,16 +139,6 @@ jobs:
         else
           ./build.sh
         fi
-    - name: Upload coverage data
-      uses: actions/upload-artifact@v4
-      # Invoke the magic `always` function to run on both success and failure.
-      if: ${{ always() && env.COV != '' }}
-      with:
-        name: coverage-data-${{ matrix.task }}
-        include-hidden-files: true
-        path: |
-          hypothesis/.coverage*
-          hypothesis/branch-check*
 
   nonreq:
     needs: [basic]
@@ -313,11 +297,11 @@ jobs:
         parallel --max-procs 100% --max-args 20 --keep-order --line-buffer \
           python -m pytest -p no:cacheprovider <<< $TEST_FILES
 
-  # Combine the coverage data uploaded by the `basic` and `req` jobs and assert
-  # that, taken together, our self-tests reach 100% branch coverage.  This
-  # replaces the old single-environment `check-coverage` task.
+  # Combine the coverage data uploaded by the 3.14 cover/nocover/rest tasks in
+  # the `basic` job and assert that, taken together, our self-tests reach 100%
+  # branch coverage.  Locally, `./build.sh check-coverage` does the same thing.
   coverage:
-    needs: [basic, req]
+    needs: [basic]
     runs-on: ubuntu-latest
     env:
       PYTHON_VERSION: "3.14"
@@ -338,7 +322,10 @@ jobs:
     - name: Combine coverage and check 100%
       working-directory: ./hypothesis
       run: |
-        pip install "$(grep '^coverage\[toml\]==' ../requirements/coverage.txt)"
+        # Install coverage at the version pinned in the lockfile.  pip won't
+        # accept a constraints file containing extras, so strip the `[toml]`
+        # (which is a no-op on 3.11+, where tomllib is in the stdlib anyway).
+        pip install coverage -c <(sed 's/\[[^]]*\]//' ../requirements/coverage.txt)
         python -m coverage combine coverage-data/*/
         python -m coverage report
         python scripts/validate_branch_check.py coverage-data

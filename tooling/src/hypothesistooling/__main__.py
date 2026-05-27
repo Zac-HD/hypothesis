@@ -766,6 +766,34 @@ standard_tox_task("numpy-nightly", py="3.12")
 standard_tox_task("snapshots")
 
 
+@python_tests
+def check_coverage(*args):
+    # Run the cover/nocover/rest environments under coverage (sys.monitoring on
+    # 3.14 gives low-overhead branch coverage), then combine their data and
+    # assert 100% branch coverage over the union -- the same check CI performs
+    # by combining the artifacts those environments upload.
+    for pattern in (".coverage*", "branch-check*"):
+        for stale in Path(hp.HYPOTHESIS).glob(pattern):
+            stale.unlink()
+    os.environ["COVERAGE_CORE"] = "sysmon"
+    os.environ["HYPOTHESIS_INTERNAL_COVERAGE"] = "true"
+    os.environ["COV"] = (
+        "--cov=hypothesis --cov-config=pyproject.toml "
+        "--cov-append --cov-report= --cov-fail-under=0"
+    )
+    for tox_env in ("cover", "nocover", "rest"):
+        os.environ["COVERAGE_FILE"] = f".coverage.{tox_env}"
+        run_tox(tox_env, PYTHONS[ci_version], *args)
+    # Combine and report with the tooling interpreter, which also has coverage.
+    del os.environ["COVERAGE_FILE"]
+    for cmd in (
+        [sys.executable, "-m", "coverage", "combine"],
+        [sys.executable, "-m", "coverage", "report"],
+        [sys.executable, "scripts/validate_branch_check.py"],
+    ):
+        subprocess.check_call(cmd, cwd=hp.HYPOTHESIS)
+
+
 @task()
 def check_quality(*args):
     run_tox("quality", PYTHONS[ci_version], *args)
