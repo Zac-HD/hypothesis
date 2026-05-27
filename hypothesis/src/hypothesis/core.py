@@ -102,7 +102,7 @@ from hypothesis.internal.healthcheck import fail_health_check
 from hypothesis.internal.observability import (
     InfoObservation,
     InfoObservationType,
-    Observation,
+    TestCaseStatus,
     make_testcase,
 )
 from hypothesis.internal.reflection import (
@@ -687,16 +687,14 @@ def execute_explicit_examples(state, wrapped_test, arguments, kwargs, original_s
 
                 empty_data.freeze()
                 if state.settings.observability is not None:
-                    tc = make_testcase(
+                    state._deliver_observation(
                         run_start=state._start_timestamp,
                         property=state.test_identifier,
                         data=empty_data,
                         how_generated="explicit example",
                         representation=state._string_repr,
                         timing=state._timing_features,
-                        observability=state.settings.observability,
                     )
-                    state._deliver_observation(tc)
 
             if fragments_reported:
                 verbose_report(fragments_reported[0].replace("Falsifying", "Trying", 1))
@@ -1345,7 +1343,7 @@ class StateForActualGivenExecution:
                     self._string_repr = "<backend failed to realize symbolic arguments>"
 
                 data.freeze()
-                tc = make_testcase(
+                self._deliver_observation(
                     run_start=self._start_timestamp,
                     property=self.test_identifier,
                     data=data,
@@ -1356,9 +1354,7 @@ class StateForActualGivenExecution:
                     coverage=tractable_coverage_report(trace) or None,
                     phase=phase,
                     backend_metadata=data.provider.observe_test_case(),
-                    observability=self.settings.observability,
                 )
-                self._deliver_observation(tc)
 
                 for msg in data.provider.observe_information_messages(
                     lifetime="test_case"
@@ -1366,26 +1362,58 @@ class StateForActualGivenExecution:
                     self._deliver_information_message(**msg)
             self._timing_features = {}
 
-    def _deliver_observation(self, observation: Observation) -> None:
-        # nocover because we currently guard all calls to this by checking if
-        # observability is enabled, but that might not always be true
-        if self.settings.observability is None:  # pragma: no cover
-            return
+    def _deliver_observation(
+        self,
+        *,
+        run_start: float,
+        property: str,
+        data: ConjectureData,
+        how_generated: str,
+        timing: dict[str, float],
+        representation: str = "<unknown>",
+        arguments: dict | None = None,
+        coverage: dict[str, list[int]] | None = None,
+        phase: str | None = None,
+        backend_metadata: dict[str, Any] | None = None,
+        status: TestCaseStatus | Status | None = None,
+        status_reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        # all callers guard on `self.settings.observability is not None`
+        assert self.settings.observability
+        observation = make_testcase(
+            run_start=run_start,
+            property=property,
+            data=data,
+            how_generated=how_generated,
+            timing=timing,
+            representation=representation,
+            arguments=arguments,
+            coverage=coverage,
+            phase=phase,
+            backend_metadata=backend_metadata,
+            status=status,
+            status_reason=status_reason,
+            metadata=metadata,
+            observability=self.settings.observability,
+        )
         for callback in self.settings.observability.callbacks:
             callback(observation)
 
     def _deliver_information_message(
         self, *, type: InfoObservationType, title: str, content: str | dict
     ) -> None:
-        self._deliver_observation(
-            InfoObservation(
-                type=type,
-                run_start=self._start_timestamp,
-                property=self.test_identifier,
-                title=title,
-                content=content,
-            )
+        # all callers guard on `self.settings.observability is not None`
+        assert self.settings.observability
+        observation = InfoObservation(
+            type=type,
+            run_start=self._start_timestamp,
+            property=self.test_identifier,
+            title=title,
+            content=content,
         )
+        for callback in self.settings.observability.callbacks:
+            callback(observation)
 
     def run_engine(self):
         """Run the test function many times, on database input and generated
@@ -1555,7 +1583,7 @@ class StateForActualGivenExecution:
                 ran_example.freeze()
                 if self.settings.observability is not None:
                     # log our observability line for the final failing example
-                    tc = make_testcase(
+                    self._deliver_observation(
                         run_start=self._start_timestamp,
                         property=self.test_identifier,
                         data=ran_example,
@@ -1567,9 +1595,7 @@ class StateForActualGivenExecution:
                         status="passed" if sys.exc_info()[0] else "failed",
                         status_reason=str(origin or "unexpected/flaky pass"),
                         metadata={"traceback": tb},
-                        observability=self.settings.observability,
                     )
-                    self._deliver_observation(tc)
 
                 # Whether or not replay actually raised the exception again, we want
                 # to print the reproduce_failure decorator for the failing example.
@@ -2352,7 +2378,7 @@ def given(
                 finally:
                     if state.settings.observability is not None:
                         data.freeze()
-                        tc = make_testcase(
+                        state._deliver_observation(
                             run_start=state._start_timestamp,
                             property=state.test_identifier,
                             data=data,
@@ -2363,9 +2389,7 @@ def given(
                             coverage=None,
                             status=status,
                             backend_metadata=data.provider.observe_test_case(),
-                            observability=state.settings.observability,
                         )
-                        state._deliver_observation(tc)
                         state._timing_features = {}
 
                 assert isinstance(data.provider, BytestringProvider)
