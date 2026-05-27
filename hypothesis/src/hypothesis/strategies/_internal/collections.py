@@ -419,17 +419,14 @@ class FixedDictStrategy(SearchStrategy[dict[Any, Any]]):
                     pairs.append((key, data.draw(self.optional[key])))
                 arg_labels |= arg_label
 
-        # Vary the iteration order of the resulting dict (#3906).  We permute
+        # Vary the iteration order of the resulting dict (#3906).  We shuffle
         # *after* choosing which optional keys to include, so the set of keys -
         # and thus the length distribution - is unaffected; only order varies.
-        # Permutations shrink towards the original order, i.e. required keys in
-        # declared order followed by optional keys.  We only do this for plain
-        # dicts, where iteration order is incidental; for an OrderedDict (or
-        # other subclass) the declared order may be semantically meaningful.
-        dict_type = type(self.mapping)
-        if dict_type is dict:
-            pairs = data.draw(st.permutations(pairs))
-        value = dict_type(pairs)
+        # The shuffle shrinks towards the original order, i.e. required keys in
+        # declared order followed by optional keys.  Callers who need a specific
+        # key order should build it themselves, e.g. tuples(...).map(dict).
+        cu.fisher_yates_shuffle(data, pairs)
+        value = type(self.mapping)(pairs)
 
         if arg_labels:
             context.known_object_printers[IDKey(value)].append(
