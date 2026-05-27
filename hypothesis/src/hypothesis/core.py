@@ -1789,6 +1789,61 @@ class HypothesisHandle:
             return self.__cached_target
 
 
+class _GivenWrapper:
+    """The object returned by ``@given``.
+
+    At module scope this behaves like the wrapped test function, delegating
+    attribute access and calls. As a class attribute it is a (non-data)
+    descriptor: ``Cls.method`` yields the underlying function unchanged, while
+    ``instance.method`` yields a bound view which threads ``instance`` through
+    to ``fuzz_one_input`` so that fuzzing works on instance methods.
+    """
+
+    def __init__(self, wrapped_test: Any) -> None:
+        object.__setattr__(self, "_wrapped_test", wrapped_test)
+
+    @property
+    def __wrapped__(self) -> Any:
+        return self._wrapped_test
+
+    def __call__(self, *args: object, **kwargs: object) -> Any:
+        return self._wrapped_test(*args, **kwargs)
+
+    def __get__(self, instance: object, owner: "type | None" = None) -> Any:
+        if instance is None:
+            return self._wrapped_test
+        return _BoundGivenWrapper(self._wrapped_test, instance)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped_test, name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        setattr(self._wrapped_test, name, value)
+
+
+class _BoundGivenWrapper:
+    """A ``@given`` test bound to an instance; see ``_GivenWrapper``."""
+
+    def __init__(self, wrapped_test: Any, instance: object) -> None:
+        self.__func__ = wrapped_test
+        self.__self__ = instance
+
+    def __call__(self, *args: object, **kwargs: object) -> Any:
+        return self.__func__(self.__self__, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.__func__, name)
+
+    @property
+    def hypothesis(self) -> HypothesisHandle:
+        handle = self.__func__.hypothesis
+        return HypothesisHandle(
+            handle.inner_test,
+            partial(handle._get_fuzz_target, self.__self__),
+            handle._given_kwargs,
+        )
+
+
 @overload
 def given(
     _: EllipsisType, /
@@ -2269,9 +2324,9 @@ def given(
                 with thread_overlap_lock:
                     del thread_overlap[threadid]
 
-        def _get_fuzz_target() -> (
-            Callable[[bytes | bytearray | memoryview | BinaryIO], bytes | None]
-        ):
+        def _get_fuzz_target(
+            selfy: Any = not_set,
+        ) -> Callable[[bytes | bytearray | memoryview | BinaryIO], bytes | None]:
             # Because fuzzing interfaces are very performance-sensitive, we use a
             # somewhat more complicated structure here.  `_get_fuzz_target()` is
             # called by the `HypothesisHandle.fuzz_one_input` property, allowing
@@ -2281,16 +2336,24 @@ def given(
             # We then share the performance cost of setting up `state` between
             # many invocations of the target.  We explicitly force `deadline=None`
             # for performance reasons, saving ~40% the runtime of an empty test.
+            #
+            # `selfy` is the bound instance when fuzzing a method, e.g. via
+            # `instance.test_method.hypothesis.fuzz_one_input`; it is passed
+            # through as the test's first positional argument.
             test = wrapped_test.hypothesis.inner_test
             settings = Settings(
                 parent=wrapped_test._hypothesis_internal_use_settings, deadline=None
             )
             random = get_random_for_wrapped_test(test, wrapped_test)
+            fuzz_args = () if selfy is not_set else (selfy,)
             _args, _kwargs, stuff = process_arguments_to_given(
-                wrapped_test, (), {}, given_kwargs, new_signature.parameters
+                wrapped_test, fuzz_args, {}, given_kwargs, new_signature.parameters
             )
-            assert not _args
-            assert not _kwargs
+            if selfy is not_set:
+                assert not _args
+                assert not _kwargs
+            else:
+                assert [*_args, *_kwargs.values()] == [selfy]
             state = StateForActualGivenExecution(
                 stuff,
                 test,
@@ -2383,7 +2446,7 @@ def given(
             test, "_hypothesis_internal_use_reproduce_failure", None
         )
         wrapped_test.hypothesis = HypothesisHandle(test, _get_fuzz_target, given_kwargs)
-        return wrapped_test
+        return _GivenWrapper(wrapped_test)
 
     return run_test_as_given
 

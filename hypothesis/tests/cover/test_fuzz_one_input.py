@@ -161,3 +161,53 @@ def test_fuzzing_invalid_test_raises_error():
     with pytest.raises(InvalidArgument, match="Too many positional arguments"):
         # access the property to check error happens during setup
         invalid_test.hypothesis.fuzz_one_input
+
+
+def test_fuzz_one_input_on_instance_method():
+    # The bound instance is threaded through to the test as `self`.
+    class Cls:
+        def __init__(self):
+            self.seen = []
+
+        @given(st.integers())
+        @settings(database=None)
+        def f(self, n):
+            self.seen.append(n)
+            raise AssertionError
+
+    inst = Cls()
+    with pytest.raises(AssertionError):
+        inst.f.hypothesis.fuzz_one_input(bytes(20))
+    assert inst.seen == [0]
+
+    # Distinct instances are fuzzed independently of one another.
+    other = Cls()
+    with pytest.raises(AssertionError):
+        other.f.hypothesis.fuzz_one_input(bytes(20))
+    assert inst.seen == [0]
+    assert other.seen == [0]
+
+
+def test_fuzz_one_input_on_unittest_method():
+    class Test(unittest.TestCase):
+        @given(st.integers())
+        @settings(database=None)
+        def test_x(self, n):
+            raise AssertionError
+
+    with pytest.raises(AssertionError):
+        Test("test_x").test_x.hypothesis.fuzz_one_input(bytes(20))
+
+
+def test_class_access_does_not_wrap_the_underlying_test():
+    # Accessing the test via the class (rather than an instance) returns the
+    # plain wrapped function, leaving introspection and existing behaviour
+    # untouched.
+    class Cls:
+        @given(st.integers())
+        def f(self, n):
+            pass
+
+    assert Cls.f is Cls.__dict__["f"].__get__(None, Cls)
+    assert Cls.f.is_hypothesis_test
+    assert callable(Cls.f.hypothesis._get_fuzz_target)
