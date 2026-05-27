@@ -8,4 +8,7 @@ in :ref:`hypothesis.extra.pandas <hypothesis-pandas>`.  You can now pass a
 :func:`~hypothesis.extra.pandas.column`, and every value will share that single
 timezone (the only arrangement pandas supports outside of the ``object``
 dtype).  The datetime resolution is taken from the dtype, so you can also
-generate e.g. ``"datetime64[us, UTC]"`` columns (:issue:`4020`).
+generate e.g. ``"datetime64[us, UTC]"`` columns, and the generated values
+cover the full range representable at that resolution - which for coarser
+units is far wider than the ``datetime64[ns]`` bounds of roughly 1677-2262
+(:issue:`4020`).

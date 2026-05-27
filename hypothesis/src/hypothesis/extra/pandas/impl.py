@@ -73,30 +73,24 @@ def datetime_tz_dtype(dtype):
     return None
 
 
-def timezone_aware_datetimes(dtype):
-    """Default element strategy for a :class:`~pandas.DatetimeTZDtype`."""
-    if dtype.unit == "ns":
-        # datetime64[ns] is limited to roughly 1677-2262, while coarser
-        # resolutions cover the full range of Python's datetime type.  We pad
-        # the bounds so that applying a UTC offset can't push a value out of
-        # the representable range.
-        min_value = (pandas.Timestamp.min + pandas.Timedelta(days=1)).floor("D")
-        max_value = (pandas.Timestamp.max - pandas.Timedelta(days=1)).floor("D")
-        datetimes = st.datetimes(
-            min_value.to_pydatetime(),
-            max_value.to_pydatetime(),
-            timezones=st.just(dtype.tz),
-        )
-        # Python datetimes only have microsecond resolution, so draw the
-        # remaining nanoseconds separately to exercise the full ns precision.
-        return st.builds(
-            lambda d, ns: pandas.Timestamp(d) + pandas.Timedelta(ns, unit="ns"),
-            datetimes,
-            st.integers(0, 999),
-        )
-    min_value = datetime.min + timedelta(days=2)
-    max_value = datetime.max - timedelta(days=2)
-    return st.datetimes(min_value, max_value, timezones=st.just(dtype.tz))
+def naive_datetime64_dtype(tz_dtype):
+    """The underlying timezone-naive ``datetime64[unit]`` dtype that backs a
+    :class:`~pandas.DatetimeTZDtype`."""
+    return np.dtype(f"datetime64[{tz_dtype.unit}]")
+
+
+def attach_timezone(obj, tz):
+    """Interpret a naive datetime64 :class:`~pandas.Series` or
+    :class:`~pandas.Index` as UTC instants and convert it to ``tz``.
+
+    We build timezone-aware columns from naive ``datetime64[unit]`` values and
+    only attach the timezone at the array level, because constructing them from
+    timezone-aware scalars silently corrupts values near the bounds of the
+    representable range.
+    """
+    if isinstance(obj, pandas.Series):
+        return obj.dt.tz_localize("UTC").dt.tz_convert(tz)
+    return obj.tz_localize("UTC").tz_convert(tz)
 
 
 @check_function
@@ -151,8 +145,13 @@ def elements_and_dtype(elements, dtype, source=None):
 
     tz_dtype = datetime_tz_dtype(dtype)
     if tz_dtype is not None:
+        # With the default elements strategy we build the column from the
+        # underlying naive datetime64[unit] dtype (covering the full
+        # representable range) and the caller attaches the timezone afterwards.
+        # Custom elements are passed through and constructed with the tz dtype.
         if elements is None:
-            elements = timezone_aware_datetimes(tz_dtype)
+            naive = naive_datetime64_dtype(tz_dtype)
+            return npst.from_dtype(naive), naive
         return elements, tz_dtype
 
     _get_subclasses = getattr(IntegerDtype, "__subclasses__", list)
@@ -298,11 +297,17 @@ def indexes(
     check_valid_interval(min_size, max_size, "min_size", "max_size")
     check_type(bool, unique, "unique")
 
+    tz_dtype = datetime_tz_dtype(dtype)
+    localize_tz = tz_dtype is not None and elements is None
+
     elements, dtype = elements_and_dtype(elements, dtype)
 
     if max_size is None:
         max_size = min_size + DEFAULT_MAX_SIZE
-    return ValueIndexStrategy(elements, dtype, min_size, max_size, unique, name)
+    strategy = ValueIndexStrategy(elements, dtype, min_size, max_size, unique, name)
+    if localize_tz:
+        return strategy.map(lambda ix: attach_timezone(ix, tz_dtype.tz))
+    return strategy
 
 
 @defines_strategy()
@@ -338,6 +343,8 @@ def series(
       As an experimental feature, you may also pass a timezone-aware
       :class:`~pandas.DatetimeTZDtype` (e.g. ``"datetime64[ns, UTC]"``), in
       which case every value in the series will share that single timezone.
+      The generated values cover the full range representable at the dtype's
+      resolution, which for coarser units is much wider than ``datetime64[ns]``.
 
     * index: If not None, a strategy for generating indexes for the
       resulting Series. This can generate either :class:`pandas.Index`
@@ -365,11 +372,18 @@ def series(
     else:
         check_strategy(index, "index")
 
+    tz_dtype = datetime_tz_dtype(dtype)
+    localize_tz = tz_dtype is not None and elements is None
+
     elements, np_dtype = elements_and_dtype(elements, dtype)
     index_strategy = index
 
+    if localize_tz:
+        # Build the column with the underlying naive dtype, then attach the
+        # timezone at the array level once it has been assembled.
+        dtype = np_dtype
     # if it is converted to an object, use object for series type
-    if (
+    elif (
         np_dtype is not None
         and np_dtype.kind == "O"
         and not isinstance(dtype, IntegerDtype)
@@ -416,6 +430,8 @@ def series(
                 name=draw(name),
             )
 
+    if localize_tz:
+        return result().map(lambda s: attach_timezone(s, tz_dtype.tz))
     return result()
 
 
@@ -617,6 +633,10 @@ def data_frames(
 
     rewritten_columns = []
     column_names: set[str] = set()
+    # Maps the name of each timezone-aware datetime column to its timezone.  We
+    # build such columns with the underlying naive dtype and attach the
+    # timezone once the frame has been assembled (see attach_timezone).
+    tz_columns: dict = {}
 
     for i, c in enumerate(cols):
         check_type(column, c, f"columns[{i}]")
@@ -639,7 +659,12 @@ def data_frames(
             raise InvalidArgument(f"duplicate definition of column name {c.name!r}")
 
         column_names.add(c.name)
-        c.elements, _ = elements_and_dtype(c.elements, c.dtype, label)
+        column_tz = datetime_tz_dtype(c.dtype)
+        localize_tz = column_tz is not None and c.elements is None
+        c.elements, np_dtype = elements_and_dtype(c.elements, c.dtype, label)
+        if localize_tz:
+            c.dtype = np_dtype
+            tz_columns[c.name] = column_tz.tz
 
         if c.dtype is None and rows is not None:
             raise InvalidArgument(
@@ -724,7 +749,10 @@ def data_frames(
                         )
                     )
 
-            return pandas.DataFrame(data, index=index)
+            result = pandas.DataFrame(data, index=index)
+            for name, tz in tz_columns.items():
+                result[name] = attach_timezone(result[name], tz)
+            return result
 
         return just_draw_columns()
     else:
@@ -812,6 +840,8 @@ def data_frames(
                     break
                 else:
                     reject()
+            for name, tz in tz_columns.items():
+                result[name] = attach_timezone(result[name], tz)
             return result
 
         return assign_rows()

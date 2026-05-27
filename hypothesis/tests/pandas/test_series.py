@@ -157,6 +157,20 @@ def test_ns_resolution_series_exercise_sub_microsecond_values():
     )
 
 
+def test_second_resolution_covers_beyond_datetime_max():
+    # The full representable range of datetime64[s] is vastly wider than
+    # Python's datetime, which stops at the year 9999.
+    year_9999 = 253402300800  # seconds since the epoch
+    find_any(
+        pdst.series(dtype="datetime64[s, UTC]", index=pdst.range_indexes(min_size=1)),
+        lambda s: _utc_seconds(s.dropna()).map(abs).gt(year_9999).any(),
+    )
+
+
+def _utc_seconds(s):
+    return s.dt.tz_convert("UTC").dt.tz_localize(None).astype("int64")
+
+
 def test_tz_aware_series_accepts_custom_elements():
     tz = dt.timezone.utc
     elements = st.datetimes(timezones=st.just(tz)).map(lambda d: d.replace(year=2000))

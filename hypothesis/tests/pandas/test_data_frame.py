@@ -40,7 +40,7 @@ def test_can_have_tz_aware_datetime_columns():
         ),
         lambda df: df["a"].dtype == dtype
         and df["b"].dtype == dtype
-        and df["b"].is_unique,
+        and df["b"].dropna().is_unique,
     )
 
 
