@@ -8,7 +8,14 @@
 # v. 2.0. If a copy of the MPL was not distributed with this file, You can
 # obtain one at https://mozilla.org/MPL/2.0/.
 
-from inspect import signature
+import asyncio
+from collections.abc import AsyncIterator, Iterator
+from inspect import (
+    isasyncgenfunction,
+    iscoroutinefunction,
+    isgeneratorfunction,
+    signature,
+)
 
 import pytest
 
@@ -213,3 +220,93 @@ def test_functions_supports_find():
     with pytest.raises(InvalidState):
         f(1, 2)
     assert f.__name__ == pure_func.__name__
+
+
+async def async_func_a(a, b) -> int: ...
+
+
+@given(functions(like=async_func_a))
+def test_functions_async(f):
+    assert iscoroutinefunction(f)
+    assert f.__name__ == "async_func_a"
+    assert list(signature(f).parameters) == ["a", "b"]
+    with pytest.raises(TypeError):
+        f(1)
+    result = asyncio.run(f(1, 2))
+    assert isinstance(result, int)
+
+
+@given(functions(like=async_func_a, returns=booleans()))
+def test_functions_async_explicit_returns(f):
+    assert isinstance(asyncio.run(f(1, 2)), bool)
+
+
+@given(f=functions(like=async_func_a, returns=integers(), pure=True))
+def test_functions_async_pure(f):
+    assert asyncio.run(f(1, 2)) == asyncio.run(f(1, 2))
+
+
+def gen_func(a) -> Iterator[int]:
+    yield a
+
+
+@given(functions(like=gen_func))
+def test_functions_generator(f):
+    assert isgeneratorfunction(f)
+    assert f.__name__ == "gen_func"
+    assert list(signature(f).parameters) == ["a"]
+    with pytest.raises(TypeError):
+        list(f())
+    result = list(f(1))
+    assert isinstance(result, list)
+    assert all(isinstance(x, int) for x in result)
+
+
+@given(functions(like=gen_func, returns=booleans()))
+def test_functions_generator_explicit_returns(f):
+    assert all(isinstance(x, bool) for x in f(1))
+
+
+def gen_no_annotation(a):
+    yield a
+
+
+@given(functions(like=gen_no_annotation))
+def test_functions_generator_infers_none_without_yield_type(f):
+    assert isgeneratorfunction(f)
+    assert all(x is None for x in f(1))
+
+
+@given(f=functions(like=gen_func, returns=integers(), pure=True))
+def test_functions_generator_pure(f):
+    assert list(f(1)) == list(f(1))
+
+
+async def agen_func(a) -> AsyncIterator[int]:
+    yield a
+
+
+@given(functions(like=agen_func))
+def test_functions_async_generator(f):
+    assert isasyncgenfunction(f)
+    assert f.__name__ == "agen_func"
+
+    async def collect():
+        return [x async for x in f(1)]
+
+    result = asyncio.run(collect())
+    assert all(isinstance(x, int) for x in result)
+
+
+def test_functions_async_valid_within_given_invalid_outside():
+    cache = None
+
+    @given(functions(like=async_func_a, returns=integers()))
+    def t(f):
+        nonlocal cache
+        cache = f
+        assert isinstance(asyncio.run(f(1, 2)), int)
+
+    t()
+    with pytest.raises(InvalidState):
+        asyncio.run(cache(1, 2))

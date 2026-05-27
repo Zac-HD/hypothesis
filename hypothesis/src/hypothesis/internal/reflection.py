@@ -352,14 +352,41 @@ def source_exec_as_module(source: str) -> ModuleType:
     return result
 
 
-COPY_SIGNATURE_SCRIPT = """
+COPY_SIGNATURE_SCRIPTS = {
+    "function": """
 from hypothesis.utils.conventions import not_set
 
 def accept({funcname}):
     def {name}{signature}:
         return {funcname}({invocation})
     return {name}
-""".lstrip()
+""".lstrip(),
+    "coroutine": """
+from hypothesis.utils.conventions import not_set
+
+def accept({funcname}):
+    async def {name}{signature}:
+        return {funcname}({invocation})
+    return {name}
+""".lstrip(),
+    "generator": """
+from hypothesis.utils.conventions import not_set
+
+def accept({funcname}):
+    def {name}{signature}:
+        yield from {funcname}({invocation})
+    return {name}
+""".lstrip(),
+    "async_generator": """
+from hypothesis.utils.conventions import not_set
+
+def accept({funcname}):
+    async def {name}{signature}:
+        for {loopvar} in {funcname}({invocation}):
+            yield {loopvar}
+    return {name}
+""".lstrip(),
+}
 
 
 def get_varargs(
@@ -371,9 +398,17 @@ def get_varargs(
     return None
 
 
-def define_function_signature(name, docstring, signature):
+def define_function_signature(name, docstring, signature, *, kind="function"):
     """A decorator which sets the name, signature and docstring of the function
-    passed into it."""
+    passed into it.
+
+    ``kind`` selects the kind of wrapper to emit - one of ``"function"`` (the
+    default), ``"coroutine"``, ``"generator"``, or ``"async_generator"`` - so
+    that the wrapper is recognised by the matching :mod:`inspect` predicate.
+    For the generator kinds the wrapped function is expected to return an
+    iterable of values to yield; for the other kinds it returns the result
+    directly.
+    """
     if name == "<lambda>":
         name = "_lambda_"
     check_valid_identifier(name)
@@ -425,11 +460,15 @@ def define_function_signature(name, docstring, signature):
             if funcname not in used_names:
                 break
 
-        source = COPY_SIGNATURE_SCRIPT.format(
+        # The async-generator template needs a loop variable; it only has to
+        # differ from funcname (a free variable referenced in the loop header),
+        # since shadowing a parameter after the header is evaluated is harmless.
+        source = COPY_SIGNATURE_SCRIPTS[kind].format(
             name=name,
             funcname=funcname,
             signature=str(newsig),
             invocation=", ".join(invocation_parts),
+            loopvar=funcname + "_",
         )
         result = source_exec_as_module(source).accept(f)
         result.__doc__ = docstring
@@ -486,11 +525,12 @@ def impersonate(target):
     return accept
 
 
-def proxies(target: T) -> Callable[[Callable], T]:
+def proxies(target: T, *, kind: str = "function") -> Callable[[Callable], T]:
     replace_sig = define_function_signature(
         target.__name__.replace("<lambda>", "_lambda_"),  # type: ignore
         target.__doc__,
         get_signature(target, follow_wrapped=False),
+        kind=kind,
     )
 
     def accept(proxy):

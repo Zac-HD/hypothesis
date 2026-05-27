@@ -119,7 +119,7 @@ from hypothesis.strategies._internal.collections import (
     tuples,
 )
 from hypothesis.strategies._internal.deferred import DeferredStrategy
-from hypothesis.strategies._internal.functions import FunctionStrategy
+from hypothesis.strategies._internal.functions import FunctionStrategy, function_kind
 from hypothesis.strategies._internal.lazy import LazyStrategy, unwrap_strategies
 from hypothesis.strategies._internal.misc import BooleansStrategy, just, none, nothing
 from hypothesis.strategies._internal.numbers import (
@@ -2604,11 +2604,26 @@ def _functions(*, like, returns, pure):
             "The first argument to functions() must be a callable to imitate, "
             f"but got non-callable like={nicerepr(like)!r}"
         )
+    # Generated functions mimic the async/generator nature of ``like``.  For the
+    # generator kinds ``returns`` describes a single *yielded* value, so we draw
+    # a list of them per call; for the other kinds it is the value returned (or
+    # awaited to).  See FunctionStrategy.do_draw for where the list is yielded.
+    is_generator = function_kind(like) in ("generator", "async_generator")
     if returns in (None, ...):
         # Passing `None` has never been *documented* as working, but it still
         # did from May 2020 to Jan 2022 so we'll avoid breaking it without cause.
         hints = get_type_hints(like)
-        returns = from_type(hints.get("return", type(None)))
+        ret = hints.get("return", type(None))
+        if is_generator:
+            # e.g. Iterator[int], Generator[int, None, None], AsyncIterator[int]
+            args = get_args(ret)
+            returns = lists(from_type(args[0]) if args else none())
+        else:
+            returns = from_type(ret)
+    else:
+        check_strategy(returns, "returns")
+        if is_generator:
+            returns = lists(returns)
     check_strategy(returns, "returns")
     return FunctionStrategy(like, returns, pure)
 
@@ -2660,6 +2675,13 @@ if typing.TYPE_CHECKING or ParamSpec is not None:
         strategy.  If ``returns`` is not passed, we attempt to infer a strategy
         from the return-type annotation if present, falling back to :func:`~none`.
 
+        If ``like`` is a coroutine, generator, or async generator function (as
+        classified by :mod:`inspect`), the generated function will share that
+        nature - so e.g. ``await``-ing or iterating over the result works as you
+        would expect.  For the generator kinds, ``returns`` describes a single
+        *yielded* value (inferred from the element of an annotated yield type
+        such as ``Iterator[int]``), and each call yields a list of such values.
+
         If ``pure=True``, all arguments passed to the generated function must be
         hashable, and if passed identical arguments the original return value will
         be returned again - *not* regenerated, so beware mutable values.
@@ -2690,6 +2712,13 @@ else:  # pragma: no cover
         for the function is drawn from the ``returns`` argument, which must be a
         strategy.  If ``returns`` is not passed, we attempt to infer a strategy
         from the return-type annotation if present, falling back to :func:`~none`.
+
+        If ``like`` is a coroutine, generator, or async generator function (as
+        classified by :mod:`inspect`), the generated function will share that
+        nature - so e.g. ``await``-ing or iterating over the result works as you
+        would expect.  For the generator kinds, ``returns`` describes a single
+        *yielded* value (inferred from the element of an annotated yield type
+        such as ``Iterator[int]``), and each call yields a list of such values.
 
         If ``pure=True``, all arguments passed to the generated function must be
         hashable, and if passed identical arguments the original return value will

@@ -8,6 +8,7 @@
 # v. 2.0. If a copy of the MPL was not distributed with this file, You can
 # obtain one at https://mozilla.org/MPL/2.0/.
 
+import inspect
 from weakref import WeakKeyDictionary
 
 from hypothesis.control import note, should_note
@@ -21,12 +22,29 @@ from hypothesis.internal.reflection import (
 from hypothesis.strategies._internal.strategies import RecurT, SearchStrategy
 
 
+def function_kind(like):
+    """Classify ``like`` so generated functions share its async/generator nature.
+
+    The returned string is one of ``"coroutine"``, ``"async_generator"``,
+    ``"generator"``, or ``"function"``, matching the keys used by
+    :func:`~hypothesis.internal.reflection.define_function_signature`.
+    """
+    if inspect.iscoroutinefunction(like):
+        return "coroutine"
+    if inspect.isasyncgenfunction(like):
+        return "async_generator"
+    if inspect.isgeneratorfunction(like):
+        return "generator"
+    return "function"
+
+
 class FunctionStrategy(SearchStrategy):
     def __init__(self, like, returns, pure):
         super().__init__()
         self.like = like
         self.returns = returns
         self.pure = pure
+        self.kind = function_kind(like)
         # Using wekrefs-to-generated-functions means that the cache can be
         # garbage-collected at the end of each example, reducing memory use.
         self._cache = WeakKeyDictionary()
@@ -35,7 +53,6 @@ class FunctionStrategy(SearchStrategy):
         return recur(self.returns)
 
     def do_draw(self, data):
-        @proxies(self.like)
         def inner(*args, **kwargs):
             if data.frozen:
                 raise InvalidState(
@@ -45,7 +62,7 @@ class FunctionStrategy(SearchStrategy):
             if self.pure:
                 args, kwargs = convert_positional_arguments(self.like, args, kwargs)
                 key = (args, frozenset(kwargs.items()))
-                cache = self._cache.setdefault(inner, {})
+                cache = self._cache.setdefault(wrapped, {})
                 if key not in cache:
                     cache[key] = data.draw(self.returns)
                     if should_note():  # optimization to avoid needless repr_call
@@ -59,4 +76,8 @@ class FunctionStrategy(SearchStrategy):
                     note(f"Called function: {rep} -> {val!r}")
                 return val
 
-        return inner
+        # For generator kinds ``self.returns`` draws the *list* of values to
+        # yield, and the wrapper emitted by ``proxies`` yields each element;
+        # otherwise the wrapper returns (or awaits to) the drawn value.
+        wrapped = proxies(self.like, kind=self.kind)(inner)
+        return wrapped
