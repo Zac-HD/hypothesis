@@ -1790,58 +1790,39 @@ class HypothesisHandle:
 
 
 class _GivenWrapper:
-    """The object returned by ``@given``.
-
-    At module scope this behaves like the wrapped test function, delegating
-    attribute access and calls. As a class attribute it is a (non-data)
-    descriptor: ``Cls.method`` yields the underlying function unchanged, while
-    ``instance.method`` yields a bound view which threads ``instance`` through
-    to ``fuzz_one_input`` so that fuzzing works on instance methods.
+    """Returned by ``@given``. A class-access descriptor: ``Cls.f`` yields the
+    wrapped function unchanged, while ``inst.f`` yields a bound view which
+    threads ``inst`` through to ``fuzz_one_input`` as ``self`` (:issue:`4060`).
     """
 
-    def __init__(self, wrapped_test: Any) -> None:
-        object.__setattr__(self, "_wrapped_test", wrapped_test)
+    def __init__(self, wrapped_test, instance=not_set):
+        object.__setattr__(self, "__wrapped__", wrapped_test)
+        object.__setattr__(self, "__self__", instance)
 
-    @property
-    def __wrapped__(self) -> Any:
-        return self._wrapped_test
+    def __call__(self, *args, **kwargs):
+        if self.__self__ is not_set:
+            return self.__wrapped__(*args, **kwargs)
+        return self.__wrapped__(self.__self__, *args, **kwargs)
 
-    def __call__(self, *args: object, **kwargs: object) -> Any:
-        return self._wrapped_test(*args, **kwargs)
-
-    def __get__(self, instance: object, owner: "type | None" = None) -> Any:
+    def __get__(self, instance, owner=None):
         if instance is None:
-            return self._wrapped_test
-        return _BoundGivenWrapper(self._wrapped_test, instance)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._wrapped_test, name)
-
-    def __setattr__(self, name: str, value: object) -> None:
-        setattr(self._wrapped_test, name, value)
-
-
-class _BoundGivenWrapper:
-    """A ``@given`` test bound to an instance; see ``_GivenWrapper``."""
-
-    def __init__(self, wrapped_test: Any, instance: object) -> None:
-        self.__func__ = wrapped_test
-        self.__self__ = instance
-
-    def __call__(self, *args: object, **kwargs: object) -> Any:
-        return self.__func__(self.__self__, *args, **kwargs)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.__func__, name)
+            return self.__wrapped__
+        return _GivenWrapper(self.__wrapped__, instance)
 
     @property
-    def hypothesis(self) -> HypothesisHandle:
-        handle = self.__func__.hypothesis
+    def hypothesis(self):
+        h = self.__wrapped__.hypothesis
+        if self.__self__ is not_set:
+            return h
         return HypothesisHandle(
-            handle.inner_test,
-            partial(handle._get_fuzz_target, self.__self__),
-            handle._given_kwargs,
+            h.inner_test, partial(h._get_fuzz_target, self.__self__), h._given_kwargs
         )
+
+    def __getattr__(self, name):
+        return getattr(self.__wrapped__, name)
+
+    def __setattr__(self, name, value):
+        setattr(self.__wrapped__, name, value)
 
 
 @overload
