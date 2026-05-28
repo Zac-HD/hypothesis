@@ -1789,42 +1789,6 @@ class HypothesisHandle:
             return self.__cached_target
 
 
-class _GivenWrapper:
-    """Returned by ``@given``. A class-access descriptor: ``Cls.f`` yields the
-    wrapped function unchanged, while ``inst.f`` yields a bound view which
-    threads ``inst`` through to ``fuzz_one_input`` as ``self`` (:issue:`4060`).
-    """
-
-    def __init__(self, wrapped_test, instance=not_set):
-        object.__setattr__(self, "__wrapped__", wrapped_test)
-        object.__setattr__(self, "__self__", instance)
-
-    def __call__(self, *args, **kwargs):
-        if self.__self__ is not_set:
-            return self.__wrapped__(*args, **kwargs)
-        return self.__wrapped__(self.__self__, *args, **kwargs)
-
-    def __get__(self, instance, owner=None):
-        if instance is None:
-            return self.__wrapped__
-        return _GivenWrapper(self.__wrapped__, instance)
-
-    @property
-    def hypothesis(self):
-        h = self.__wrapped__.hypothesis
-        if self.__self__ is not_set:
-            return h
-        return HypothesisHandle(
-            h.inner_test, partial(h._get_fuzz_target, self.__self__), h._given_kwargs
-        )
-
-    def __getattr__(self, name):
-        return getattr(self.__wrapped__, name)
-
-    def __setattr__(self, name, value):
-        setattr(self.__wrapped__, name, value)
-
-
 @overload
 def given(
     _: EllipsisType, /
@@ -2083,6 +2047,10 @@ def given(
                     given_kwargs,
                     new_signature.parameters,
                 )
+                # Stash `self` so that `fuzz_one_input` on a bound method can
+                # find it later (issue #4060).
+                if stuff.selfy is not None:
+                    wrapped_test._hypothesis_internal_selfy = stuff.selfy
 
                 if (
                     inspect.iscoroutinefunction(test)
@@ -2305,9 +2273,9 @@ def given(
                 with thread_overlap_lock:
                     del thread_overlap[threadid]
 
-        def _get_fuzz_target(
-            selfy: Any = not_set,
-        ) -> Callable[[bytes | bytearray | memoryview | BinaryIO], bytes | None]:
+        def _get_fuzz_target() -> (
+            Callable[[bytes | bytearray | memoryview | BinaryIO], bytes | None]
+        ):
             # Because fuzzing interfaces are very performance-sensitive, we use a
             # somewhat more complicated structure here.  `_get_fuzz_target()` is
             # called by the `HypothesisHandle.fuzz_one_input` property, allowing
@@ -2318,14 +2286,15 @@ def given(
             # many invocations of the target.  We explicitly force `deadline=None`
             # for performance reasons, saving ~40% the runtime of an empty test.
             #
-            # `selfy` is the bound instance when fuzzing a method, e.g. via
-            # `instance.test_method.hypothesis.fuzz_one_input`; it is passed
-            # through as the test's first positional argument.
+            # For instance methods, `self` is captured from the most recent
+            # normal call to ``wrapped_test`` (see issue #4060), so the user
+            # must call ``instance.method()`` at least once before fuzzing.
             test = wrapped_test.hypothesis.inner_test
             settings = Settings(
                 parent=wrapped_test._hypothesis_internal_use_settings, deadline=None
             )
             random = get_random_for_wrapped_test(test, wrapped_test)
+            selfy = getattr(wrapped_test, "_hypothesis_internal_selfy", not_set)
             fuzz_args = () if selfy is not_set else (selfy,)
             _args, _kwargs, stuff = process_arguments_to_given(
                 wrapped_test, fuzz_args, {}, given_kwargs, new_signature.parameters
@@ -2427,7 +2396,7 @@ def given(
             test, "_hypothesis_internal_use_reproduce_failure", None
         )
         wrapped_test.hypothesis = HypothesisHandle(test, _get_fuzz_target, given_kwargs)
-        return _GivenWrapper(wrapped_test)
+        return wrapped_test
 
     return run_test_as_given
 
