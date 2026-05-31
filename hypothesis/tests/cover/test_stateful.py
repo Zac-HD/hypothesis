@@ -30,6 +30,7 @@ from hypothesis.core import encode_failure
 from hypothesis.database import InMemoryExampleDatabase
 from hypothesis.errors import (
     DidNotReproduce,
+    FailedHealthCheck,
     Flaky,
     FlakyStrategyDefinition,
     InvalidArgument,
@@ -1470,6 +1471,204 @@ def test_flatmap():
 
     Machine.TestCase.settings = Settings(stateful_step_count=5, max_examples=10)
     run_state_machine_as_test(Machine)
+
+
+def test_filter():
+    class Machine(RuleBasedStateMachine):
+        val = Bundle("val")
+
+        @initialize(target=val)
+        def init(self):
+            return multiple(1, 2, 3)
+
+        # named so they're drawn (and printed) in the order a < b < c
+        @rule(
+            a=val,
+            b=val.filter(lambda x: x < 2),
+            c=val.filter(lambda x: x > 2),
+        )
+        def fail_fast(self, a, b, c):
+            assert b < 2
+            assert c > 2
+            raise AssertionError
+
+    Machine.TestCase.settings = NO_BLOB_SETTINGS
+    with pytest.raises(AssertionError) as err:
+        run_state_machine_as_test(Machine)
+
+    result = "\n".join(err.value.__notes__)
+    assert result == """
+Falsifying example:
+state = Machine()
+val_0, val_1, val_2 = state.init()
+state.fail_fast(a=val_2, b=val_0, c=val_2)
+state.teardown()
+""".strip()
+
+
+def test_consumes_filter():
+    class Machine(RuleBasedStateMachine):
+        values = Bundle("values")
+
+        @initialize(target=values)
+        def init(self):
+            return multiple(1, 2, 3)
+
+        @rule(
+            a=consumes(values).filter(lambda x: x < 2),
+            b=consumes(values).filter(lambda x: x > 2),
+            c=consumes(values),
+        )
+        def fail_fast(self, a, b, c):
+            assert a < 2
+            assert b > 2
+            raise AssertionError
+
+    Machine.TestCase.settings = NO_BLOB_SETTINGS
+    with pytest.raises(AssertionError) as err:
+        run_state_machine_as_test(Machine)
+
+    result = "\n".join(err.value.__notes__)
+    assert result == """
+Falsifying example:
+state = Machine()
+values_0, values_1, values_2 = state.init()
+state.fail_fast(a=values_0, b=values_2, c=values_1)
+state.teardown()
+""".strip()
+
+
+def test_consumes_bundle_filter():
+    # consumes(bundle.filter(...)) is equivalent to consumes(bundle).filter(...)
+    class Machine(RuleBasedStateMachine):
+        values = Bundle("values")
+
+        @initialize(target=values)
+        def init(self):
+            return multiple(1, 2, 3)
+
+        @rule(large=consumes(values.filter(lambda x: x > 2)))
+        def fail_fast(self, large):
+            assert large > 2
+            raise AssertionError
+
+    Machine.TestCase.settings = NO_BLOB_SETTINGS
+    with pytest.raises(AssertionError):
+        run_state_machine_as_test(Machine)
+
+
+def test_consumes_map_with_filter():
+    class Machine(RuleBasedStateMachine):
+        values = Bundle("values")
+
+        @initialize(target=values)
+        def init(self):
+            return multiple(2, 4)
+
+        # ``a`` is non-consuming and drawn first, so the consuming draws ``b``
+        # and ``c`` can still find values that satisfy their filters.
+        @rule(
+            a=values.map(lambda x: x**2).filter(lambda x: x < 3**2),
+            b=consumes(values).map(lambda x: x**2).filter(lambda x: x > 3**2),
+            c=consumes(values),
+        )
+        def fail_fast(self, a, b, c):
+            assert a < 9
+            assert b > 9
+            raise AssertionError
+
+    Machine.TestCase.settings = NO_BLOB_SETTINGS
+    with pytest.raises(AssertionError) as err:
+        run_state_machine_as_test(Machine)
+
+    result = "\n".join(err.value.__notes__)
+    assert result == """
+Falsifying example:
+state = Machine()
+values_0, values_1 = state.init()
+state.fail_fast(a=values_0, b=values_1, c=values_0)
+state.teardown()
+""".strip()
+
+
+def test_map_and_filter_combinations():
+    class Machine(RuleBasedStateMachine):
+        values = Bundle("values")
+
+        @initialize(target=values)
+        def create_values(self):
+            return multiple(1, 2)
+
+        @rule(n=values.map(lambda x: -x))
+        def use_map(self, n):
+            assert isinstance(n, int)
+            assert n < 0
+
+        @rule(n=values.map(lambda x: -x).filter(lambda x: x < -1))
+        def use_map_filter(self, n):
+            assert n < -1
+
+        @rule(n=values.filter(lambda x: x > 1).map(lambda x: -x))
+        def use_filter_map(self, n):
+            assert n < -1
+
+        @rule(n=values.flatmap(lambda x: just(x + 1)).map(lambda x: -x))
+        def use_flatmap_map(self, n):
+            assert n < 0
+
+        @rule(n=values)
+        def use_directly(self, n):
+            assert n > 0
+
+    run_state_machine_as_test(Machine)
+
+
+def test_filter_not_satisfied_healthcheck():
+    class Machine(RuleBasedStateMachine):
+        values = Bundle("values")
+
+        @initialize(target=values)
+        def create_values(self):
+            return 0
+
+        @rule(n=values.filter(lambda x: False))
+        def use_filter(self, n):
+            raise AssertionError("filtered-out value should never be drawn")
+
+    Machine.TestCase.settings = Settings(stateful_step_count=2, max_examples=2)
+    with pytest.raises(FailedHealthCheck, match="filter_too_much"):
+        run_state_machine_as_test(Machine)
+
+
+def test_mapped_values_assigned_properly():
+    class Machine(RuleBasedStateMachine):
+        values = Bundle("values")
+
+        @initialize(target=values)
+        def init(self):
+            return multiple("ret1", "ret2")
+
+        @rule(
+            v1=values,
+            v2=values.map(lambda x: x + x),
+            v3=consumes(values).map(lambda x: x + x),
+            v4=values,
+        )
+        def fail_fast(self, v1, v2, v3, v4):
+            raise AssertionError
+
+    Machine.TestCase.settings = NO_BLOB_SETTINGS
+    with pytest.raises(AssertionError) as err:
+        run_state_machine_as_test(Machine)
+
+    result = "\n".join(err.value.__notes__)
+    assert result == """
+Falsifying example:
+state = Machine()
+values_0, values_1 = state.init()
+state.fail_fast(v1=values_1, v2=values_1, v3=values_1, v4=values_0)
+state.teardown()
+""".strip()
 
 
 def test_use_bundle_within_other_strategies():
