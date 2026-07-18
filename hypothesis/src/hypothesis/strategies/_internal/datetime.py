@@ -219,17 +219,39 @@ def _shift_datetime(value, steps):
     return value + steps * _MICROSECOND
 
 
-def _bound_in_tz(bound, tz, *, upper):
+# Sentinel for a bound which no wall-clock time in the drawn timezone satisfies.
+_UNSATISFIABLE = object()
+
+
+def _bound_in_tz(bound, tz, *, upper, exclusive):
     """Convert an aware bound to a naive max_value (if upper, else min_value) for
     draws which will be interpreted in tz, i.e. into that timezone's wall clock.
 
-    This is exact for fixed-offset timezones.  Otherwise DST, historical
-    transitions, and the independently-drawn fold mean the offset at the drawn
-    value may differ from the offset at the bound, so we widen the window by
-    _MAX_OFFSET_SPAN and check the bounds exactly after drawing.  Returns None
-    if tz can't convert at all (e.g. utcoffset() is None); comparing the drawn
-    values to the bound will then raise an error at the exact-check stage.
+    For fixed-offset timezones this is exact, and a bound with no wall-clock
+    reading in tz is vacuous or _UNSATISFIABLE, depending on which end of the
+    representable range it falls off.  For variable-offset timezones, DST,
+    historical transitions, and the independently-drawn fold mean the offset
+    at the drawn value may differ from the offset at the bound, so we widen
+    the window by _MAX_OFFSET_SPAN and check the bounds exactly after drawing.
+    Returns None if tz can't convert at all (e.g. utcoffset() is None);
+    comparing the drawn values to the bound then raises at the exact check.
     """
+    if type(tz) is dt.timezone:
+        # Change to tz's offset while preserving the instant, by hand: because
+        # astimezone() works via naive UTC, it can overflow even when the
+        # wall-clock reading in tz is representable.
+        shift = tz.utcoffset(None) - bound.utcoffset()
+        if exclusive:
+            shift += -_MICROSECOND if upper else _MICROSECOND
+        try:
+            return bound.replace(tzinfo=None) + shift
+        except OverflowError:
+            # The bound falls off the end of the range in the direction of
+            # shift.  A max_value above the range (or a min_value below it)
+            # is vacuous; the reverse is unsatisfiable in this timezone.
+            if (shift > dt.timedelta()) == upper:
+                return dt.datetime.max if upper else dt.datetime.min
+            return _UNSATISFIABLE
     try:
         local = bound.astimezone(tz).replace(tzinfo=None)
     except OverflowError:
@@ -238,8 +260,8 @@ def _bound_in_tz(bound, tz, *, upper):
         local = dt.datetime.min if bound.year < 5000 else dt.datetime.max
     except Exception:
         return None
-    if type(tz) is dt.timezone:  # a fixed offset, so the conversion was exact
-        return local
+    # The 1us adjustment for an exclusive bound is lost in this widening; the
+    # exact check below handles it.
     try:
         return local + _MAX_OFFSET_SPAN if upper else local - _MAX_OFFSET_SPAN
     except OverflowError:
@@ -256,6 +278,8 @@ class DatetimeStrategy(SearchStrategy):
         *,
         min_instant=None,
         max_instant=None,
+        exclude_min_instant=False,
+        exclude_max_instant=False,
     ):
         super().__init__()
         assert isinstance(min_value, dt.datetime)
@@ -267,6 +291,8 @@ class DatetimeStrategy(SearchStrategy):
         assert isinstance(allow_imaginary, bool)
         assert min_instant is None or min_instant.utcoffset() is not None
         assert max_instant is None or max_instant.utcoffset() is not None
+        assert min_instant is not None or not exclude_min_instant
+        assert max_instant is not None or not exclude_max_instant
         self.min_value = min_value
         self.max_value = max_value
         self.tz_strat = timezones_strat
@@ -275,9 +301,13 @@ class DatetimeStrategy(SearchStrategy):
         # which constrain the *instant* of generated values - while the naive
         # min_value and max_value constrain the wall-clock reading.  We narrow
         # the naive part of the draw once the timezone is known, and then check
-        # the aware bounds exactly.
+        # the aware bounds exactly.  Strict comparisons are recorded as
+        # exclusive bounds, since the adjacent instant might not be
+        # representable in the same timezone as the bound.
         self.min_instant = min_instant
         self.max_instant = max_instant
+        self.exclude_min_instant = exclude_min_instant
+        self.exclude_max_instant = exclude_max_instant
 
     def do_draw(self, data):
         # We start by drawing a timezone, and an initial datetime.
@@ -292,17 +322,26 @@ class DatetimeStrategy(SearchStrategy):
                 )
             # Work in the wall clock of the drawn timezone: convert each aware
             # bound into it, and narrow the naive part of the draw to match.
-            if (
-                self.min_instant is not None
-                and (lo := _bound_in_tz(self.min_instant, tz, upper=False)) is not None
-            ):
-                min_value = max(min_value, lo)
-            if (
-                self.max_instant is not None
-                and (hi := _bound_in_tz(self.max_instant, tz, upper=True)) is not None
-            ):
-                max_value = min(max_value, hi)
-            if max_value < min_value:
+            lo = hi = None
+            if self.min_instant is not None:
+                lo = _bound_in_tz(
+                    self.min_instant,
+                    tz,
+                    upper=False,
+                    exclusive=self.exclude_min_instant,
+                )
+                if lo is not None and lo is not _UNSATISFIABLE:
+                    min_value = max(min_value, lo)
+            if self.max_instant is not None:
+                hi = _bound_in_tz(
+                    self.max_instant,
+                    tz,
+                    upper=True,
+                    exclusive=self.exclude_max_instant,
+                )
+                if hi is not None and hi is not _UNSATISFIABLE:
+                    max_value = min(max_value, hi)
+            if _UNSATISFIABLE in (lo, hi) or max_value < min_value:
                 data.mark_invalid(
                     f"No datetimes with timezone {tz!r} are within the aware "
                     f"bounds min={self.min_instant!r} and max={self.max_instant!r}"
@@ -312,8 +351,18 @@ class DatetimeStrategy(SearchStrategy):
         # The narrowing above is only approximate for variable-offset timezones,
         # so check the aware bounds exactly.  Mixed-type comparisons here raise
         # TypeError, just as comparing the values to the bounds elsewhere would.
-        if (self.min_instant is not None and result < self.min_instant) or (
-            self.max_instant is not None and result > self.max_instant
+        if (
+            self.min_instant is not None
+            and (
+                result < self.min_instant
+                or (self.exclude_min_instant and result == self.min_instant)
+            )
+        ) or (
+            self.max_instant is not None
+            and (
+                result > self.max_instant
+                or (self.exclude_max_instant and result == self.max_instant)
+            )
         ):
             data.mark_invalid(f"{result} is outside the aware bounds")
 
@@ -363,59 +412,58 @@ class DatetimeStrategy(SearchStrategy):
                 # Aware datetimes compare as instants, which is exactly what our
                 # aware min_instant/max_instant bounds constrain - so we rewrite
                 # the filter into a strategy with narrowed bounds.
-                if func in (op.lt, op.gt):
-                    # Adjust strict bounds by one microsecond, in UTC where wall
-                    # arithmetic is instant arithmetic.
-                    step = _MICROSECOND if func is op.lt else -_MICROSECOND
-                    try:
-                        arg = arg.astimezone(dt.timezone.utc) + step
-                    except OverflowError:
-                        # Instants within a day of the ends of the representable
-                        # range may have no UTC representation, but the most
-                        # extreme legal offset can represent the instant of
-                        # every constructible aware datetime.  We can't use
-                        # astimezone() here - it works via naive UTC - so we
-                        # change the offset while preserving the instant by hand.
-                        offset = dt.timedelta(hours=24) - _MICROSECOND
-                        if arg.year > 5000:
-                            offset = -offset
-                        shift = offset - arg.utcoffset() + step
-                        try:
-                            arg = (arg.replace(tzinfo=None) + shift).replace(
-                                tzinfo=dt.timezone(offset)
-                            )
-                        except OverflowError:
-                            # The adjusted bound is beyond every possible aware
-                            # datetime, and so cannot be satisfied at all.
-                            return nothing()
+                exclusive = func in (op.lt, op.gt)
                 min_instant, max_instant = self.min_instant, self.max_instant
-                if func in (op.lt, op.le, op.eq):
-                    min_instant = arg if min_instant is None else max(min_instant, arg)
-                if func in (op.eq, op.ge, op.gt):
-                    max_instant = arg if max_instant is None else min(max_instant, arg)
+                exclude_min = self.exclude_min_instant
+                exclude_max = self.exclude_max_instant
+                if func in (op.lt, op.le, op.eq) and (
+                    min_instant is None
+                    or arg > min_instant
+                    or (arg == min_instant and exclusive and not exclude_min)
+                ):
+                    min_instant, exclude_min = arg, exclusive
+                if func in (op.eq, op.ge, op.gt) and (
+                    max_instant is None
+                    or arg < max_instant
+                    or (arg == max_instant and exclusive and not exclude_max)
+                ):
+                    max_instant, exclude_max = arg, exclusive
                 if tz_kind == "aware":
                     # Aware values are instants strictly within 24h of the naive
                     # wall-clock bounds, so contradictions are visibly empty.
-                    day = dt.timedelta(hours=24)
+                    # All arithmetic here is between timedeltas, which have a
+                    # much wider range than datetimes and so cannot overflow.
                     if (
-                        (
-                            min_instant is not None
-                            and max_instant is not None
-                            and max_instant < min_instant
-                        )
-                        or (
-                            min_instant is not None
-                            and min_instant.replace(tzinfo=None) - self.max_value
-                            > day + min_instant.utcoffset()
-                        )
-                        or (
-                            max_instant is not None
-                            and self.min_value - max_instant.replace(tzinfo=None)
-                            > day - max_instant.utcoffset()
+                        min_instant is not None
+                        and max_instant is not None
+                        and (
+                            max_instant < min_instant
+                            or (
+                                min_instant == max_instant
+                                and (exclude_min or exclude_max)
+                            )
                         )
                     ):
                         return nothing()
-                if (min_instant, max_instant) == (self.min_instant, self.max_instant):
+                    day = dt.timedelta(hours=24)
+                    if min_instant is not None:
+                        cutoff = day + min_instant.utcoffset()
+                        if exclude_min:
+                            cutoff -= _MICROSECOND
+                        if min_instant.replace(tzinfo=None) - self.max_value >= cutoff:
+                            return nothing()
+                    if max_instant is not None:
+                        cutoff = day - max_instant.utcoffset()
+                        if exclude_max:
+                            cutoff -= _MICROSECOND
+                        if self.min_value - max_instant.replace(tzinfo=None) >= cutoff:
+                            return nothing()
+                if (min_instant, exclude_min, max_instant, exclude_max) == (
+                    self.min_instant,
+                    self.exclude_min_instant,
+                    self.max_instant,
+                    self.exclude_max_instant,
+                ):
                     return self
                 return DatetimeStrategy(
                     self.min_value,
@@ -424,6 +472,8 @@ class DatetimeStrategy(SearchStrategy):
                     self.allow_imaginary,
                     min_instant=min_instant,
                     max_instant=max_instant,
+                    exclude_min_instant=exclude_min,
+                    exclude_max_instant=exclude_max,
                 )
         return super().filter(condition)
 

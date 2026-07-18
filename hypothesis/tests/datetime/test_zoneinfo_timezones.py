@@ -65,12 +65,28 @@ def test_aware_bounds_spanning_a_dst_transition(value):
     st.datetimes(
         max_value=dt.datetime.max.replace(tzinfo=dt.timezone.utc)
         - dt.timedelta(hours=12),
-        timezones=st.timezones(),
+        # In Etc/GMT-14, i.e. UTC+14, the bound has no wall-clock reading at all
+        timezones=st.timezones() | st.just(zoneinfo.ZoneInfo("Etc/GMT-14")),
     )
 )
 def test_aware_bounds_near_the_end_of_the_representable_range(value):
     max_value = dt.datetime.max.replace(tzinfo=dt.timezone.utc) - dt.timedelta(hours=12)
     assert value <= max_value
+
+
+@settings(max_examples=10)
+@given(
+    st.datetimes(
+        max_value=dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+        - dt.timedelta(hours=12),
+        timezones=st.just(zoneinfo.ZoneInfo("Etc/GMT-14")),
+    )
+)
+def test_aware_bound_unrepresentable_in_a_zoneinfo_timezone(value):
+    assert value.utcoffset() == dt.timedelta(hours=14)
+    assert value <= dt.datetime.max.replace(tzinfo=dt.timezone.utc) - dt.timedelta(
+        hours=12
+    )
 
 
 @given(st.data(), st.datetimes(), st.datetimes())

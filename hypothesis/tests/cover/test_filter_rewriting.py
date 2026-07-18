@@ -778,8 +778,20 @@ def test_aware_datetimes_filter_rewriting_narrows_draws():
     # which narrow the naive draws once the timezone is known.
     assert isinstance(out, DatetimeStrategy)
     assert (out.min_instant, out.max_instant) == (UTC_2000, None)
-    # and a filter which does not tighten those bounds is a no-op
+    # a filter which does not tighten those bounds is a no-op,
     assert out.filter(partial(operator.le, UTC_2000 - dt.timedelta(days=1))) is out
+    # while tighter or strict-at-the-same-instant filters narrow them
+    tighter = out.filter(partial(operator.le, UTC_2000 + dt.timedelta(days=1)))
+    assert tighter.min_instant == UTC_2000 + dt.timedelta(days=1)
+    strict = out.filter(partial(operator.lt, UTC_2000))
+    assert (strict.min_instant, strict.exclude_min_instant) == (UTC_2000, True)
+    upper = s.filter(partial(operator.ge, UTC_2000)).filter(
+        partial(operator.ge, UTC_2000 - dt.timedelta(days=1))
+    )
+    assert (upper.max_instant, upper.exclude_max_instant) == (
+        UTC_2000 - dt.timedelta(days=1),
+        False,
+    )
 
     # Contradictory filters, and filters contradicting the naive bounds, are empty
     lt, gt = partial(operator.lt, UTC_2000), partial(operator.gt, UTC_2000)
@@ -793,20 +805,12 @@ def test_aware_datetimes_filter_rewriting_narrows_draws():
     )
     assert late.filter(partial(operator.ge, UTC_2000)).is_empty
 
-    # Strict bounds on instants with no UTC representation (within a day of
-    # the ends of the range) are rewritten via a more extreme offset instead
-    extreme = dt.datetime.max.replace(tzinfo=dt.timezone(dt.timedelta(hours=-14)))
-    out = s.filter(partial(operator.gt, extreme))
-    assert isinstance(out, DatetimeStrategy)
-    assert out.max_instant == extreme - dt.timedelta(microseconds=1)
-    low = dt.datetime.min.replace(tzinfo=dt.timezone(dt.timedelta(hours=14)))
-    out = s.filter(partial(operator.gt, low))
-    assert isinstance(out, DatetimeStrategy)
-    assert out.max_instant < low
+    # Strict bounds are recorded exactly, even at instants whose neighbours
+    # are unrepresentable in the bound's own (or any other) timezone
     max_utc = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
     out = s.filter(partial(operator.lt, max_utc))
     assert isinstance(out, DatetimeStrategy)
-    assert out.min_instant > max_utc
+    assert (out.min_instant, out.exclude_min_instant) == (max_utc, True)
 
     # while strict bounds beyond every constructible instant are just empty
     limit = dt.timedelta(hours=24) - dt.timedelta(microseconds=1)
@@ -821,14 +825,16 @@ def test_aware_datetimes_filter_rewriting_narrows_draws():
     st.datetimes(timezones=st.just(dt.timezone(dt.timedelta(hours=-5))))
     .filter(partial(operator.le, UTC_2000))
     .filter(partial(operator.le, UTC_2000 - dt.timedelta(days=1)))
+    .filter(partial(operator.lt, UTC_2000))
     .filter(partial(operator.ge, UTC_2000 + dt.timedelta(hours=1)))
     .filter(partial(operator.ge, UTC_2000 + dt.timedelta(days=1)))
+    .filter(partial(operator.gt, UTC_2000 + dt.timedelta(hours=1)))
 )
 def test_aware_datetimes_filter_rewriting_is_exact_for_fixed_offsets(value):
     # A one-hour window in twenty millennia would fail the filter_too_much
-    # health check without rewriting.  The second filter on each side is
-    # looser than the first, and so has no further effect.
-    assert UTC_2000 <= value <= UTC_2000 + dt.timedelta(hours=1)
+    # health check without rewriting.  The looser filters have no further
+    # effect, and the strict ones exclude the endpoints.
+    assert UTC_2000 < value < UTC_2000 + dt.timedelta(hours=1)
 
 
 @settings(max_examples=A_FEW)

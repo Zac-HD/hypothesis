@@ -224,6 +224,40 @@ def test_aware_bound_near_start_of_representable_range(value):
     )
 
 
+@given(
+    datetimes(
+        min_value=dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+        - dt.timedelta(hours=12),
+        timezones=st.sampled_from(
+            [dt.timezone.utc, dt.timezone(dt.timedelta(hours=14))]
+        ),
+    )
+)
+def test_aware_min_bound_may_be_unsatisfiable_in_some_timezones(value):
+    # No wall-clock time in UTC+14 has an instant this late, so we only ever
+    # generate UTC datetimes here.
+    assert value.tzinfo is dt.timezone.utc
+    assert value >= dt.datetime.max.replace(tzinfo=dt.timezone.utc) - dt.timedelta(
+        hours=12
+    )
+
+
+@given(
+    datetimes(
+        max_value=dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        + dt.timedelta(hours=12),
+        timezones=st.sampled_from(
+            [dt.timezone.utc, dt.timezone(dt.timedelta(hours=-14))]
+        ),
+    )
+)
+def test_aware_max_bound_may_be_unsatisfiable_in_some_timezones(value):
+    assert value.tzinfo is dt.timezone.utc
+    assert value <= dt.datetime.min.replace(tzinfo=dt.timezone.utc) + dt.timedelta(
+        hours=12
+    )
+
+
 @fails_with(InvalidArgument)
 @given(
     datetimes(min_value=UTC_2000, timezones=st.sampled_from([None, dt.timezone.utc]))
