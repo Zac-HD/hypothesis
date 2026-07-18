@@ -14,10 +14,12 @@ from calendar import monthrange
 import pytest
 
 from hypothesis import HealthCheck, example, given, settings, strategies as st
+from hypothesis.errors import InvalidArgument
 from hypothesis.strategies import dates, datetimes, timedeltas, times
 from hypothesis.strategies._internal.datetime import _num_days_in_month
 
 from tests.common.debug import assert_simple_property, find_any, minimal
+from tests.common.utils import fails_with
 
 
 @example(1900)
@@ -157,3 +159,92 @@ def test_can_generate_time_with_fold_1():
 @given(datetimes(allow_imaginary=False))
 def test_allow_imaginary_is_not_an_error_for_naive_datetimes(d):
     pass
+
+
+UTC_2000 = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+PLUS_FIVE_THIRTY = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+
+@given(datetimes(min_value=UTC_2000, max_value=UTC_2000 + dt.timedelta(days=1)))
+def test_aware_bounds_default_timezones_to_the_bounds_tzinfo(value):
+    # Aware bounds constrain the instant of generated datetimes, and default
+    # the timezones strategy to the timezone(s) of the bounds.
+    assert UTC_2000 <= value <= UTC_2000 + dt.timedelta(days=1)
+    assert value.tzinfo is dt.timezone.utc
+
+
+@given(
+    datetimes(
+        min_value=UTC_2000,
+        max_value=dt.datetime(2000, 6, 1, tzinfo=PLUS_FIVE_THIRTY),
+    )
+)
+def test_aware_bounds_infer_timezones_from_both_bounds(value):
+    assert UTC_2000 <= value <= dt.datetime(2000, 6, 1, tzinfo=PLUS_FIVE_THIRTY)
+    assert value.tzinfo in (dt.timezone.utc, PLUS_FIVE_THIRTY)
+
+
+def test_aware_bounds_can_generate_all_inferred_timezones():
+    strategy = datetimes(
+        min_value=UTC_2000, max_value=dt.datetime(2000, 6, 1, tzinfo=PLUS_FIVE_THIRTY)
+    )
+    find_any(strategy, lambda d: d.tzinfo is dt.timezone.utc)
+    find_any(strategy, lambda d: d.tzinfo is PLUS_FIVE_THIRTY)
+
+
+@given(datetimes(min_value=UTC_2000, max_value=UTC_2000))
+def test_aware_bounds_can_pin_a_single_instant(value):
+    assert value == UTC_2000
+
+
+@given(
+    datetimes(
+        max_value=dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+        - dt.timedelta(hours=12),
+        timezones=st.just(dt.timezone(dt.timedelta(hours=14))),
+    )
+)
+def test_aware_bound_near_end_of_representable_range(value):
+    # The bound has no wall-clock representation in UTC+14, which is fine.
+    assert value <= dt.datetime.max.replace(tzinfo=dt.timezone.utc) - dt.timedelta(
+        hours=12
+    )
+
+
+@given(
+    datetimes(
+        min_value=dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        + dt.timedelta(hours=12),
+        timezones=st.just(dt.timezone(dt.timedelta(hours=-14))),
+    )
+)
+def test_aware_bound_near_start_of_representable_range(value):
+    assert value >= dt.datetime.min.replace(tzinfo=dt.timezone.utc) + dt.timedelta(
+        hours=12
+    )
+
+
+@fails_with(InvalidArgument)
+@given(
+    datetimes(min_value=UTC_2000, timezones=st.sampled_from([None, dt.timezone.utc]))
+)
+def test_aware_bounds_reject_a_none_timezone_at_draw_time(value):
+    pass
+
+
+class NoOffsetTimezone(dt.tzinfo):
+    def utcoffset(self, value):
+        return None
+
+    def tzname(self, value):
+        return "?"
+
+    def dst(self, value):
+        return None
+
+
+def test_aware_bound_without_utc_offset_is_invalid():
+    with pytest.raises(InvalidArgument, match="no UTC offset"):
+        datetimes(
+            min_value=dt.datetime(2000, 1, 1, tzinfo=NoOffsetTimezone())
+        ).validate()

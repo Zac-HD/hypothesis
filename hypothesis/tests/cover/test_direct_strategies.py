@@ -14,7 +14,7 @@ import enum
 import fractions
 import math
 import warnings
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from ipaddress import IPv4Network, IPv6Network
 
 import pytest
@@ -72,6 +72,27 @@ def fn_ktest(*fnkwargs):
     (
         st.datetimes,
         {"min_value": datetime(2017, 8, 22), "max_value": datetime(2017, 8, 21)},
+    ),
+    (
+        st.datetimes,
+        {
+            "min_value": datetime(2017, 8, 22, tzinfo=timezone.utc),
+            "max_value": datetime(2017, 8, 21, tzinfo=timezone.utc),
+        },
+    ),
+    (
+        st.datetimes,
+        {
+            "min_value": datetime(2017, 8, 21),
+            "max_value": datetime(2017, 8, 22, tzinfo=timezone.utc),
+        },
+    ),
+    (
+        st.datetimes,
+        {
+            "min_value": datetime(2017, 8, 21, tzinfo=timezone.utc),
+            "timezones": st.none(),
+        },
     ),
     (st.decimals, {"min_value": math.nan}),
     (st.decimals, {"max_value": math.nan}),

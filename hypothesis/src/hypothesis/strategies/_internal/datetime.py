@@ -32,10 +32,10 @@ DATENAMES = ("year", "month", "day")
 TIMENAMES = ("hour", "minute", "second", "microsecond")
 
 _MICROSECOND = dt.timedelta(microseconds=1)
-_MAX_NAIVE_MICROS = (dt.datetime.max - dt.datetime.min) // _MICROSECOND
-# A single instant can correspond to wall-clock times up to (but not including)
-# 48 hours apart, because utcoffset() is strictly between -24 and +24 hours.
-_OFFSET_SPAN_MICROS = 2 * (dt.timedelta(hours=24) // _MICROSECOND)
+# Wall-clock readings of a single instant differ by strictly less than 48 hours,
+# because utcoffset() is strictly between -24 and +24 hours; this also bounds
+# offset changes within a single zone (DST, historical transitions, etc).
+_MAX_OFFSET_SPAN = dt.timedelta(hours=48)
 
 
 def _comparator_bound(condition):
@@ -219,37 +219,31 @@ def _shift_datetime(value, steps):
     return value + steps * _MICROSECOND
 
 
-def _instant_micros(value):
-    """The instant an aware datetime refers to, as microseconds relative to
-    dt.datetime.min in UTC.  Unlike datetimes, this can't over- or under-flow."""
-    offset = value.utcoffset()
-    return (value.replace(tzinfo=None) - dt.datetime.min - offset) // _MICROSECOND
-
-
-def _naive_bound_for_tz(instant, tz, *, upper):
-    """A naive max_value (if upper, else min_value) for draws which will be
-    interpreted in tz, wide enough to include every wall-clock time whose
-    instant is on the relevant side of ``instant`` (see _instant_micros).
+def _bound_in_tz(bound, tz, *, upper):
+    """Convert an aware bound to a naive max_value (if upper, else min_value) for
+    draws which will be interpreted in tz, i.e. into that timezone's wall clock.
 
     This is exact for fixed-offset timezones.  Otherwise DST, historical
-    transitions, and the independently-drawn fold mean that converting an
-    instant to a wall-clock time is only approximate, so we widen the bound
-    by _OFFSET_SPAN_MICROS and rely on the retained predicate for exactness.
-    Returns None if we can't get a utcoffset for this tzinfo at all.
+    transitions, and the independently-drawn fold mean the offset at the drawn
+    value may differ from the offset at the bound, so we widen the window by
+    _MAX_OFFSET_SPAN and check the bounds exactly after drawing.  Returns None
+    if tz can't convert at all (e.g. utcoffset() is None); comparing the drawn
+    values to the bound will then raise an error at the exact-check stage.
     """
-    probe = dt.datetime.min + min(max(instant, 0), _MAX_NAIVE_MICROS) * _MICROSECOND
     try:
-        offset = tz.utcoffset(probe)
+        local = bound.astimezone(tz).replace(tzinfo=None)
+    except OverflowError:
+        # This instant isn't representable as a wall-clock time in tz.  Because
+        # offsets are less than 24 hours, which end we fell off is unambiguous.
+        local = dt.datetime.min if bound.year < 5000 else dt.datetime.max
     except Exception:
-        offset = None
-    if offset is None:
-        # Without an offset the drawn values will compare as naive, making the
-        # retained predicate raise TypeError just as it would without rewriting.
         return None
-    micros = instant + offset // _MICROSECOND
-    if type(tz) is not dt.timezone:
-        micros += _OFFSET_SPAN_MICROS if upper else -_OFFSET_SPAN_MICROS
-    return dt.datetime.min + min(max(micros, 0), _MAX_NAIVE_MICROS) * _MICROSECOND
+    if type(tz) is dt.timezone:  # a fixed offset, so the conversion was exact
+        return local
+    try:
+        return local + _MAX_OFFSET_SPAN if upper else local - _MAX_OFFSET_SPAN
+    except OverflowError:
+        return dt.datetime.max if upper else dt.datetime.min
 
 
 class DatetimeStrategy(SearchStrategy):
@@ -271,14 +265,17 @@ class DatetimeStrategy(SearchStrategy):
         assert min_value <= max_value
         assert isinstance(timezones_strat, SearchStrategy)
         assert isinstance(allow_imaginary, bool)
+        assert min_instant is None or min_instant.utcoffset() is not None
+        assert max_instant is None or max_instant.utcoffset() is not None
         self.min_value = min_value
         self.max_value = max_value
         self.tz_strat = timezones_strat
         self.allow_imaginary = allow_imaginary
-        # Bounds from rewritten filters with aware datetimes as their argument,
-        # as microseconds relative to dt.datetime.min in UTC (see _instant_micros).
-        # We use them to narrow the naive part of the draw once the timezone is
-        # known, while the exact predicate is retained as a filter condition.
+        # Aware datetimes, from aware bounds or rewritten filter predicates,
+        # which constrain the *instant* of generated values - while the naive
+        # min_value and max_value constrain the wall-clock reading.  We narrow
+        # the naive part of the draw once the timezone is known, and then check
+        # the aware bounds exactly.
         self.min_instant = min_instant
         self.max_instant = max_instant
 
@@ -286,25 +283,39 @@ class DatetimeStrategy(SearchStrategy):
         # We start by drawing a timezone, and an initial datetime.
         tz = data.draw(self.tz_strat)
         min_value, max_value = self.min_value, self.max_value
-        if tz is not None:
+        if self.min_instant is not None or self.max_instant is not None:
+            if tz is None:
+                raise InvalidArgument(
+                    f"Cannot bound naive datetimes (from drawing timezone=None "
+                    f"with timezones={self.tz_strat!r}) by the aware bounds "
+                    f"min={self.min_instant!r} and max={self.max_instant!r}"
+                )
+            # Work in the wall clock of the drawn timezone: convert each aware
+            # bound into it, and narrow the naive part of the draw to match.
             if (
                 self.min_instant is not None
-                and (lo := _naive_bound_for_tz(self.min_instant, tz, upper=False))
-                is not None
+                and (lo := _bound_in_tz(self.min_instant, tz, upper=False)) is not None
             ):
                 min_value = max(min_value, lo)
             if (
                 self.max_instant is not None
-                and (hi := _naive_bound_for_tz(self.max_instant, tz, upper=True))
-                is not None
+                and (hi := _bound_in_tz(self.max_instant, tz, upper=True)) is not None
             ):
                 max_value = min(max_value, hi)
             if max_value < min_value:
                 data.mark_invalid(
-                    f"No datetimes with timezone {tz!r} are within the bounds "
-                    "of the rewritten filter conditions."
+                    f"No datetimes with timezone {tz!r} are within the aware "
+                    f"bounds min={self.min_instant!r} and max={self.max_instant!r}"
                 )
         result = self.draw_naive_datetime_and_combine(data, tz, min_value, max_value)
+
+        # The narrowing above is only approximate for variable-offset timezones,
+        # so check the aware bounds exactly.  Mixed-type comparisons here raise
+        # TypeError, just as comparing the values to the bounds elsewhere would.
+        if (self.min_instant is not None and result < self.min_instant) or (
+            self.max_instant is not None and result > self.max_instant
+        ):
+            data.mark_invalid(f"{result} is outside the aware bounds")
 
         # TODO: with some probability, systematically search for one of
         #   - an imaginary time (if allowed),
@@ -349,35 +360,50 @@ class DatetimeStrategy(SearchStrategy):
                     allow_imaginary=self.allow_imaginary,
                 )
             if arg.utcoffset() is not None and tz_kind != "none":
-                # Aware datetimes compare as instants, so we narrow the naive
-                # part of the draw once the timezone is known (see do_draw), and
-                # retain the exact predicate to handle DST transitions, fold,
-                # and mixed naive/aware comparisons (which raise TypeError).
-                instant = _instant_micros(arg)
+                # Aware datetimes compare as instants, which is exactly what our
+                # aware min_instant/max_instant bounds constrain - so we rewrite
+                # the filter into a strategy with narrowed bounds.
                 if func in (op.lt, op.gt):
-                    instant += 1 if func is op.lt else -1
+                    # Adjust strict bounds by one microsecond, in UTC where wall
+                    # arithmetic is instant arithmetic.  Instants within a day
+                    # of the ends of the representable range may not have a UTC
+                    # representation; just filter for those.
+                    try:
+                        arg = arg.astimezone(dt.timezone.utc) + (
+                            _MICROSECOND if func is op.lt else -_MICROSECOND
+                        )
+                    except OverflowError:
+                        return super().filter(condition)
                 min_instant, max_instant = self.min_instant, self.max_instant
                 if func in (op.lt, op.le, op.eq):
-                    min_instant = (
-                        instant if min_instant is None else max(min_instant, instant)
-                    )
+                    min_instant = arg if min_instant is None else max(min_instant, arg)
                 if func in (op.eq, op.ge, op.gt):
-                    max_instant = (
-                        instant if max_instant is None else min(max_instant, instant)
-                    )
+                    max_instant = arg if max_instant is None else min(max_instant, arg)
                 if tz_kind == "aware":
                     # Aware values are instants strictly within 24h of the naive
-                    # bounds, so contradictory constraints are visibly empty.
-                    day = dt.timedelta(hours=24) // _MICROSECOND
-                    lo = (self.min_value - dt.datetime.min) // _MICROSECOND - day
-                    hi = (self.max_value - dt.datetime.min) // _MICROSECOND + day
-                    if min_instant is not None:
-                        lo = max(lo, min_instant)
-                    if max_instant is not None:
-                        hi = min(hi, max_instant)
-                    if hi < lo:
+                    # wall-clock bounds, so contradictions are visibly empty.
+                    day = dt.timedelta(hours=24)
+                    if (
+                        (
+                            min_instant is not None
+                            and max_instant is not None
+                            and max_instant < min_instant
+                        )
+                        or (
+                            min_instant is not None
+                            and min_instant.replace(tzinfo=None) - self.max_value
+                            > day + min_instant.utcoffset()
+                        )
+                        or (
+                            max_instant is not None
+                            and self.min_value - max_instant.replace(tzinfo=None)
+                            > day - max_instant.utcoffset()
+                        )
+                    ):
                         return nothing()
-                narrowed = DatetimeStrategy(
+                if (min_instant, max_instant) == (self.min_instant, self.max_instant):
+                    return self
+                return DatetimeStrategy(
                     self.min_value,
                     self.max_value,
                     self.tz_strat,
@@ -385,24 +411,32 @@ class DatetimeStrategy(SearchStrategy):
                     min_instant=min_instant,
                     max_instant=max_instant,
                 )
-                return SearchStrategy.filter(narrowed, condition)
         return super().filter(condition)
 
 
 @defines_strategy(force_reusable_values=True)
 def datetimes(
-    min_value: dt.datetime = dt.datetime.min,
-    max_value: dt.datetime = dt.datetime.max,
+    min_value: dt.datetime | None = None,
+    max_value: dt.datetime | None = None,
     *,
-    timezones: SearchStrategy[dt.tzinfo | None] = none(),
+    timezones: SearchStrategy[dt.tzinfo | None] | None = None,
     allow_imaginary: bool = True,
 ) -> SearchStrategy[dt.datetime]:
-    """datetimes(min_value=datetime.datetime.min, max_value=datetime.datetime.max, *, timezones=none(), allow_imaginary=True)
+    """datetimes(min_value=None, max_value=None, *, timezones=None, allow_imaginary=True)
 
     A strategy for generating datetimes, which may be timezone-aware.
 
-    This strategy works by drawing a naive datetime between ``min_value``
-    and ``max_value``, which must both be naive (have no timezone).
+    This strategy works by drawing a naive datetime - by default anywhere
+    between ``datetime.min`` and ``datetime.max`` - and then attaching a
+    timezone drawn from the ``timezones`` strategy.  Naive bounds therefore
+    constrain the "wall clock" reading of generated datetimes, regardless of
+    their timezone.
+
+    If ``min_value`` or ``max_value`` is timezone-aware, it instead bounds the
+    *instant* that generated datetimes refer to, and every generated datetime
+    is aware.  Aware and naive bounds cannot be mixed, and aware bounds require
+    a ``timezones`` strategy which does not generate ``None``.  If ``timezones``
+    is not provided, we default to the timezone or timezones of the bounds.
 
     ``timezones`` must be a strategy that generates either ``None``, for naive
     datetimes, or :class:`~python:datetime.tzinfo` objects for 'aware' datetimes.
@@ -422,28 +456,62 @@ def datetimes(
     Examples from this strategy shrink towards midnight on January 1st 2000,
     local time.
     """
-    # Why must bounds be naive?  In principle, we could also write a strategy
-    # that took aware bounds, but the API and validation is much harder.
-    # If you want to generate datetimes between two particular moments in
-    # time I suggest (a) just filtering out-of-bounds values; (b) if bounds
-    # are very close, draw a value and subtract its UTC offset, handling
-    # overflows and nonexistent times; or (c) do something customised to
-    # handle datetimes in e.g. a four-microsecond span which is not
-    # representable in UTC.  Handling (d), all of the above, leads to a much
-    # more complex API for all users and a useful feature for very few.
     check_type(bool, allow_imaginary, "allow_imaginary")
-    check_type(dt.datetime, min_value, "min_value")
-    check_type(dt.datetime, max_value, "max_value")
-    if min_value.tzinfo is not None:
-        raise InvalidArgument(f"{min_value=} must not have tzinfo")
-    if max_value.tzinfo is not None:
-        raise InvalidArgument(f"{max_value=} must not have tzinfo")
-    check_valid_interval(min_value, max_value, "min_value", "max_value")
-    if not isinstance(timezones, SearchStrategy):
+    if min_value is not None:
+        check_type(dt.datetime, min_value, "min_value")
+    if max_value is not None:
+        check_type(dt.datetime, max_value, "max_value")
+    for name, value in [("min_value", min_value), ("max_value", max_value)]:
+        if value is not None and value.tzinfo is not None and value.utcoffset() is None:
+            raise InvalidArgument(
+                f"{name}={value!r} has a tzinfo, but no UTC offset - it would "
+                "compare as naive, so use a naive bound instead"
+            )
+    if timezones is not None and not isinstance(timezones, SearchStrategy):
         raise InvalidArgument(
             f"{timezones=} must be a SearchStrategy that can "
             "provide tzinfo for datetimes (either None or dt.tzinfo objects)"
         )
+    bounds_aware = {
+        v.tzinfo is not None for v in (min_value, max_value) if v is not None
+    }
+    if len(bounds_aware) == 2:
+        raise InvalidArgument(
+            f"Cannot mix naive and aware bounds: got {min_value=} and "
+            f"{max_value=}.  Naive bounds constrain the wall-clock reading of "
+            "generated datetimes, while aware bounds constrain the instant."
+        )
+    check_valid_interval(min_value, max_value, "min_value", "max_value")
+    if bounds_aware == {True}:
+        if timezones is None:
+            # Default to the timezone(s) of the bounds themselves.
+            unique_tzs = []
+            for value in (min_value, max_value):
+                if value is not None and not any(
+                    value.tzinfo == tz for tz in unique_tzs
+                ):
+                    unique_tzs.append(value.tzinfo)
+            timezones = sampled_from(unique_tzs)
+        elif _timezones_kind(timezones) == "none":
+            raise InvalidArgument(
+                f"aware bounds require aware datetimes, but {timezones=} can "
+                "only generate None"
+            )
+        return DatetimeStrategy(
+            dt.datetime.min,
+            dt.datetime.max,
+            timezones,
+            allow_imaginary,
+            min_instant=min_value,
+            max_instant=max_value,
+        )
+
+    if min_value is None:
+        min_value = dt.datetime.min
+    if max_value is None:
+        max_value = dt.datetime.max
+    if timezones is None:
+        timezones = none()
     return DatetimeStrategy(min_value, max_value, timezones, allow_imaginary)
 
 

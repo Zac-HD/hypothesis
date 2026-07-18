@@ -50,10 +50,11 @@ def test_timezone_aware_datetimes_are_timezone_aware(dt):
     assert dt.tzinfo is not None
 
 
-@given(sampled_from(["min_value", "max_value"]), datetimes(timezones=timezones()))
-def test_datetime_bounds_must_be_naive(name, val):
-    with pytest.raises(InvalidArgument):
-        datetimes(**{name: val}).validate()
+def test_aware_bounds_are_instants():
+    # Aware bounds constrain the instant of generated datetimes, and infer
+    # their timezone(s) as the default timezones strategy.
+    bound = dt.datetime(2020, 1, 1, tzinfo=tz.gettz("America/New_York"))
+    assert_all_examples(datetimes(max_value=bound), lambda v: v <= bound)
 
 
 def test_timezones_arg_to_datetimes_must_be_search_strategy():

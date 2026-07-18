@@ -40,10 +40,37 @@ def test_can_generate_non_utc():
 )
 def test_aware_datetimes_filter_rewriting_narrows_arbitrary_timezones(value):
     # This spans a DST transition in many timezones; the rewritten strategy
-    # narrows each draw to near the three-month window and the retained
-    # predicate ensures exactness.
+    # narrows each draw to near the three-month window and then checks the
+    # bounds exactly.
     assert dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc) <= value
     assert value <= dt.datetime(2020, 4, 1, tzinfo=dt.timezone.utc)
+
+
+@settings(max_examples=10)
+@given(
+    st.datetimes(
+        min_value=dt.datetime(2020, 3, 7, tzinfo=dt.timezone.utc),
+        max_value=dt.datetime(2020, 3, 9, tzinfo=dt.timezone.utc),
+        timezones=st.just(zoneinfo.ZoneInfo("America/New_York")),
+    )
+)
+def test_aware_bounds_spanning_a_dst_transition(value):
+    assert dt.datetime(2020, 3, 7, tzinfo=dt.timezone.utc) <= value
+    assert value <= dt.datetime(2020, 3, 9, tzinfo=dt.timezone.utc)
+    assert value.tzinfo.key == "America/New_York"
+
+
+@settings(max_examples=10)
+@given(
+    st.datetimes(
+        max_value=dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+        - dt.timedelta(hours=12),
+        timezones=st.timezones(),
+    )
+)
+def test_aware_bounds_near_the_end_of_the_representable_range(value):
+    max_value = dt.datetime.max.replace(tzinfo=dt.timezone.utc) - dt.timedelta(hours=12)
+    assert value <= max_value
 
 
 @given(st.data(), st.datetimes(), st.datetimes())
