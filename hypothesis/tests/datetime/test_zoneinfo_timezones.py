@@ -8,12 +8,15 @@
 # v. 2.0. If a copy of the MPL was not distributed with this file, You can
 # obtain one at https://mozilla.org/MPL/2.0/.
 
+import datetime as dt
+import operator
 import platform
 import zoneinfo
+from functools import partial
 
 import pytest
 
-from hypothesis import given, strategies as st
+from hypothesis import given, settings, strategies as st
 from hypothesis.errors import InvalidArgument
 
 from tests.common.debug import assert_no_examples, find_any, minimal
@@ -27,6 +30,20 @@ def test_can_generate_non_utc():
     find_any(
         st.datetimes(timezones=st.timezones()).filter(lambda d: d.tzinfo.key != "UTC")
     )
+
+
+@settings(max_examples=25)
+@given(
+    st.datetimes(timezones=st.timezones())
+    .filter(partial(operator.le, dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)))
+    .filter(partial(operator.ge, dt.datetime(2020, 4, 1, tzinfo=dt.timezone.utc)))
+)
+def test_aware_datetimes_filter_rewriting_narrows_arbitrary_timezones(value):
+    # This spans a DST transition in many timezones; the rewritten strategy
+    # narrows each draw to near the three-month window and the retained
+    # predicate ensures exactness.
+    assert dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc) <= value
+    assert value <= dt.datetime(2020, 4, 1, tzinfo=dt.timezone.utc)
 
 
 @given(st.data(), st.datetimes(), st.datetimes())
