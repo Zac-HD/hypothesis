@@ -793,12 +793,27 @@ def test_aware_datetimes_filter_rewriting_narrows_draws():
     )
     assert late.filter(partial(operator.ge, UTC_2000)).is_empty
 
-    # Strict bounds on instants which are not representable in UTC (within a
-    # day of the ends of the range) are not rewritten, just filtered.
+    # Strict bounds on instants with no UTC representation (within a day of
+    # the ends of the range) are rewritten via a more extreme offset instead
     extreme = dt.datetime.max.replace(tzinfo=dt.timezone(dt.timedelta(hours=-14)))
-    assert isinstance(s.filter(partial(operator.gt, extreme)), FilteredStrategy)
+    out = s.filter(partial(operator.gt, extreme))
+    assert isinstance(out, DatetimeStrategy)
+    assert out.max_instant == extreme - dt.timedelta(microseconds=1)
+    low = dt.datetime.min.replace(tzinfo=dt.timezone(dt.timedelta(hours=14)))
+    out = s.filter(partial(operator.gt, low))
+    assert isinstance(out, DatetimeStrategy)
+    assert out.max_instant < low
     max_utc = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
-    assert isinstance(s.filter(partial(operator.lt, max_utc)), FilteredStrategy)
+    out = s.filter(partial(operator.lt, max_utc))
+    assert isinstance(out, DatetimeStrategy)
+    assert out.min_instant > max_utc
+
+    # while strict bounds beyond every constructible instant are just empty
+    limit = dt.timedelta(hours=24) - dt.timedelta(microseconds=1)
+    top = dt.datetime.max.replace(tzinfo=dt.timezone(-limit))
+    assert s.filter(partial(operator.lt, top)).is_empty
+    bottom = dt.datetime.min.replace(tzinfo=dt.timezone(limit))
+    assert s.filter(partial(operator.gt, bottom)).is_empty
 
 
 @settings(max_examples=A_FEW)

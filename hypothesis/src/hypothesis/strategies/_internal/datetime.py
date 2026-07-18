@@ -365,15 +365,29 @@ class DatetimeStrategy(SearchStrategy):
                 # the filter into a strategy with narrowed bounds.
                 if func in (op.lt, op.gt):
                     # Adjust strict bounds by one microsecond, in UTC where wall
-                    # arithmetic is instant arithmetic.  Instants within a day
-                    # of the ends of the representable range may not have a UTC
-                    # representation; just filter for those.
+                    # arithmetic is instant arithmetic.
+                    step = _MICROSECOND if func is op.lt else -_MICROSECOND
                     try:
-                        arg = arg.astimezone(dt.timezone.utc) + (
-                            _MICROSECOND if func is op.lt else -_MICROSECOND
-                        )
+                        arg = arg.astimezone(dt.timezone.utc) + step
                     except OverflowError:
-                        return super().filter(condition)
+                        # Instants within a day of the ends of the representable
+                        # range may have no UTC representation, but the most
+                        # extreme legal offset can represent the instant of
+                        # every constructible aware datetime.  We can't use
+                        # astimezone() here - it works via naive UTC - so we
+                        # change the offset while preserving the instant by hand.
+                        offset = dt.timedelta(hours=24) - _MICROSECOND
+                        if arg.year > 5000:
+                            offset = -offset
+                        shift = offset - arg.utcoffset() + step
+                        try:
+                            arg = (arg.replace(tzinfo=None) + shift).replace(
+                                tzinfo=dt.timezone(offset)
+                            )
+                        except OverflowError:
+                            # The adjusted bound is beyond every possible aware
+                            # datetime, and so cannot be satisfied at all.
+                            return nothing()
                 min_instant, max_instant = self.min_instant, self.max_instant
                 if func in (op.lt, op.le, op.eq):
                     min_instant = arg if min_instant is None else max(min_instant, arg)
