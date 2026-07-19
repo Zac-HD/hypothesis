@@ -56,13 +56,17 @@ if hasattr(sys, "monitoring"):
         MONITORING_EVENTS = {
             sys.monitoring.events.BRANCH_LEFT: "trace_branch",
             sys.monitoring.events.BRANCH_RIGHT: "trace_branch",
+            sys.monitoring.events.PY_START: "trace_py_start",
         }
         DISABLE_REPEATED_BRANCHES = sys.monitoring.DISABLE
     else:
         # On 3.12 and 3.13 there is only the combined BRANCH event, and
         # returning DISABLE would suppress *both* directions of that branch -
         # losing arcs we need - so we trace every event instead.
-        MONITORING_EVENTS = {sys.monitoring.events.BRANCH: "trace_branch"}
+        MONITORING_EVENTS = {
+            sys.monitoring.events.BRANCH: "trace_branch",
+            sys.monitoring.events.PY_START: "trace_py_start",
+        }
         DISABLE_REPEATED_BRANCHES = None
 
 
@@ -83,6 +87,7 @@ class Tracer:
         "_branches",
         "_previous_location",
         "_seen_branches",
+        "_seen_codes",
         "_should_trace",
         "_tried_and_failed_to_trace",
     )
@@ -90,6 +95,13 @@ class Tracer:
     def __init__(self, *, should_trace: bool) -> None:
         self._branches: set[Branch] = set()
         self._seen_branches: set[tuple[types.CodeType, int, int]] = set()
+        self._seen_codes: set[types.CodeType] = set()
+        # We chain each recorded event to the previous one, so the explain
+        # phase can prune locations which only run after the first
+        # always-failing-never-passing location.  With repeated events
+        # suppressed this chain records first-occurrence order, and pruning
+        # depends only on the relative order of first occurrences, so
+        # suppression does not change which locations we report.
         self._previous_location: Location | None = None
         self._tried_and_failed_to_trace = False
         self._should_trace = should_trace and self.can_trace()
@@ -109,6 +121,11 @@ class Tracer:
     def trace(self, frame, event, arg):
         try:
             if event == "call":
+                code = frame.f_code
+                if should_trace_file(code.co_filename):
+                    entry = (code.co_filename, code.co_firstlineno)
+                    self._branches.add((self._previous_location, entry))
+                    self._previous_location = entry
                 return self.trace
             elif event == "line":
                 fname = frame.f_code.co_filename
@@ -145,12 +162,26 @@ class Tracer:
 
         source = (fname, source_line)
         destination = (fname, destination_line)
-        # Chaining each event to the previous one keeps every location
-        # reachable from the None start node, as get_explaining_locations
-        # requires, in addition to recording the branch arc itself.
         self._branches.add((self._previous_location, source))
         self._branches.add((source, destination))
         self._previous_location = destination
+        return DISABLE_REPEATED_BRANCHES
+
+    def trace_py_start(self, code: types.CodeType, instruction_offset: int) -> object:
+        # Function entries capture control flow with no syntactic branch, such
+        # as dict-based dispatch, and give the explain phase a location inside
+        # functions whose bodies contain no branches at all.
+        if code in self._seen_codes:
+            return None
+        self._seen_codes.add(code)
+
+        fname = code.co_filename
+        if not should_trace_file(fname):
+            return sys.monitoring.DISABLE
+
+        entry = (fname, code.co_firstlineno)
+        self._branches.add((self._previous_location, entry))
+        self._previous_location = entry
         return DISABLE_REPEATED_BRANCHES
 
     def __enter__(self) -> "Self":
@@ -208,6 +239,7 @@ UNHELPFUL_LOCATIONS = (
     "/re.py",
     "/re/__init__.py",  # refactored in Python 3.11
     "/warnings.py",
+    "/_py_warnings.py",  # the pure-python implementation on Python 3.14+
     # Quite rarely, the first AFNP line is in Pytest's internals.
     "/_pytest/**",
     "/pluggy/_*.py",
@@ -248,7 +280,11 @@ def get_explaining_locations(traces):
         return {}
 
     unions = {origin: set().union(*values) for origin, values in traces.items()}
-    seen_passing = {None}.union(*unions.pop(None, set()))
+    if None not in unions:
+        # Without any passing traces, "always and only run by failing examples"
+        # would cover everything the test ran, which is not informative.
+        return {}
+    seen_passing = {None}.union(*unions.pop(None))
 
     always_failing_never_passing = {
         origin: reduce(set.intersection, [set().union(*v) for v in values])
@@ -376,8 +412,9 @@ def _get_git_repo_root() -> Path:
 def tractable_coverage_report(trace: Trace) -> dict[str, list[int]]:
     """Report a simple coverage map which is (probably most) of the user's code.
 
-    On Python 3.12+ we trace branches rather than lines, so the map contains
-    only the source and destination lines of executed branches.
+    On Python 3.12+ we trace branches and function entries rather than lines,
+    so the map contains only the source and destination lines of executed
+    branches, plus the first line of each function which ran.
     """
     coverage: dict = {}
     t = dict(trace)
