@@ -6,5 +6,5 @@ This release improves |Phase.explain| reports (:issue:`3551`):
   they cannot have caused the failure
 * print suspicious lines in the order they first executed, so that the
   earliest divergence comes first
-* show up to ten lines, up from five, truncating the middle of longer
-  reports rather than the tail
+* show up to ten lines, up from five, preferring to drop stdlib and then
+  site-packages locations over local code when truncating

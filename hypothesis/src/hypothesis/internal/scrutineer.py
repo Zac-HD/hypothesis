@@ -9,7 +9,6 @@
 # obtain one at https://mozilla.org/MPL/2.0/.
 
 import functools
-import itertools
 import math
 import os
 import re
@@ -57,24 +56,15 @@ if hasattr(sys, "monitoring"):
     }
 
 
-# We mark each raised exception with the number of exceptions raised before it,
-# so that we can discard lines which only ran after the failing exception - see
-# Tracer.branches_before().  Exceptions can't be weakly referenced, and their
-# id() is commonly reused, so we set an attribute on the exception itself; the
-# per-Tracer token invalidates marks left over from previous test executions.
-RAISE_INDEX_ATTR = "_hypothesis_internal_raise_index"
-_token_counter = itertools.count()
-
-
 class Tracer:
     """A super-simple branch coverage tracer."""
 
     __slots__ = (
         "_branches",
         "_exc_count",
+        "_exc_indices",
         "_previous_location",
         "_should_trace",
-        "_token",
         "_tried_and_failed_to_trace",
     )
 
@@ -85,7 +75,12 @@ class Tracer:
         self._branches: dict[Branch, int] = {}
         self._previous_location: Location | None = None
         self._exc_count = 0
-        self._token = next(_token_counter)
+        # id(exception) -> the number of exceptions raised before it, at its
+        # most recent raise.  Exceptions may be immutable and can't be weakly
+        # referenced, so we key on id() and rely on only ever looking up an
+        # exception which is still alive: its id can't have been reused since
+        # its raise, when we last overwrote the entry.
+        self._exc_indices: dict[int, int] = {}
         self._tried_and_failed_to_trace = False
         self._should_trace = should_trace and self.can_trace()
 
@@ -113,10 +108,8 @@ class Tracer:
                         (self._previous_location, current_location), self._exc_count
                     )
                     self._previous_location = current_location
-            elif event == "exception" and arg[2] is not None and arg[2].tb_next is None:
-                # Only count the frame in which the exception was raised, not
-                # the frames it propagates through.
-                self._note_exception(arg[1])
+            elif event == "exception":
+                self._note_exception(arg[1], arg[2])
         except RecursionError:
             pass
 
@@ -138,23 +131,23 @@ class Tracer:
     ) -> None:
         # Never return DISABLE here: we need to count every raise, not just
         # those from locations we've seen before.
-        self._note_exception(exception)
+        self._note_exception(exception, exception.__traceback__)
 
-    def _note_exception(self, exception: BaseException) -> None:
-        entry = getattr(exception, RAISE_INDEX_ATTR, None)
-        if isinstance(entry, tuple) and entry[0] == self._token:
-            return  # already noted, e.g. the same exception explicitly re-raised
-        self._exc_count += 1
-        try:
-            setattr(exception, RAISE_INDEX_ATTR, (self._token, self._exc_count))
-        except Exception:  # e.g. immutable exceptions
-            pass
+    def _note_exception(
+        self, exception: BaseException, tb: types.TracebackType | None
+    ) -> None:
+        # A freshly-raised exception has a single-frame traceback at the time
+        # of the raise event; longer chains are propagation into caller frames
+        # (settrace) or explicit re-raises of an existing exception, which we
+        # skip so that the recorded index is that of the original raise.
+        if tb is not None and tb.tb_next is None:
+            self._exc_count += 1
+            self._exc_indices[id(exception)] = self._exc_count
 
     def _raise_index(self, exception: BaseException) -> int | None:
         indices = []
-        entry = getattr(exception, RAISE_INDEX_ATTR, None)
-        if isinstance(entry, tuple) and entry[0] == self._token:
-            indices.append(entry[1])
+        if (idx := self._exc_indices.get(id(exception))) is not None:
+            indices.append(idx)
         if isinstance(exception, BaseExceptionGroup):
             indices.extend(
                 idx
@@ -357,6 +350,13 @@ class ModuleLocation(IntEnum):
         return cls.LOCAL
 
 
+def _keep_first_and_last(seq, n):
+    """Drop items from the middle of seq until at most n remain."""
+    if len(seq) <= n:
+        return seq
+    return seq[: (n + 1) // 2] + seq[len(seq) - n // 2 :]
+
+
 def make_report(explanations, *, cap_lines_at=10, location_ranks=None):
     report = defaultdict(list)
     for origin, locations in explanations.items():
@@ -364,10 +364,27 @@ def make_report(explanations, *, cap_lines_at=10, location_ranks=None):
         # comes first; locations we didn't see executing sort last.
         ranks = (location_ranks or {}).get(origin, {})
         locations = sorted(locations, key=lambda loc: (ranks.get(loc, math.inf), loc))
-        report_lines = [f"        {fname}:{lineno}" for fname, lineno in locations]
-        if len(report_lines) > cap_lines_at + 1:
-            half = cap_lines_at // 2
-            report_lines[half:-half] = ["        [...]"]
+        keep = locations
+        if len(locations) > cap_lines_at + 1:
+            # Prefer dropping stdlib lines, then site-packages, and only then
+            # local code - and drop from the middle of each group, replacing
+            # each omitted run with "[...]" below.
+            groups: dict[ModuleLocation, list[Location]] = defaultdict(list)
+            for loc in locations:
+                groups[ModuleLocation.from_path(loc[0])].append(loc)
+            budget = cap_lines_at
+            keep = []
+            for module_location in ModuleLocation:  # local first, stdlib last
+                kept = _keep_first_and_last(groups[module_location], budget)
+                keep.extend(kept)
+                budget -= len(kept)
+        keep = set(keep)
+        report_lines: list = []
+        for fname, lineno in locations:
+            if (fname, lineno) in keep:
+                report_lines.append(f"        {fname}:{lineno}")
+            elif report_lines[-1:] != ["        [...]"]:
+                report_lines.append("        [...]")
         if report_lines:  # We might have filtered out every location as uninformative.
             report[origin] = list(EXPLANATION_STUB) + report_lines
     return report

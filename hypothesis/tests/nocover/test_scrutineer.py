@@ -8,6 +8,7 @@
 # v. 2.0. If a copy of the MPL was not distributed with this file, You can
 # obtain one at https://mozilla.org/MPL/2.0/.
 
+import json
 import sys
 
 import pytest
@@ -184,12 +185,21 @@ def test_reports_multiple_divergent_locations(testdir):
     assert all(f"{test_file}:{lineno}" in pytest_stdout for lineno in bug_lines)
 
 
-def test_tracer_excludes_branches_first_run_after_exception():
+class ImmutableError(Exception):
+    def __setattr__(self, name, value):
+        raise AttributeError(name)
+
+
+@pytest.mark.parametrize("exc_type", [ValueError, ImmutableError])
+def test_tracer_excludes_branches_first_run_after_exception(exc_type):
     tracer = Tracer(should_trace=False)
     code = compile("pass", "fake_file.py", "exec")
     tracer.trace_line(code, 1)
     tracer.trace_line(code, 2)
-    exc = ValueError()
+    try:
+        raise exc_type()
+    except exc_type as e:
+        exc = e
     tracer.trace_raise(code, 0, exc)
     tracer.trace_line(code, 3)
 
@@ -240,3 +250,35 @@ def test_report_orders_lines_by_first_execution():
     lines = [line.strip() for line in report["origin"][2:]]
     # c ran first, then a; b wasn't seen executing so it sorts last
     assert lines == [f"{__file__}:30", f"{__file__}:10", f"{__file__}:20"]
+
+
+def _reported_and_omitted(explanations):
+    lines = [line.strip() for line in make_report(explanations)["origin"][2:]]
+    return [line for line in lines if line != "[...]"], lines.count("[...]")
+
+
+def test_report_truncation_prefers_dropping_stdlib_lines():
+    local = [(__file__, n) for n in range(4)]
+    site = [(pytest.__file__, n) for n in range(4)]
+    stdlib = [(json.__file__, n) for n in range(6)]
+    kept, n_markers = _reported_and_omitted({"origin": local + site + stdlib})
+    # all local and site-packages lines fit; stdlib is truncated to first-and-last
+    assert len(kept) == 10
+    for fname, lineno in local + site:
+        assert f"{fname}:{lineno}" in kept
+    assert [line for line in kept if str(json.__file__) in line] == [
+        f"{json.__file__}:0",
+        f"{json.__file__}:5",
+    ]
+    assert n_markers == 1
+
+
+def test_report_truncation_never_drops_local_lines():
+    local = [(__file__, n) for n in range(2)]
+    site = [(pytest.__file__, n) for n in range(30)]
+    kept, n_markers = _reported_and_omitted({"origin": local + site})
+    # both local lines survive, with the site-packages lines truncated around them
+    assert len(kept) == 10
+    for fname, lineno in local:
+        assert f"{fname}:{lineno}" in kept
+    assert n_markers >= 1
