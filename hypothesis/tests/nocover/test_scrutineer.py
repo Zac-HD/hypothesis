@@ -234,12 +234,14 @@ def test_tracer_ranks_locations_by_first_execution():
     }
 
 
-def test_report_truncates_long_reports():
+def test_report_truncates_middle_of_long_reports():
     explanations = {"origin": [(__file__, n) for n in range(1, 15)]}
     report_lines = [line.strip() for line in make_report(explanations)["origin"][2:]]
-    assert report_lines == [f"{__file__}:{n}" for n in range(1, 11)] + [
-        "[ ... 4 lines omitted; use settings.verbosity=verbose to show ]"
-    ]
+    assert report_lines == (
+        [f"{__file__}:{n}" for n in range(1, 6)]
+        + ["[ ... 4 lines omitted; use settings.verbosity=verbose to show ]"]
+        + [f"{__file__}:{n}" for n in range(10, 15)]
+    )
     # eleven lines fit without truncation
     explanations = {"origin": [(__file__, n) for n in range(1, 12)]}
     assert len(make_report(explanations)["origin"][2:]) == 11
@@ -267,14 +269,13 @@ def test_report_truncation_prefers_dropping_stdlib_lines():
         line.strip()
         for line in make_report({"origin": local + site + stdlib})["origin"][2:]
     ]
-    # all local and site-packages lines fit, plus the two earliest stdlib lines
-    assert (
-        lines[-1] == "[ ... 4 lines omitted; use settings.verbosity=verbose to show ]"
-    )
-    kept = lines[:-1]
+    kept = [line for line in lines if not line.startswith("[ ...")]
+    # all local and site-packages lines fit; only stdlib lines are omitted
     assert len(kept) == 10
-    for fname, lineno in local + site + stdlib[:2]:
+    for fname, lineno in local + site:
         assert f"{fname}:{lineno}" in kept
+    assert sum(str(json.__file__) in line for line in kept) == 2
+    assert "[ ... 4 lines omitted; use settings.verbosity=verbose to show ]" in lines
 
 
 def test_report_truncation_never_drops_local_lines():
@@ -283,11 +284,9 @@ def test_report_truncation_never_drops_local_lines():
     lines = [
         line.strip() for line in make_report({"origin": local + site})["origin"][2:]
     ]
-    # both local lines survive, along with the eight earliest site-packages lines
-    assert (
-        lines[-1] == "[ ... 22 lines omitted; use settings.verbosity=verbose to show ]"
-    )
-    kept = lines[:-1]
+    kept = [line for line in lines if not line.startswith("[ ...")]
+    # both local lines survive, plus the site-packages lines nearest each end
     assert len(kept) == 10
-    for fname, lineno in local + site[:8]:
+    for fname, lineno in local:
         assert f"{fname}:{lineno}" in kept
+    assert "[ ... 22 lines omitted; use settings.verbosity=verbose to show ]" in lines

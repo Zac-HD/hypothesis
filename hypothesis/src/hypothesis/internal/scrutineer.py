@@ -364,29 +364,34 @@ def make_report(explanations, *, cap_lines_at=10, location_ranks=None):
         # comes first; locations we didn't see executing sort last.
         ranks = (location_ranks or {}).get(origin, {})
         locations = sorted(locations, key=lambda loc: (ranks.get(loc, math.inf), loc))
-        tail = []
+        keep = set(locations)
         if len(locations) > cap_lines_at + 1:
-            # Keep the most local and earliest-executed lines, and say how
-            # many we've omitted.
-            keep = set(
-                sorted(
-                    locations,
-                    key=lambda loc: (
-                        ModuleLocation.from_path(loc[0]),
-                        ranks.get(loc, math.inf),
-                        loc,
-                    ),
-                )[:cap_lines_at]
-            )
-            omitted = len(locations) - cap_lines_at
-            locations = [loc for loc in locations if loc in keep]
-            tail = [
-                f"        [ ... {omitted} lines omitted; "
-                "use settings.verbosity=verbose to show ]"
-            ]
-        report_lines = [f"        {fname}:{lineno}" for fname, lineno in locations]
+            # Truncate to the cap, dropping the least-local lines first
+            # (stdlib, then site-packages, and only then local code), from
+            # the middle of the list outwards.
+            def drop_order(item, *, n=len(locations)):
+                index, (fname, _) = item
+                distance_from_ends = min(index, n - 1 - index)
+                return (ModuleLocation.from_path(fname), distance_from_ends)
+
+            kept = sorted(enumerate(locations), key=drop_order)[:cap_lines_at]
+            keep = {loc for _, loc in kept}
+        report_lines: list = []
+        omitted = 0
+        for loc in [*locations, None]:  # None flushes a trailing omitted run
+            if loc is None or loc in keep:
+                if omitted:
+                    report_lines.append(
+                        f"        [ ... {omitted} line{'s' * (omitted > 1)} omitted; "
+                        "use settings.verbosity=verbose to show ]"
+                    )
+                    omitted = 0
+                if loc is not None:
+                    report_lines.append(f"        {loc[0]}:{loc[1]}")
+            else:
+                omitted += 1
         if report_lines:  # We might have filtered out every location as uninformative.
-            report[origin] = list(EXPLANATION_STUB) + report_lines + tail
+            report[origin] = list(EXPLANATION_STUB) + report_lines
     return report
 
 
