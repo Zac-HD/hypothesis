@@ -19,6 +19,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from enum import IntEnum
 from functools import lru_cache, reduce
+from operator import or_
 from os import sep
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias
@@ -43,12 +44,36 @@ def should_trace_file(fname: str) -> bool:
 
 
 # where possible, we'll use 3.12's new sys.monitoring module for low-overhead
-# coverage instrumentation; on older python versions we'll use sys.settrace.
+# branch instrumentation; on older python versions we'll use sys.settrace.
 # tool_id = 1 is designated for coverage, but we intentionally choose a
 # non-reserved tool id so we can co-exist with coverage tools.
 MONITORING_TOOL_ID = 3
 if hasattr(sys, "monitoring"):
-    MONITORING_EVENTS = {sys.monitoring.events.LINE: "trace_line"}
+    if sys.version_info >= (3, 14):
+        # BRANCH_LEFT and BRANCH_RIGHT can each be DISABLEd independently, so
+        # each (branch, direction) pair fires at most once per test case - we
+        # re-enable them via restart_events() when entering the next Tracer.
+        MONITORING_EVENTS = {
+            sys.monitoring.events.BRANCH_LEFT: "trace_branch",
+            sys.monitoring.events.BRANCH_RIGHT: "trace_branch",
+        }
+        DISABLE_REPEATED_BRANCHES = sys.monitoring.DISABLE
+    else:
+        # On 3.12 and 3.13 there is only the combined BRANCH event, and
+        # returning DISABLE would suppress *both* directions of that branch -
+        # losing arcs we need - so we trace every event instead.
+        MONITORING_EVENTS = {sys.monitoring.events.BRANCH: "trace_branch"}
+        DISABLE_REPEATED_BRANCHES = None
+
+
+@lru_cache(maxsize=4096)
+def _offset_to_line(code: types.CodeType) -> dict[int, int]:
+    table = {}
+    for start, end, line in code.co_lines():
+        if line is not None:
+            for offset in range(start, end, 2):
+                table[offset] = line
+    return table
 
 
 class Tracer:
@@ -57,12 +82,14 @@ class Tracer:
     __slots__ = (
         "_branches",
         "_previous_location",
+        "_seen_branches",
         "_should_trace",
         "_tried_and_failed_to_trace",
     )
 
     def __init__(self, *, should_trace: bool) -> None:
         self._branches: set[Branch] = set()
+        self._seen_branches: set[tuple[types.CodeType, int, int]] = set()
         self._previous_location: Location | None = None
         self._tried_and_failed_to_trace = False
         self._should_trace = should_trace and self.can_trace()
@@ -92,16 +119,39 @@ class Tracer:
         except RecursionError:
             pass
 
-    def trace_line(self, code: types.CodeType, line_number: int) -> None:
+    def trace_branch(
+        self, code: types.CodeType, source_offset: int, destination_offset: int
+    ) -> object:
+        # this function is only called on 3.12+, but we want to avoid an
+        # assertion to that effect for performance.
+        key = (code, source_offset, destination_offset)
+        if key in self._seen_branches:
+            # Where we can't DISABLE each branch direction independently
+            # (i.e. before 3.14), this cheap check keeps the overhead of
+            # repeated branches - e.g. hot loops - low.
+            return None
+        self._seen_branches.add(key)
+
         fname = code.co_filename
         if not should_trace_file(fname):
-            # this function is only called on 3.12+, but we want to avoid an
-            # assertion to that effect for performance.
-            return sys.monitoring.DISABLE  # type: ignore
+            return sys.monitoring.DISABLE
 
-        current_location = (fname, line_number)
-        self._branches.add((self._previous_location, current_location))
-        self._previous_location = current_location
+        lines = _offset_to_line(code)
+        source_line = lines.get(source_offset)
+        destination_line = lines.get(destination_offset)
+        if source_line is None or destination_line is None:
+            # e.g. a jump to or from synthetic bytecode with no source line
+            return DISABLE_REPEATED_BRANCHES
+
+        source = (fname, source_line)
+        destination = (fname, destination_line)
+        # Chaining each event to the previous one keeps every location
+        # reachable from the None start node, as get_explaining_locations
+        # requires, in addition to recording the branch arc itself.
+        self._branches.add((self._previous_location, source))
+        self._branches.add((source, destination))
+        self._previous_location = destination
+        return DISABLE_REPEATED_BRANCHES
 
     def __enter__(self) -> "Self":
         self._tried_and_failed_to_trace = False
@@ -121,8 +171,11 @@ class Tracer:
             self._tried_and_failed_to_trace = True
             return self
 
+        if DISABLE_REPEATED_BRANCHES is not None:  # pragma: no cover  # 3.14+
+            # re-enable any branches disabled while tracing a previous test case
+            sys.monitoring.restart_events()
+        sys.monitoring.set_events(MONITORING_TOOL_ID, reduce(or_, MONITORING_EVENTS))
         for event, callback_name in MONITORING_EVENTS.items():
-            sys.monitoring.set_events(MONITORING_TOOL_ID, event)
             callback = getattr(self, callback_name)
             sys.monitoring.register_callback(MONITORING_TOOL_ID, event, callback)
 
@@ -321,7 +374,11 @@ def _get_git_repo_root() -> Path:
 
 
 def tractable_coverage_report(trace: Trace) -> dict[str, list[int]]:
-    """Report a simple coverage map which is (probably most) of the user's code."""
+    """Report a simple coverage map which is (probably most) of the user's code.
+
+    On Python 3.12+ we trace branches rather than lines, so the map contains
+    only the source and destination lines of executed branches.
+    """
     coverage: dict = {}
     t = dict(trace)
     for file, line in set(t.keys()).union(t.values()) - {None}:  # type: ignore
