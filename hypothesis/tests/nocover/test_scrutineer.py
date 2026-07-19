@@ -238,7 +238,7 @@ def test_report_truncates_long_reports():
     explanations = {"origin": [(__file__, n) for n in range(1, 15)]}
     report_lines = [line.strip() for line in make_report(explanations)["origin"][2:]]
     assert report_lines == [f"{__file__}:{n}" for n in range(1, 11)] + [
-        "(and 4 more with settings.verbosity >= verbose)"
+        "[ ... 4 lines omitted; use settings.verbosity=verbose to show ]"
     ]
     # eleven lines fit without truncation
     explanations = {"origin": [(__file__, n) for n in range(1, 12)]}
@@ -268,7 +268,9 @@ def test_report_truncation_prefers_dropping_stdlib_lines():
         for line in make_report({"origin": local + site + stdlib})["origin"][2:]
     ]
     # all local and site-packages lines fit, plus the two earliest stdlib lines
-    assert lines[-1] == "(and 4 more with settings.verbosity >= verbose)"
+    assert (
+        lines[-1] == "[ ... 4 lines omitted; use settings.verbosity=verbose to show ]"
+    )
     kept = lines[:-1]
     assert len(kept) == 10
     for fname, lineno in local + site + stdlib[:2]:
@@ -282,7 +284,9 @@ def test_report_truncation_never_drops_local_lines():
         line.strip() for line in make_report({"origin": local + site})["origin"][2:]
     ]
     # both local lines survive, along with the eight earliest site-packages lines
-    assert lines[-1] == "(and 22 more with settings.verbosity >= verbose)"
+    assert (
+        lines[-1] == "[ ... 22 lines omitted; use settings.verbosity=verbose to show ]"
+    )
     kept = lines[:-1]
     assert len(kept) == 10
     for fname, lineno in local + site[:8]:

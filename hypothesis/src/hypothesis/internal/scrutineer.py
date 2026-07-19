@@ -380,7 +380,10 @@ def make_report(explanations, *, cap_lines_at=10, location_ranks=None):
             )
             omitted = len(locations) - cap_lines_at
             locations = [loc for loc in locations if loc in keep]
-            tail = [f"        (and {omitted} more with settings.verbosity >= verbose)"]
+            tail = [
+                f"        [ ... {omitted} lines omitted; "
+                "use settings.verbosity=verbose to show ]"
+            ]
         report_lines = [f"        {fname}:{lineno}" for fname, lineno in locations]
         if report_lines:  # We might have filtered out every location as uninformative.
             report[origin] = list(EXPLANATION_STUB) + report_lines + tail
