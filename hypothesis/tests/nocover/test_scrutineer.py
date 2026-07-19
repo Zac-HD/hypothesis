@@ -15,8 +15,8 @@ import sysconfig
 import pytest
 
 from hypothesis import given, note, settings, strategies as st
-from hypothesis.internal.compat import PYPY
-from hypothesis.internal.scrutineer import make_report
+from hypothesis.internal.compat import PYPY, ExceptionGroup
+from hypothesis.internal.scrutineer import Tracer, make_report
 from hypothesis.vendor import pretty
 
 from tests.common.utils import skipif_threading
@@ -124,11 +124,130 @@ def test_skips_uninformative_locations(testdir):
     assert "Explanation:" not in pytest_stdout
 
 
+NO_SHOW_USER_CLEANUP = """
+from hypothesis import Phase, given, settings, strategies as st
+
+class Context:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb):
+        if exc_type is not None:
+            cleanup = exc_type.__name__  # only runs after the failure
+        return False
+
+@settings(phases=tuple(Phase), derandomize=True)
+@given(st.integers())
+def test(x):
+    with Context():
+        assert x < 100
+"""
+
+
+@skipif_threading  # runpytest_inprocess is not thread safe
+def test_skips_lines_run_only_after_the_failing_exception(testdir):
+    pytest_stdout, _ = get_reports(NO_SHOW_USER_CLEANUP, testdir=testdir)
+    assert "Explanation:" not in pytest_stdout
+
+
+# Two always-failing lines, each reachable from passing-covered code in one of
+# the two failing orderings, so that the explanation reports both locations.
+DIVERGENCE = """
+from hypothesis import Phase, given, settings, strategies as st
+
+def u(fail):
+    if fail:
+        u_bug = 1  # BUG
+
+def v(fail):
+    if fail:
+        v_bug = 1  # BUG
+
+@settings(phases=tuple(Phase), derandomize=True)
+@given(st.integers())
+def test(x):
+    fail = x > 10
+    if x % 2:
+        u(fail)
+        v(fail)
+    else:
+        v(fail)
+        u(fail)
+    if fail:
+        raise AssertionError
+"""
+
+
+@skipif_threading  # runpytest_inprocess is not thread safe
+def test_annotates_earliest_divergence(testdir):
+    test_file = str(testdir.makepyfile(DIVERGENCE))
+    pytest_stdout = str(testdir.runpytest_inprocess(test_file, "--tb=native").stdout)
+    bug_lines = {
+        i for i, line in enumerate(DIVERGENCE.splitlines()) if line.endswith(BUG_MARKER)
+    }
+    assert all(f"{test_file}:{lineno}" in pytest_stdout for lineno in bug_lines)
+    annotated = [
+        line
+        for line in pytest_stdout.splitlines()
+        if line.endswith("(earliest divergence)")
+    ]
+    assert len(annotated) == 1
+    assert any(f"{test_file}:{lineno} " in annotated[0] for lineno in bug_lines)
+
+
+def test_tracer_excludes_branches_first_run_after_exception():
+    tracer = Tracer(should_trace=False)
+    code = compile("pass", "fake_file.py", "exec")
+    tracer.trace_line(code, 1)
+    tracer.trace_line(code, 2)
+    exc = ValueError()
+    tracer.trace_raise(code, 0, exc)
+    tracer.trace_line(code, 3)
+
+    pre_raise = {
+        (None, ("fake_file.py", 1)),
+        (("fake_file.py", 1), ("fake_file.py", 2)),
+    }
+    assert tracer.branches == pre_raise | {(("fake_file.py", 2), ("fake_file.py", 3))}
+    assert tracer.branches_before(exc) == pre_raise
+    assert tracer.branches_before(ExceptionGroup("wrapped", [exc])) == pre_raise
+    # an exception we never saw raised leaves the trace unfiltered
+    assert tracer.branches_before(KeyError()) == tracer.branches
+    # as does an exception raised under a previous Tracer
+    other = Tracer(should_trace=False)
+    other.trace_line(code, 1)
+    assert other.branches_before(exc) == other.branches
+
+
+def test_tracer_ranks_locations_by_first_execution():
+    tracer = Tracer(should_trace=False)
+    code = compile("pass", "fake_file.py", "exec")
+    for lineno in (3, 1, 2, 1):
+        tracer.trace_line(code, lineno)
+    assert tracer.location_ranks() == {
+        ("fake_file.py", 3): 0,
+        ("fake_file.py", 1): 1,
+        ("fake_file.py", 2): 2,
+    }
+
+
 def test_report_shows_ten_lines_before_truncating():
     explanations = {"origin": [(__file__, n) for n in range(1, 15)]}
     report_lines = [line.strip() for line in make_report(explanations)["origin"][2:]]
     assert report_lines[:10] == [f"{__file__}:{n}" for n in range(1, 11)]
     assert report_lines[10:] == ["(and 4 more with settings.verbosity >= verbose)"]
+
+
+def test_report_annotates_earliest_divergence():
+    a, b = (__file__, 10), (__file__, 20)
+    ranks = {"origin": {b: 0, a: 1}}
+    report = make_report({"origin": [a, b]}, location_ranks=ranks)
+    lines = [line.strip() for line in report["origin"][2:]]
+    assert lines == [f"{__file__}:10", f"{__file__}:20  (earliest divergence)"]
+
+    # single-location reports are not annotated
+    report = make_report({"origin": [b]}, location_ranks=ranks)
+    assert report["origin"][2].strip() == f"{__file__}:20"
 
 
 @given(st.randoms())

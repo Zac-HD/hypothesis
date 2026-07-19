@@ -121,6 +121,7 @@ from hypothesis.internal.reflection import (
 )
 from hypothesis.internal.scrutineer import (
     MONITORING_TOOL_ID,
+    Location,
     Trace,
     Tracer,
     explanatory_lines,
@@ -952,6 +953,9 @@ class StateForActualGivenExecution:
         self.explain_traces: dict[None | InterestingOrigin, set[Trace]] = defaultdict(
             set
         )
+        # First-execution order of locations in the most recent failing example
+        # for each origin, used to highlight the earliest divergence.
+        self.explain_trace_ranks: dict[InterestingOrigin, dict[Location, int]] = {}
         self._start_timestamp = time.time()
         self._string_repr = ""
         self._timing_features: dict[str, float] = {}
@@ -1315,10 +1319,15 @@ class StateForActualGivenExecution:
                 interesting_origin = InterestingOrigin.from_exception(e)
                 if trace:  # pragma: no cover
                     # Trace collection is explicitly disabled under coverage.
-                    self.explain_traces[interesting_origin].add(trace)
+                    if filtered := tracer.branches_before(e):
+                        self.explain_traces[interesting_origin].add(filtered)
+                        self.explain_trace_ranks[interesting_origin] = (
+                            tracer.location_ranks()
+                        )
                 if interesting_origin.exc_type == DeadlineExceeded:
                     self.failed_due_to_deadline = True
                     self.explain_traces.clear()
+                    self.explain_trace_ranks.clear()
                 try:
                     data.mark_interesting(interesting_origin)
                 except FlakyReplay as err:
@@ -1502,7 +1511,9 @@ class StateForActualGivenExecution:
         if report_lines:
             report_lines.append("")
 
-        explanations = explanatory_lines(self.explain_traces, self.settings)
+        explanations = explanatory_lines(
+            self.explain_traces, self.settings, location_ranks=self.explain_trace_ranks
+        )
         for falsifying_example in self.falsifying_examples:
             fragments = []
 

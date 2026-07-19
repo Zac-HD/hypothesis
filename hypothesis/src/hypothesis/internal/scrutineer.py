@@ -9,6 +9,7 @@
 # obtain one at https://mozilla.org/MPL/2.0/.
 
 import functools
+import itertools
 import os
 import re
 import subprocess
@@ -19,12 +20,13 @@ from collections import defaultdict
 from collections.abc import Iterable
 from enum import IntEnum
 from functools import lru_cache, reduce
+from operator import or_
 from os import sep
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias
 
 from hypothesis._settings import Phase, Verbosity
-from hypothesis.internal.compat import PYPY
+from hypothesis.internal.compat import PYPY, BaseExceptionGroup
 from hypothesis.internal.escalation import is_hypothesis_file
 
 if TYPE_CHECKING:
@@ -48,7 +50,19 @@ def should_trace_file(fname: str) -> bool:
 # non-reserved tool id so we can co-exist with coverage tools.
 MONITORING_TOOL_ID = 3
 if hasattr(sys, "monitoring"):
-    MONITORING_EVENTS = {sys.monitoring.events.LINE: "trace_line"}
+    MONITORING_EVENTS = {
+        sys.monitoring.events.LINE: "trace_line",
+        sys.monitoring.events.RAISE: "trace_raise",
+    }
+
+
+# We mark each raised exception with the number of exceptions raised before it,
+# so that we can discard lines which only ran after the failing exception - see
+# Tracer.branches_before().  Exceptions can't be weakly referenced, and their
+# id() is commonly reused, so we set an attribute on the exception itself; the
+# per-Tracer token invalidates marks left over from previous test executions.
+RAISE_INDEX_ATTR = "_hypothesis_internal_raise_index"
+_token_counter = itertools.count()
 
 
 class Tracer:
@@ -56,14 +70,21 @@ class Tracer:
 
     __slots__ = (
         "_branches",
+        "_exc_count",
         "_previous_location",
         "_should_trace",
+        "_token",
         "_tried_and_failed_to_trace",
     )
 
     def __init__(self, *, should_trace: bool) -> None:
-        self._branches: set[Branch] = set()
+        # Maps each branch to the number of exceptions which had been raised
+        # when it was first executed, in insertion order - see branches_before()
+        # and location_ranks() respectively.
+        self._branches: dict[Branch, int] = {}
         self._previous_location: Location | None = None
+        self._exc_count = 0
+        self._token = next(_token_counter)
         self._tried_and_failed_to_trace = False
         self._should_trace = should_trace and self.can_trace()
 
@@ -87,8 +108,14 @@ class Tracer:
                 fname = frame.f_code.co_filename
                 if should_trace_file(fname):
                     current_location = (fname, frame.f_lineno)
-                    self._branches.add((self._previous_location, current_location))
+                    self._branches.setdefault(
+                        (self._previous_location, current_location), self._exc_count
+                    )
                     self._previous_location = current_location
+            elif event == "exception" and arg[2] is not None and arg[2].tb_next is None:
+                # Only count the frame in which the exception was raised, not
+                # the frames it propagates through.
+                self._note_exception(arg[1])
         except RecursionError:
             pass
 
@@ -100,8 +127,65 @@ class Tracer:
             return sys.monitoring.DISABLE  # type: ignore
 
         current_location = (fname, line_number)
-        self._branches.add((self._previous_location, current_location))
+        self._branches.setdefault(
+            (self._previous_location, current_location), self._exc_count
+        )
         self._previous_location = current_location
+
+    def trace_raise(
+        self, code: types.CodeType, offset: int, exception: BaseException
+    ) -> None:
+        # Never return DISABLE here: we need to count every raise, not just
+        # those from locations we've seen before.
+        self._note_exception(exception)
+
+    def _note_exception(self, exception: BaseException) -> None:
+        entry = getattr(exception, RAISE_INDEX_ATTR, None)
+        if isinstance(entry, tuple) and entry[0] == self._token:
+            return  # already noted, e.g. the same exception explicitly re-raised
+        self._exc_count += 1
+        try:
+            setattr(exception, RAISE_INDEX_ATTR, (self._token, self._exc_count))
+        except Exception:  # e.g. immutable exceptions
+            pass
+
+    def _raise_index(self, exception: BaseException) -> int | None:
+        indices = []
+        entry = getattr(exception, RAISE_INDEX_ATTR, None)
+        if isinstance(entry, tuple) and entry[0] == self._token:
+            indices.append(entry[1])
+        if isinstance(exception, BaseExceptionGroup):
+            indices.extend(
+                idx
+                for exc in exception.exceptions
+                if (idx := self._raise_index(exc)) is not None
+            )
+        return min(indices, default=None)
+
+    def branches_before(self, exception: BaseException) -> Trace:
+        """Return branches, minus those first executed only after *exception*
+        was raised.
+
+        Lines which only ran while the failing exception was propagating -
+        cleanup handlers, pytest's failure formatting, and so on - cannot have
+        caused the failure, so we decline to report them as explanations.  If
+        we never saw *exception* being raised, return all branches unfiltered.
+        """
+        index = self._raise_index(exception)
+        if index is None:
+            return self.branches
+        return frozenset(
+            branch for branch, exc_count in self._branches.items() if exc_count < index
+        )
+
+    def location_ranks(self) -> dict[Location, int]:
+        """Map each traced location to its rank in order of first execution."""
+        ranks: dict[Location, int] = {}
+        for branch in self._branches:
+            for location in branch:
+                if location is not None and location not in ranks:
+                    ranks[location] = len(ranks)
+        return ranks
 
     def __enter__(self) -> "Self":
         self._tried_and_failed_to_trace = False
@@ -121,8 +205,8 @@ class Tracer:
             self._tried_and_failed_to_trace = True
             return self
 
+        sys.monitoring.set_events(MONITORING_TOOL_ID, reduce(or_, MONITORING_EVENTS))
         for event, callback_name in MONITORING_EVENTS.items():
-            sys.monitoring.set_events(MONITORING_TOOL_ID, event)
             callback = getattr(self, callback_name)
             sys.monitoring.register_callback(MONITORING_TOOL_ID, event, callback)
 
@@ -277,12 +361,22 @@ def _sort_key(path: str, lineno: int) -> tuple[int, str, int]:
     return (ModuleLocation.from_path(path), path, lineno)
 
 
-def make_report(explanations, *, cap_lines_at=10):
+def make_report(explanations, *, cap_lines_at=10, location_ranks=None):
     report = defaultdict(list)
     for origin, locations in explanations.items():
-        locations = list(locations)
-        locations.sort(key=lambda v: _sort_key(v[0], v[1]))
-        report_lines = [f"        {fname}:{lineno}" for fname, lineno in locations]
+        locations = sorted(locations, key=lambda v: _sort_key(v[0], v[1]))
+        earliest = None
+        if location_ranks is not None and len(locations) > 1:
+            # Highlight the earliest-executed divergence as the most likely
+            # place to start debugging, with the rest as useful context.
+            ranks = location_ranks.get(origin, {})
+            if ranked := [loc for loc in locations if loc in ranks]:
+                earliest = min(ranked, key=ranks.__getitem__)
+        report_lines = [
+            f"        {fname}:{lineno}"
+            + ("  (earliest divergence)" if (fname, lineno) == earliest else "")
+            for fname, lineno in locations
+        ]
         if len(report_lines) > cap_lines_at + 1:
             msg = "        (and {} more with settings.verbosity >= verbose)"
             report_lines[cap_lines_at:] = [msg.format(len(report_lines[cap_lines_at:]))]
@@ -291,13 +385,15 @@ def make_report(explanations, *, cap_lines_at=10):
     return report
 
 
-def explanatory_lines(traces, settings):
+def explanatory_lines(traces, settings, *, location_ranks=None):
     if Phase.explain in settings.phases and sys.gettrace() and not traces:
         return defaultdict(list)
     # Return human-readable report lines summarising the traces
     explanations = get_explaining_locations(traces)
     max_lines = 10 if settings.verbosity <= Verbosity.normal else float("inf")
-    return make_report(explanations, cap_lines_at=max_lines)
+    return make_report(
+        explanations, cap_lines_at=max_lines, location_ranks=location_ranks
+    )
 
 
 # beware the code below; we're using some heuristics to make a nicer report...
