@@ -277,7 +277,7 @@ def _sort_key(path: str, lineno: int) -> tuple[int, str, int]:
     return (ModuleLocation.from_path(path), path, lineno)
 
 
-def make_report(explanations, *, cap_lines_at=5):
+def make_report(explanations, *, cap_lines_at=10):
     report = defaultdict(list)
     for origin, locations in explanations.items():
         locations = list(locations)
@@ -296,7 +296,7 @@ def explanatory_lines(traces, settings):
         return defaultdict(list)
     # Return human-readable report lines summarising the traces
     explanations = get_explaining_locations(traces)
-    max_lines = 5 if settings.verbosity <= Verbosity.normal else float("inf")
+    max_lines = 10 if settings.verbosity <= Verbosity.normal else float("inf")
     return make_report(explanations, cap_lines_at=max_lines)
 
 

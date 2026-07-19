@@ -124,6 +124,13 @@ def test_skips_uninformative_locations(testdir):
     assert "Explanation:" not in pytest_stdout
 
 
+def test_report_shows_ten_lines_before_truncating():
+    explanations = {"origin": [(__file__, n) for n in range(1, 15)]}
+    report_lines = [line.strip() for line in make_report(explanations)["origin"][2:]]
+    assert report_lines[:10] == [f"{__file__}:{n}" for n in range(1, 11)]
+    assert report_lines[10:] == ["(and 4 more with settings.verbosity >= verbose)"]
+
+
 @given(st.randoms())
 @settings(max_examples=5)
 def test_report_sort(random):
