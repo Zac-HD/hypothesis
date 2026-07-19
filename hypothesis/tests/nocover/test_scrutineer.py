@@ -14,7 +14,11 @@ import sys
 import pytest
 
 from hypothesis.internal.compat import PYPY, ExceptionGroup
-from hypothesis.internal.scrutineer import Tracer, make_report
+from hypothesis.internal.scrutineer import (
+    Tracer,
+    get_explaining_locations,
+    make_report,
+)
 
 from tests.common.utils import skipif_threading
 
@@ -230,17 +234,20 @@ def test_tracer_ranks_locations_by_first_execution():
     }
 
 
-def test_report_truncates_middle_of_long_reports():
+def test_report_truncates_long_reports():
     explanations = {"origin": [(__file__, n) for n in range(1, 15)]}
     report_lines = [line.strip() for line in make_report(explanations)["origin"][2:]]
-    assert report_lines == (
-        [f"{__file__}:{n}" for n in range(1, 6)]
-        + ["[...]"]
-        + [f"{__file__}:{n}" for n in range(10, 15)]
-    )
+    assert report_lines == [f"{__file__}:{n}" for n in range(1, 11)] + [
+        "(and 4 more with settings.verbosity >= verbose)"
+    ]
     # eleven lines fit without truncation
     explanations = {"origin": [(__file__, n) for n in range(1, 12)]}
     assert len(make_report(explanations)["origin"][2:]) == 11
+
+
+def test_empty_traces_are_dropped():
+    # e.g. a failing example where every line ran only after the exception
+    assert get_explaining_locations({None: set(), "origin": {frozenset()}}) == {}
 
 
 def test_report_orders_lines_by_first_execution():
@@ -252,33 +259,31 @@ def test_report_orders_lines_by_first_execution():
     assert lines == [f"{__file__}:30", f"{__file__}:10", f"{__file__}:20"]
 
 
-def _reported_and_omitted(explanations):
-    lines = [line.strip() for line in make_report(explanations)["origin"][2:]]
-    return [line for line in lines if line != "[...]"], lines.count("[...]")
-
-
 def test_report_truncation_prefers_dropping_stdlib_lines():
     local = [(__file__, n) for n in range(4)]
     site = [(pytest.__file__, n) for n in range(4)]
     stdlib = [(json.__file__, n) for n in range(6)]
-    kept, n_markers = _reported_and_omitted({"origin": local + site + stdlib})
-    # all local and site-packages lines fit; stdlib is truncated to first-and-last
-    assert len(kept) == 10
-    for fname, lineno in local + site:
-        assert f"{fname}:{lineno}" in kept
-    assert [line for line in kept if str(json.__file__) in line] == [
-        f"{json.__file__}:0",
-        f"{json.__file__}:5",
+    lines = [
+        line.strip()
+        for line in make_report({"origin": local + site + stdlib})["origin"][2:]
     ]
-    assert n_markers == 1
+    # all local and site-packages lines fit, plus the two earliest stdlib lines
+    assert lines[-1] == "(and 4 more with settings.verbosity >= verbose)"
+    kept = lines[:-1]
+    assert len(kept) == 10
+    for fname, lineno in local + site + stdlib[:2]:
+        assert f"{fname}:{lineno}" in kept
 
 
 def test_report_truncation_never_drops_local_lines():
     local = [(__file__, n) for n in range(2)]
     site = [(pytest.__file__, n) for n in range(30)]
-    kept, n_markers = _reported_and_omitted({"origin": local + site})
-    # both local lines survive, with the site-packages lines truncated around them
+    lines = [
+        line.strip() for line in make_report({"origin": local + site})["origin"][2:]
+    ]
+    # both local lines survive, along with the eight earliest site-packages lines
+    assert lines[-1] == "(and 22 more with settings.verbosity >= verbose)"
+    kept = lines[:-1]
     assert len(kept) == 10
-    for fname, lineno in local:
+    for fname, lineno in local + site[:8]:
         assert f"{fname}:{lineno}" in kept
-    assert n_markers >= 1

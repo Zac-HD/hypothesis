@@ -269,6 +269,13 @@ def _glob_to_re(locs: Iterable[str]) -> str:
 def get_explaining_locations(traces):
     # Traces is a dict[interesting_origin | None, set[frozenset[tuple[str, int]]]]
     # Each trace in the set might later become a Counter instead of frozenset.
+    # Discard empty traces, e.g. where every line ran only after the failing
+    # exception was raised, and then origins with no traces left at all.
+    traces = {
+        origin: {trace for trace in values if trace}
+        for origin, values in traces.items()
+    }
+    traces = {origin: values for origin, values in traces.items() if values}
     if not traces:
         return {}
 
@@ -350,13 +357,6 @@ class ModuleLocation(IntEnum):
         return cls.LOCAL
 
 
-def _keep_first_and_last(seq, n):
-    """Drop items from the middle of seq until at most n remain."""
-    if len(seq) <= n:
-        return seq
-    return seq[: (n + 1) // 2] + seq[len(seq) - n // 2 :]
-
-
 def make_report(explanations, *, cap_lines_at=10, location_ranks=None):
     report = defaultdict(list)
     for origin, locations in explanations.items():
@@ -364,29 +364,26 @@ def make_report(explanations, *, cap_lines_at=10, location_ranks=None):
         # comes first; locations we didn't see executing sort last.
         ranks = (location_ranks or {}).get(origin, {})
         locations = sorted(locations, key=lambda loc: (ranks.get(loc, math.inf), loc))
-        keep = locations
+        tail = []
         if len(locations) > cap_lines_at + 1:
-            # Prefer dropping stdlib lines, then site-packages, and only then
-            # local code - and drop from the middle of each group, replacing
-            # each omitted run with "[...]" below.
-            groups: dict[ModuleLocation, list[Location]] = defaultdict(list)
-            for loc in locations:
-                groups[ModuleLocation.from_path(loc[0])].append(loc)
-            budget = cap_lines_at
-            keep = []
-            for module_location in ModuleLocation:  # local first, stdlib last
-                kept = _keep_first_and_last(groups[module_location], budget)
-                keep.extend(kept)
-                budget -= len(kept)
-        keep = set(keep)
-        report_lines: list = []
-        for fname, lineno in locations:
-            if (fname, lineno) in keep:
-                report_lines.append(f"        {fname}:{lineno}")
-            elif report_lines[-1:] != ["        [...]"]:
-                report_lines.append("        [...]")
+            # Keep the most local and earliest-executed lines, and say how
+            # many we've omitted.
+            keep = set(
+                sorted(
+                    locations,
+                    key=lambda loc: (
+                        ModuleLocation.from_path(loc[0]),
+                        ranks.get(loc, math.inf),
+                        loc,
+                    ),
+                )[:cap_lines_at]
+            )
+            omitted = len(locations) - cap_lines_at
+            locations = [loc for loc in locations if loc in keep]
+            tail = [f"        (and {omitted} more with settings.verbosity >= verbose)"]
+        report_lines = [f"        {fname}:{lineno}" for fname, lineno in locations]
         if report_lines:  # We might have filtered out every location as uninformative.
-            report[origin] = list(EXPLANATION_STUB) + report_lines
+            report[origin] = list(EXPLANATION_STUB) + report_lines + tail
     return report
 
 

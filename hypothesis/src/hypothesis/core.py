@@ -1221,11 +1221,7 @@ class StateForActualGivenExecution:
             with Tracer(should_trace=self._should_trace()) as tracer:
                 try:
                     result = self.execute_once(data)
-                    if (
-                        data.status == Status.VALID and tracer.branches
-                    ):  # pragma: no cover
-                        # This is in fact covered by our *non-coverage* tests, but due
-                        # to the settrace() contention *not* by our coverage tests.
+                    if data.status == Status.VALID and tracer.branches:
                         self.explain_traces[None].add(tracer.branches)
                 finally:
                     trace = tracer.branches
@@ -1317,13 +1313,13 @@ class StateForActualGivenExecution:
                 self.failed_normally = True
 
                 interesting_origin = InterestingOrigin.from_exception(e)
-                if trace:  # pragma: no cover
-                    # Trace collection is explicitly disabled under coverage.
-                    if filtered := tracer.branches_before(e):
-                        self.explain_traces[interesting_origin].add(filtered)
-                        self.explain_trace_ranks[interesting_origin] = (
-                            tracer.location_ranks()
-                        )
+                if trace:
+                    self.explain_traces[interesting_origin].add(
+                        tracer.branches_before(e)
+                    )
+                    self.explain_trace_ranks[interesting_origin] = (
+                        tracer.location_ranks()
+                    )
                 if interesting_origin.exc_type == DeadlineExceeded:
                     self.failed_due_to_deadline = True
                     self.explain_traces.clear()
