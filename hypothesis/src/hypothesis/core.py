@@ -954,7 +954,7 @@ class StateForActualGivenExecution:
             set
         )
         # First-execution order of locations in the most recent failing example
-        # for each origin, used to highlight the earliest divergence.
+        # for each origin, so reports can print lines in order of occurrence.
         self.explain_trace_ranks: dict[InterestingOrigin, dict[Location, int]] = {}
         self._start_timestamp = time.time()
         self._string_repr = ""

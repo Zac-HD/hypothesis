@@ -10,6 +10,7 @@
 
 import functools
 import itertools
+import math
 import os
 import re
 import subprocess
@@ -356,30 +357,17 @@ class ModuleLocation(IntEnum):
         return cls.LOCAL
 
 
-# show local files first, then site-packages, then stdlib
-def _sort_key(path: str, lineno: int) -> tuple[int, str, int]:
-    return (ModuleLocation.from_path(path), path, lineno)
-
-
 def make_report(explanations, *, cap_lines_at=10, location_ranks=None):
     report = defaultdict(list)
     for origin, locations in explanations.items():
-        locations = sorted(locations, key=lambda v: _sort_key(v[0], v[1]))
-        earliest = None
-        if location_ranks is not None and len(locations) > 1:
-            # Highlight the earliest-executed divergence as the most likely
-            # place to start debugging, with the rest as useful context.
-            ranks = location_ranks.get(origin, {})
-            if ranked := [loc for loc in locations if loc in ranks]:
-                earliest = min(ranked, key=ranks.__getitem__)
-        report_lines = [
-            f"        {fname}:{lineno}"
-            + ("  (earliest divergence)" if (fname, lineno) == earliest else "")
-            for fname, lineno in locations
-        ]
+        # Print lines in order of first execution, so the earliest divergence
+        # comes first; locations we didn't see executing sort last.
+        ranks = (location_ranks or {}).get(origin, {})
+        locations = sorted(locations, key=lambda loc: (ranks.get(loc, math.inf), loc))
+        report_lines = [f"        {fname}:{lineno}" for fname, lineno in locations]
         if len(report_lines) > cap_lines_at + 1:
-            msg = "        (and {} more with settings.verbosity >= verbose)"
-            report_lines[cap_lines_at:] = [msg.format(len(report_lines[cap_lines_at:]))]
+            half = cap_lines_at // 2
+            report_lines[half:-half] = ["        [...]"]
         if report_lines:  # We might have filtered out every location as uninformative.
             report[origin] = list(EXPLANATION_STUB) + report_lines
     return report

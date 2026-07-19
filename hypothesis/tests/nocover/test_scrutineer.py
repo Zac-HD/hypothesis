@@ -8,16 +8,12 @@
 # v. 2.0. If a copy of the MPL was not distributed with this file, You can
 # obtain one at https://mozilla.org/MPL/2.0/.
 
-import json
 import sys
-import sysconfig
 
 import pytest
 
-from hypothesis import given, note, settings, strategies as st
 from hypothesis.internal.compat import PYPY, ExceptionGroup
 from hypothesis.internal.scrutineer import Tracer, make_report
-from hypothesis.vendor import pretty
 
 from tests.common.utils import skipif_threading
 
@@ -179,20 +175,13 @@ def test(x):
 
 
 @skipif_threading  # runpytest_inprocess is not thread safe
-def test_annotates_earliest_divergence(testdir):
+def test_reports_multiple_divergent_locations(testdir):
     test_file = str(testdir.makepyfile(DIVERGENCE))
     pytest_stdout = str(testdir.runpytest_inprocess(test_file, "--tb=native").stdout)
     bug_lines = {
         i for i, line in enumerate(DIVERGENCE.splitlines()) if line.endswith(BUG_MARKER)
     }
     assert all(f"{test_file}:{lineno}" in pytest_stdout for lineno in bug_lines)
-    annotated = [
-        line
-        for line in pytest_stdout.splitlines()
-        if line.endswith("(earliest divergence)")
-    ]
-    assert len(annotated) == 1
-    assert any(f"{test_file}:{lineno} " in annotated[0] for lineno in bug_lines)
 
 
 def test_tracer_excludes_branches_first_run_after_exception():
@@ -231,56 +220,23 @@ def test_tracer_ranks_locations_by_first_execution():
     }
 
 
-def test_report_shows_ten_lines_before_truncating():
+def test_report_truncates_middle_of_long_reports():
     explanations = {"origin": [(__file__, n) for n in range(1, 15)]}
     report_lines = [line.strip() for line in make_report(explanations)["origin"][2:]]
-    assert report_lines[:10] == [f"{__file__}:{n}" for n in range(1, 11)]
-    assert report_lines[10:] == ["(and 4 more with settings.verbosity >= verbose)"]
+    assert report_lines == (
+        [f"{__file__}:{n}" for n in range(1, 6)]
+        + ["[...]"]
+        + [f"{__file__}:{n}" for n in range(10, 15)]
+    )
+    # eleven lines fit without truncation
+    explanations = {"origin": [(__file__, n) for n in range(1, 12)]}
+    assert len(make_report(explanations)["origin"][2:]) == 11
 
 
-def test_report_annotates_earliest_divergence():
-    a, b = (__file__, 10), (__file__, 20)
-    ranks = {"origin": {b: 0, a: 1}}
-    report = make_report({"origin": [a, b]}, location_ranks=ranks)
+def test_report_orders_lines_by_first_execution():
+    a, b, c = (__file__, 10), (__file__, 20), (__file__, 30)
+    ranks = {"origin": {c: 0, a: 1}}
+    report = make_report({"origin": [a, b, c]}, location_ranks=ranks)
     lines = [line.strip() for line in report["origin"][2:]]
-    assert lines == [f"{__file__}:10", f"{__file__}:20  (earliest divergence)"]
-
-    # single-location reports are not annotated
-    report = make_report({"origin": [b]}, location_ranks=ranks)
-    assert report["origin"][2].strip() == f"{__file__}:20"
-
-
-@given(st.randoms())
-@settings(max_examples=5)
-def test_report_sort(random):
-    # show local files first, then site-packages, then stdlib
-
-    lines = [
-        # local
-        (__file__, 10),
-        # site-packages
-        (pytest.__file__, 123),
-        (pytest.__file__, 124),
-        # stdlib
-        (json.__file__, 43),
-        (json.__file__, 42),
-    ]
-    random.shuffle(lines)
-    explanations = {"origin": lines}
-    report = make_report(explanations)
-    report_lines = report["origin"][2:]
-    report_lines = [line.strip() for line in report_lines]
-
-    expected_lines = [
-        f"{__file__}:10",
-        f"{pytest.__file__}:123",
-        f"{pytest.__file__}:124",
-        f"{json.__file__}:42",
-        f"{json.__file__}:43",
-    ]
-
-    note(f"sysconfig.get_paths(): {pretty.pretty(sysconfig.get_paths())}")
-    note(f"actual lines: {pretty.pretty(report_lines)}")
-    note(f"expected lines: {pretty.pretty(expected_lines)}")
-
-    assert report_lines == expected_lines
+    # c ran first, then a; b wasn't seen executing so it sorts last
+    assert lines == [f"{__file__}:30", f"{__file__}:10", f"{__file__}:20"]
