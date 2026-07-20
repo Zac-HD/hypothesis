@@ -9,6 +9,7 @@
 # obtain one at https://mozilla.org/MPL/2.0/.
 
 import re
+import subprocess
 import sys
 from typing import Annotated
 
@@ -159,3 +160,15 @@ else:
         assert value["x"] >= 0
         assert value.get("y", 0) >= 0
         assert value.get("z", 0) >= 0
+
+
+def test_datetimes_annotations_use_timezone_metadata():
+    # The aliases annotating st.datetimes() overloads pick up annotated-types
+    # metadata only if it was already imported, so check in a fresh process.
+    code = """
+import annotated_types, typing
+from hypothesis.strategies._internal import datetime as d
+assert typing.get_args(d.NaiveDatetime)[1] == annotated_types.Timezone(None)
+assert typing.get_args(d.AwareDatetime)[1] == annotated_types.Timezone(...)
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
