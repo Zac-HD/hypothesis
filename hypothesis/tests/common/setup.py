@@ -9,6 +9,8 @@
 # obtain one at https://mozilla.org/MPL/2.0/.
 
 import os
+import time
+from importlib import metadata
 from warnings import filterwarnings
 
 from hypothesis import (
@@ -85,6 +87,21 @@ def run():
             suppress_health_check=(HealthCheck.too_slow, HealthCheck.filter_too_much),
             report_multiple_bugs=False,
         )
+
+        # crosshair-tool >= 0.0.106 measures per-path timeouts in process cpu
+        # time, but hypothesis-crosshair <= 0.0.28 still passes a deadline based
+        # on time.monotonic(), which is so far ahead of the cpu clock that path
+        # timeouts never fire - making some tests dozens of times slower.
+        # Remove this workaround once a fixed hypothesis-crosshair is released.
+        def _version(dist):
+            return tuple(int(part) for part in metadata.version(dist).split("."))
+
+        if _version("crosshair-tool") >= (0, 0, 106) and _version(
+            "hypothesis-crosshair"
+        ) <= (0, 0, 28):
+            from hypothesis_crosshair_provider import crosshair_provider
+
+            crosshair_provider.monotonic = time.process_time
 
     for backend in set(AVAILABLE_PROVIDERS) - {"hypothesis", "crosshair"}:
         settings.register_profile(backend, backend=backend)
