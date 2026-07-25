@@ -65,7 +65,7 @@ from hypothesistooling.scripts import pip_tool
 TASKS = {}
 BUILD_FILES = tuple(
     os.path.join(ROOT, f)
-    for f in ["tooling", "requirements", ".github", "hypothesis/tox.ini"]
+    for f in ["tooling", ".github", "hypothesis/tox.ini", "hypothesis/uv.lock"]
 )
 TODAY = date.today().isoformat()
 
@@ -245,7 +245,7 @@ def format(*, format_all=False):
     changed = modified_files()
 
     format_all = format_all or os.environ.get("FORMAT_ALL", "").lower() == "true"
-    if "requirements/tools.txt" in changed:
+    if "tooling/uv.lock" in changed:
         # We've changed the tools, which includes a lot of our formatting
         # logic, so we need to rerun formatters.
         format_all = True
@@ -374,35 +374,20 @@ def check_not_changed():
 
 @task()
 def compile_requirements(*, upgrade=False):
-    if upgrade:
-        extra = ["--upgrade", "--rebuild"]
-    else:
-        extra = []
-
-    for f in Path("requirements").glob("*.in"):
-        out_file = f.with_suffix(".txt")
-        pip_tool(
-            "pip-compile",
-            "--allow-unsafe",  # future default, not actually unsafe
-            "--resolver=backtracking",  # new pip resolver, default in pip-compile 7+
-            *extra,
-            str(f),
-            "hypothesis/pyproject.toml",
-            "--output-file",
-            str(out_file),
-            cwd=ROOT,
-            env={
-                "CUSTOM_COMPILE_COMMAND": "./build.sh upgrade-requirements",
-                **os.environ,
-            },
+    # Every dependency of every environment lives in a PEP 735 group, and
+    # resolves into one of these three lockfiles.  See CONTRIBUTING.rst.
+    for project in [HYPOTHESIS, ROOT / "tooling"]:
+        subprocess.check_call(
+            ["uv", "lock", *(["--upgrade"] if upgrade else ["--locked"])], cwd=project
         )
-        # Check that we haven't added anything to output files without adding to inputs
-        out_pkgs = out_file.read_text(encoding="utf-8")
-        for p in f.read_text(encoding="utf-8").splitlines():
-            p = p.lower().replace("_", "-")
-            if re.fullmatch(r"[a-z-]+", p):
-                assert p + "==" in out_pkgs, f"Package `{p}` deleted from {out_file}"
-        out_file.write_text(out_pkgs.replace(f"{ROOT}/", ""))
+    # `uv lock --check` never passes for a project that declares conflicts, so we
+    # re-lock the version matrix and let check_not_changed catch any drift.
+    subprocess.check_call(
+        ["uv", "lock", *(["--upgrade"] if upgrade else [])],
+        cwd=HYPOTHESIS / "ci-matrix",
+    )
+    if not upgrade:
+        check_not_changed()
 
 
 def update_python_versions():
@@ -777,6 +762,26 @@ python_tests = task(
 )
 
 
+# Optional extras which are tested in an environment of their own.  Keep in sync
+# with the `extra-{...}` generative section in tox.ini; whole_repo_tests checks it.
+EXTRAS = (
+    "datetime",
+    "dpcontracts",
+    "redis",
+    "typingext",
+    "annotated",
+    "attrs",
+    "scipy",
+    "lark",
+    "codemods",
+    "patching",
+    "ghostwriter",
+    "django",
+    "numpy",
+    "pandas",
+    "watchdog",
+)
+
 # ALIASES are the executable names for each Python version
 ALIASES = {}
 for key, version in PYTHONS.items():
@@ -787,19 +792,16 @@ for key, version in PYTHONS.items():
         ALIASES[version] = f"python{key}"
         name = f"py3{key[2:]}"
     TASKS[f"check-{name}"] = python_tests(
-        lambda n=f"{name}-full", v=version, *args: run_tox(n, v, *args)
+        lambda n=f"{name}-cover", v=version, *args: run_tox(n, v, *args)
     )
-    for subtask in (
-        "brief",
-        "full",
-        "cover",
-        "rest",
-        "nocover",
-        "niche",
-        "custom",
-    ):
+    for subtask in ("brief", "cover", "rest", "nocover", "custom"):
         TASKS[f"check-{name}-{subtask}"] = python_tests(
             lambda n=f"{name}-{subtask}", v=version, *args: run_tox(n, v, *args)
+        )
+    # One task per optional extra, replacing the old `-full` and `-niche` scripts.
+    for extra in EXTRAS:
+        TASKS[f"check-{name}-extra-{extra}"] = python_tests(
+            lambda n=f"extra-{extra}", v=version, *args: run_tox(n, v, *args)
         )
 
 
@@ -843,7 +845,7 @@ standard_tox_task("py311-pandas20", py="3.11")
 standard_tox_task("py312-pandas21", py="3.12")
 standard_tox_task("py313-pandas22", py="3.13")
 
-for kind in ("cover", "nocover", "niche", "custom"):
+for kind in ("cover", "nocover", "repeat", "custom"):
     standard_tox_task(f"crosshair-{kind}")
 
 for kind in ("rest", "nocover"):
@@ -858,6 +860,8 @@ standard_tox_task("numpy-nightly", py="3.12")
 standard_tox_task("coverage")
 standard_tox_task("conjecture-coverage")
 standard_tox_task("snapshots")
+standard_tox_task("optimized")
+standard_tox_task("larkmin", py="3.10")
 
 
 @python_tests

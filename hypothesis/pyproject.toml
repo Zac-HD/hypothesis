@@ -134,6 +134,68 @@ hypothesis = "hypothesis.extra.cli:main"
 [project.entry-points.pytest11]
 hypothesispytest = "_hypothesis_pytestplugin"
 
+# Development dependencies.  These are PEP 735 groups, which are *not* published
+# in our wheel metadata, so they cost downstream users nothing.  Every version
+# here is resolved into uv.lock; nothing is installed at test time.
+[dependency-groups]
+# The base harness, shared by nearly every environment.
+test = ["pexpect", "pytest", "pytest-xdist", "syrupy"]
+
+# Dev-only companions for extras which are exercised in isolation.  Where an
+# extra is enough on its own (lark, dpcontracts, ...) the tox env just sets
+# `extras =` and needs no group here.
+annotated-types = ["annotated-types", {include-group = "test"}]
+attrs = ["attrs", {include-group = "test"}]
+ghostwriter = ["black", "attrs", {include-group = "coverage"}]
+patching = ["black", "libcst", {include-group = "test"}]
+redis = ["fakeredis", {include-group = "test"}]
+# scipy trails numpy's latest release, so it caps numpy for the whole lock.
+scipy = ["scipy", {include-group = "test"}]
+typing-extensions = ["typing-extensions", {include-group = "test"}]
+
+# Everything at once, for the coverage run.
+coverage = [
+    "annotated-types",
+    "black",
+    "click",
+    "coverage-enable-subprocess",
+    "dpcontracts",
+    "fakeredis",
+    "lark",
+    "libcst",
+    "numpy",
+    "pandas",
+    "pyarrow",  # silence a warning from pandas >=2.2,<3
+    "pytest-cov",
+    "python-dateutil",
+    "pytz",
+    "typing-extensions",
+    "watchdog",
+    {include-group = "test"},
+]
+crosshair = ["crosshair-tool", "hypothesis-crosshair", "pytest-repeat", {include-group = "test"}]
+fuzzing = ["hypofuzz", {include-group = "coverage"}]
+threading = [
+    # in pytest-run-parallel==0.7.0, python3.10 + pytest-run-parallel + xdist does
+    # not collect any tests. I don't know why.
+    "pytest-run-parallel==0.6.0",
+    {include-group = "test"},
+]
+
+ci = ["tox", "tox-uv>=1.35"]
+
+# NOTE: no [tool.uv].conflicts here, deliberately.  As of uv 0.8.17 a lockfile
+# that declares conflicts can never satisfy `uv lock --check` / `uv sync
+# --locked` - it reports the lock as stale even immediately after writing it -
+# and verifying the lock in every CI job is the entire point.  So this project
+# stays conflict-free, and everything that needs a conflicting pin lives in
+# ci-matrix/, which is verified by re-locking in CI rather than by --locked.
+
+# The deliberately-off-latest version matrix (old pandas, old pytest, oldest
+# numpy, ...) lives in its own project at ci-matrix/, because declaring those
+# groups as mutually exclusive here would fork this resolution hundreds of ways.
+# See ci-matrix/pyproject.toml.
+
 [tool.maturin]
 manifest-path = "rust/Cargo.toml"
 python-source = "src"

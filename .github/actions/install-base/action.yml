@@ -48,9 +48,10 @@ runs:
         ~/appdata/local/pip/cache
         ~/Library/Caches/pip
         ~/wheelhouse
+        ~/.cache/uv
         hypothesis/rust/target
-      key: deps-${{ runner.os }}-${{ hashFiles('requirements/*.txt') }}-${{ inputs.python-version }}-${{ inputs.python-architecture }}-${{ inputs.task }}
+      key: deps-${{ runner.os }}-${{ hashFiles('hypothesis/uv.lock') }}-${{ inputs.python-version }}-${{ inputs.python-architecture }}-${{ inputs.task }}
       restore-keys: |
-        deps-${{ runner.os }}-${{ hashFiles('requirements/*.txt') }}-${{ inputs.python-version }}-${{ inputs.python-architecture }}
-        deps-${{ runner.os }}-${{ hashFiles('requirements/*.txt') }}
+        deps-${{ runner.os }}-${{ hashFiles('hypothesis/uv.lock') }}-${{ inputs.python-version }}-${{ inputs.python-architecture }}
+        deps-${{ runner.os }}-${{ hashFiles('hypothesis/uv.lock') }}
         deps-${{ runner.os }}

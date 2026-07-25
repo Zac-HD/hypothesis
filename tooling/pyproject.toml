@@ -1,0 +1,54 @@
+# The build environment: linters, type checkers, docs, and the release machinery.
+# Kept separate from hypothesis/pyproject.toml so that pins needed by our type
+# checkers (notably numpy, below) can't cap the versions our tests exercise.
+[project]
+name = "hypothesis-tooling"
+version = "0"
+requires-python = ">=3.11"
+dependencies = [
+
+    "build",
+    "codespell",
+    "coverage",
+    "django",
+    "dpcontracts",
+    "furo",
+    "ipython",
+    "lark",
+    "libcst",
+    "maturin",
+    "mypy",
+    # numpy >= 2.5 typing stubs use the `type` keyword, new in python 3.12.
+    # this causes mypy errors when type checking on 3.10 and 3.11. We can
+    # drop this pin after we drop python 3.11.
+    "numpy<2.5",
+    "pelican[markdown]",
+    "pyright",
+    "python-dateutil",
+    "requests",
+    "restructuredtext-lint",
+    "ruff",
+    "shed==2024.1.1",
+    "sortedcontainers-stubs",  # for typing
+    "sphinx",
+    "sphinx-autobuild",
+    "sphinx-codeautolink",
+    "sphinx-jsonschema",
+    "sphinx-selective-exclude",
+    "tox",
+    "tox-uv>=1.35",
+    "twine",
+    "types-click",
+    "types-pytz",
+    "types-redis",
+    "typing-extensions",
+    "watchdog",  # for typing
+    "attrs",  # for typing,
+    "pexpect",
+    "pytest",
+    "pytest-xdist",
+    "syrupy",
+]
+
+[tool.uv]
+package = false

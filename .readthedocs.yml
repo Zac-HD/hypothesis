@@ -15,9 +15,7 @@ build:
       rust: "latest"
    jobs:
       post_install:
-         - python -m pip install -e ./hypothesis[all]
-python:
-   install:
-      - requirements: requirements/tools.txt
+         - python -m pip install uv
+         - python -m uv sync --directory ./hypothesis --locked --group tools --all-extras --active
 sphinx:
    configuration: hypothesis/docs/conf.py

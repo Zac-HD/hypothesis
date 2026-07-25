@@ -278,6 +278,72 @@ Two things to check before committing to this:
   should cover them, but wheel availability on exotic targets is exactly where
   universal resolution gets awkward.
 
+## 8. What the prototype found
+
+§7 is now implemented on this branch. Hand-written diff is **+533 / -1254 across 27
+files**, plus three generated lockfiles (~9.9k lines) — `requirements/`,
+`scripts/basic-test.sh` and `scripts/other-tests.sh` are gone, along with all 17
+lockfile greps and both numpy version ladders.
+
+Verified end-to-end, not just written:
+
+- `./build.sh` bootstraps its tool venv from the new `tooling/uv.lock`, and `format` and `lint` run.
+- `uv sync --locked --no-default-groups --group redis --extra redis` builds the Rust extension, installs exactly redis + fakeredis + the harness, and `pytest tests/redis` gives 12 passed.
+- `tox --showconfig` resolves every rewritten environment to the right groups, extras, and project root.
+
+Four things the prototype changed my mind about:
+
+**1. A single lockfile is not achievable.** The §7 plan assumed one `uv.lock`.
+With all the conflicting groups in one project, `uv lock` **timed out after 900
+seconds** without producing a lockfile. The cause is fork count, not any
+individual pin: uv forks the resolution once per combination across conflict
+sets, so three sets (numpy/pandas ×15, pytest ×6, django ×2) means ~336 universal
+resolutions of a 200-package graph. Conflicts are cheap in isolation — the entire
+10-member pandas matrix locks in **385ms** on its own, and the full version matrix
+with all three conflict sets locks in **8.9s** as a standalone project. It's the
+product against the big graph that explodes.
+
+So the layout is three projects, not one:
+
+| Project | Contents | Packages | `uv lock` |
+| --- | --- | --- | --- |
+| `hypothesis/` | library + per-extra test groups | 98 | 0.7s |
+| `hypothesis/ci-matrix/` | old pandas/pytest/django, oldest numpy & lark, 32-bit alt | 84 | 24s |
+| `tooling/` | linters, type checkers, docs, release | 152 | 0.4s |
+
+Three lockfiles instead of today's five, each with a reason to exist rather than
+one per CI environment.
+
+**2. `uv lock --check` never passes when `conflicts` is declared.** On uv 0.8.17,
+a project declaring any conflict set reports its own freshly-written lockfile as
+stale — `uv lock` immediately followed by `uv lock --check` fails, and `uv sync
+--locked` fails with it, even though re-locking produces a byte-identical file.
+Setting `conflicts = []` makes both pass. Since verifying the lock in every CI job
+is the entire point of the exercise, this dictated the layout above: the main
+project stays conflict-free so `--locked` works, and `ci-matrix` (which cannot
+avoid conflicts) syncs with `--frozen`, with staleness caught instead by
+`./build.sh check-requirements` re-locking and diffing. Worth reporting upstream;
+if it's fixed, ci-matrix can move to `--locked` too.
+
+**3. Tooling pins were capping the library's test versions.** §6 raised this as an
+open question and the prototype answers it: `tools`' `numpy<2.5` isn't just
+theoretically capping, it caps in practice, and a marker (`; python_full_version <
+'3.12'`) doesn't fix it because uv won't split the marker range further than it
+must. Moving the build tooling into `tooling/pyproject.toml` fixes it
+structurally — and is where those dependencies belonged anyway, since they
+describe the build environment rather than the library.
+
+**4. Re-lock churn is real but small.** Two visible effects: `pandas 3.0.5`
+requires `numpy<2.5`, so the new lock lands on numpy 2.4.6 where pip-compile had
+picked pandas 3.0.3 + numpy 2.5.1 (both valid; if we care about testing 2.5.x,
+pandas needs a conflict group of its own). And the newer `ruff` flags 9
+pre-existing lint errors in files this change never touches.
+
+Two things still unverified, both needing real CI:
+
+- **Whether per-extra environments are actually faster.** The parallelism win assumes uv caches the built Rust extension across the ~16 environments rather than rebuilding per env. One local sync built it once in ~3 minutes; that cost repeated 16× per Python version would swamp the benefit.
+- **PyPy, GraalVM, free-threading, 32-bit Windows, and Pyodide.** All still go through paths this branch rewrote, and none can be exercised here.
+
 Sequencing, if we go this way: land the lock/generator switch first (mechanical,
 re-locks everything, easy to revert), then convert extras to groups one at a time
 with the old script path still in place, then delete the scripts once the last

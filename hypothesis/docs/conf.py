@@ -23,7 +23,7 @@ sys.path.insert(0, str(root / "src"))
 sys.path.insert(0, str(Path(__file__).parent / "_ext"))
 
 needs_sphinx = re.search(
-    r"sphinx==([0-9\.]+)", root.joinpath("../requirements/tools.txt").read_text()
+    r'name = "sphinx"\nversion = "([0-9.]+)"', root.joinpath("uv.lock").read_text()
 ).group(1)
 default_role = "py:obj"
 nitpicky = True

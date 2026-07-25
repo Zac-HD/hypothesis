@@ -46,8 +46,8 @@ jobs:
     - name: Install tox
       if: ${{ startsWith(matrix.task, 'tox-') }}
       run: |
-        pip install --upgrade setuptools pip wheel
-        pip install tox
+        pip install uv
+        uv sync --directory hypothesis --locked --only-group ci --active
     - name: Run tests
       run: |
         export TASK=${{ matrix.task }}
@@ -72,18 +72,14 @@ jobs:
           - check-release-smoke
           - check-py310-cover
           - check-py310-nocover
-          - check-py310-niche
           # - check-py310-pyjion  # see notes in tox.ini
           - check-py311-cover
           - check-py311-nocover
-          - check-py311-niche
           - check-pypy311-cover
           - check-py312-cover
           - check-py312-nocover
-          - check-py312-niche
           - check-py313-cover
           - check-py313-nocover
-          - check-py313-niche
           - check-quality
           - check-pytest9
           - check-pytest84
@@ -145,16 +141,12 @@ jobs:
           # Blocked by a 3.14rc1 bug. see
           # https://github.com/HypothesisWorks/hypothesis/pull/4490#issuecomment-3144989862.
           # Can revisit in 3.14rc2.
-          # - check-py314-niche
           - check-py314t-cover
           - check-py314t-nocover
-          - check-py314t-niche
           # - check-py315-cover
           # - check-py315-nocover
-          # - check-py315-niche
           # - check-py315t-cover
           # - check-py315t-nocover
-          # - check-py315t-niche
           - check-django52
           ## `-cover` is too slow under crosshair; use a custom split
           - check-crosshair-custom-cover/test_[a-d]*
@@ -166,9 +158,10 @@ jobs:
           - check-crosshair-custom-nocover/test_[e-i]*
           - check-crosshair-custom-nocover/test_[j-r]*
           - check-crosshair-custom-nocover/test_[s-z]*
-          # - check-crosshair-niche
+          # - check-crosshair-repeat
           - check-threading
           - check-py310-oldestnumpy
+          - check-larkmin
           - check-numpy-nightly
       fail-fast: false
     env:
@@ -235,12 +228,50 @@ jobs:
         task: ${{ matrix.task }}
     - name: Install tox
       run: |
-        pip install --upgrade setuptools pip wheel
-        pip install tox
+        pip install uv
+        uv sync --directory hypothesis --locked --only-group ci --active
     - name: Run tests
       working-directory: ./hypothesis
       run: |
         tox -e ${{ matrix.task }}
+
+  # Replaces the old `niche` job: one environment per optional extra, synced
+  # from uv.lock and run in parallel instead of installed and uninstalled in
+  # sequence inside a single environment.
+  extras:
+    needs: [basic]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14t"]
+        extra:
+          - datetime
+          - dpcontracts
+          - redis
+          - typingext
+          - annotated
+          - attrs
+          - scipy
+          - lark
+          - codemods
+          - patching
+          - ghostwriter
+          - django
+          - numpy
+          - pandas
+          - watchdog
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - name: "Install base for Python ${{ matrix.python-version }}"
+      uses: ./.github/actions/install-base
+      with:
+        python-version: ${{ matrix.python-version }}
+        task: extra-${{ matrix.extra }}
+    - name: Run tests
+      run: ./build.sh check-py${{ matrix.python-version }}-extra-${{ matrix.extra }}
 
   test-pyodide:
     needs: [basic]
@@ -266,7 +297,7 @@ jobs:
 
   check-required:
     if: always()
-    needs: [basic, req, cross]
+    needs: [basic, req, extras, cross]
     runs-on: ubuntu-latest
     steps:
     - name: Check required jobs

@@ -64,8 +64,8 @@ If you want to test Hypothesis as part of your packaging you will probably not w
 Hypothesis itself uses for running its tests, because it has a lot of logic for installing and testing against
 different versions of Python.
 
-The tests must be run with fairly recent tooling; check the :gh-link:`tree/master/requirements/`
-directory for details.
+The tests must be run with fairly recent tooling; check the ``[dependency-groups]``
+table in :gh-file:`hypothesis/pyproject.toml` for details.
 
 The organisation of the tests is described in the :gh-file:`hypothesis/tests/README.rst`.
 

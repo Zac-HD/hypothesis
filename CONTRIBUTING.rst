@@ -64,12 +64,24 @@ make changes and install the changed version) you can do this with:
 
 .. code:: bash
 
-  pip install -r requirements/test.in
-  pip install -r requirements/tools.in
-  pip install -e hypothesis/
+  # Creates .venv from the committed lockfile, with the test harness installed.
+  uv sync --directory hypothesis --locked
 
   # You don't need to run the tests, but here's the command:
-  pytest hypothesis/tests/cover/
+  uv run --directory hypothesis pytest tests/cover/
+
+Every test environment is described by a `dependency group
+<https://packaging.python.org/en/latest/specifications/dependency-groups/>`__ in
+``hypothesis/pyproject.toml`` and resolved into ``hypothesis/uv.lock``, so CI can
+only install versions we have committed.  Two smaller projects hang off that:
+``hypothesis/ci-matrix/`` holds the deliberately-off-latest version matrix (old
+pandas, old pytest, oldest numpy), and ``tooling/`` holds the linters and docs
+build.  They are separate because their pins conflict with the library's, and
+resolving them together forks the resolution hundreds of ways.
+
+To test an optional extra in isolation, sync its group - e.g.
+``uv sync --directory hypothesis --locked --group redis``.  Run
+``./build.sh upgrade-requirements`` to re-resolve all three lockfiles.
 
 Installing from source requires a Rust toolchain to be installed on your system. You can install it here: https://rust-lang.org/tools/install/.
 

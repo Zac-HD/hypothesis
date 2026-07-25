@@ -1,0 +1,89 @@
+# The deliberately-off-latest half of our test matrix: old pandas, old pytest,
+# supported-but-not-latest django, and the oldest numpy and lark we claim to
+# support.  These groups pin incompatible versions of the same packages, so each
+# one has to be declared as conflicting - which forks the resolution.  Keeping
+# them in their own tiny project means we fork a 60-package graph a few dozen
+# ways instead of forking the whole library's 200-package graph.
+#
+# Nothing here floats: every version below is resolved into uv.lock, and the
+# `oldest` groups are checked against our declared floors by whole_repo_tests.
+#
+# As of uv 0.8.17, `uv lock --check` never passes for a lockfile that declares
+# conflicts, so test environments sync this project with --frozen.  Staleness is
+# caught instead by ./build.sh check-requirements, which re-locks and fails if
+# the result differs from what's committed.
+[project]
+name = "hypothesis-ci-matrix"
+version = "0"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+package = false
+conflicts = [
+    [
+        {group = "oldestnumpy"},
+        {group = "alt"},
+        {group = "pandas11"},
+        {group = "pandas12"},
+        {group = "pandas13"},
+        {group = "pandas14"},
+        {group = "pandas15"},
+        {group = "pandas20"},
+        {group = "pandas21"},
+        {group = "pandas22"},
+    ],
+    [
+        {group = "test"},
+        {group = "pytest54"},
+        {group = "pytest62"},
+        {group = "pytest74"},
+        {group = "pytest84"},
+        {group = "pytest9"},
+    ],
+    [{group = "django52"}, {group = "django60"}],
+]
+
+[tool.uv.sources]
+hypothesis = {path = "..", editable = true}
+
+[dependency-groups]
+test = ["hypothesis", "pytest", "pytest-xdist", "pexpect", "syrupy"]
+
+# Test each pandas version with the latest Python version that supports it.
+pandas11 = ["hypothesis[pandas]", "numpy~=1.26.4", "pandas~=1.1.5 ; python_full_version < '3.11'", {include-group = "test"}]
+pandas12 = ["hypothesis[pandas]", "numpy~=1.26.4", "pandas~=1.2.5 ; python_full_version < '3.11'", {include-group = "test"}]
+pandas13 = ["hypothesis[pandas]", "numpy~=1.26.4", "pandas~=1.3.5 ; python_full_version < '3.11'", {include-group = "test"}]
+pandas14 = ["hypothesis[pandas]", "numpy~=1.26.4", "pandas~=1.4.4 ; python_full_version < '3.11'", {include-group = "test"}]
+pandas15 = ["hypothesis[pandas]", "numpy~=1.26.4", "pandas~=1.5.3 ; python_full_version < '3.12'", {include-group = "test"}]
+pandas20 = ["hypothesis[pandas]", "numpy~=1.26.4", "pandas~=2.0.3 ; python_full_version < '3.12'", {include-group = "test"}]
+pandas21 = ["hypothesis[pandas]", "numpy~=1.26.4", "pandas~=2.1.4 ; python_full_version < '3.13'", {include-group = "test"}]
+pandas22 = ["hypothesis[pandas]", "pandas~=2.2.2", {include-group = "test"}]
+
+# The oldest numpy and lark we claim to support; these must match the floors in
+# ../pyproject.toml, which whole_repo_tests/test_requirements.py asserts.
+oldestnumpy = ["hypothesis[numpy]", "numpy==1.21.6 ; python_full_version < '3.11'", {include-group = "test"}]
+larkmin = ["hypothesis[lark]", "lark==0.10.1", {include-group = "test"}]
+
+# Our 32-bit Windows jobs, where the newest numpy and pandas have no wheels.
+alt = [
+    "hypothesis[all]",
+    "numpy==1.26.4",
+    "pandas==2.0.3",
+    "black",
+    "fakeredis",
+    "libcst",
+    "python-dateutil",
+    "pytz",
+    "typing-extensions",
+    {include-group = "test"},
+]
+
+pytest54 = ["hypothesis", "pytest==5.4.3", "pytest-xdist", "pexpect", "syrupy"]
+pytest62 = ["hypothesis", "pytest==6.2.5", "pytest-xdist", "pexpect", "syrupy"]
+pytest74 = ["hypothesis", "pytest==7.4.4", "pytest-xdist", "pexpect", "syrupy"]
+pytest84 = ["hypothesis", "pytest==8.4.2", "pytest-xdist", "pexpect", "syrupy"]
+pytest9 = ["hypothesis", "pytest==9.*", "pytest-xdist", "pexpect", "syrupy"]
+
+django52 = ["hypothesis[django]", "django==5.2.16", {include-group = "test"}]
+django60 = ["hypothesis[django]", "django==6.0.7 ; python_full_version >= '3.12'", {include-group = "test"}]

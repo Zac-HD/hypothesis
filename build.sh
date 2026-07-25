@@ -36,7 +36,7 @@ else
     PYTHON=$(pythonloc "$PYTHON_VERSION")/bin/python
 fi
 
-TOOL_REQUIREMENTS="$ROOT/requirements/tools.txt"
+TOOL_REQUIREMENTS="$ROOT/tooling/uv.lock"
 
 # append PYTHON_VERSION to bust caches when we upgrade versions
 TOOL_HASH=$( (cat "$TOOL_REQUIREMENTS" && echo "$PYTHON_VERSION") | "$PYTHON" "$SCRIPTS/tool-hash.py")
@@ -48,8 +48,9 @@ export PYTHONPATH="$ROOT/tooling/src"
 
 if ! "$TOOL_PYTHON" -m hypothesistooling check-installed ; then
   rm -rf "$TOOL_VIRTUALENV"
-  uv venv --seed --python "$PYTHON" "$TOOL_VIRTUALENV"
-  uv pip install --python "$TOOL_PYTHON" -r requirements/tools.txt
+  # --locked fails rather than silently re-resolving against a newer PyPI.
+  UV_PROJECT_ENVIRONMENT="$TOOL_VIRTUALENV" \
+    uv sync --directory "$ROOT/tooling" --locked --python "$PYTHON"
 fi
 
 if [ -n "${CI:-}" ] ; then echo "::endgroup::" ; fi
