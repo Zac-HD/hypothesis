@@ -5,6 +5,17 @@
 *.jpg binary
 *.gif binary
 
+# Generated files: collapsed by default in GitHub diffs, and excluded from the
+# repository's language statistics.  Regenerate these rather than editing them.
+hypothesis/uv.lock linguist-generated=true
+hypothesis/ci-matrix/uv.lock linguist-generated=true
+tooling/uv.lock linguist-generated=true
+hypothesis/rust/Cargo.lock linguist-generated=true
+hypothesis/src/hypothesis/vendor/tlds-alpha-by-domain.txt linguist-generated=true
+
+# Vendored from IPython; we don't want to review or count it as our own code.
+hypothesis/src/hypothesis/vendor/pretty.py linguist-vendored=true
+
 # track website/ media under LFS to avoid blowing up repo size
 website/**/*.png filter=lfs diff=lfs merge=lfs -text
 website/**/*.jpg filter=lfs diff=lfs merge=lfs -text
