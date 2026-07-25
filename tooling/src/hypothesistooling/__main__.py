@@ -803,6 +803,13 @@ for key, version in PYTHONS.items():
         TASKS[f"check-{name}-extra-{extra}"] = python_tests(
             lambda n=f"extra-{extra}", v=version, *args: run_tox(n, v, *args)
         )
+    # ...and one task running all of them, so CI pays for interpreter setup and
+    # the Rust build once per Python version instead of once per extra.
+    TASKS[f"check-{name}-extras"] = python_tests(
+        lambda n=",".join(f"extra-{e}" for e in EXTRAS), v=version, *args: run_tox(
+            n, v, *args
+        )
+    )
 
 
 @python_tests

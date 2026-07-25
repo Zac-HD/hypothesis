@@ -235,31 +235,21 @@ jobs:
       run: |
         tox -e ${{ matrix.task }}
 
-  # Replaces the old `niche` job: one environment per optional extra, synced
-  # from uv.lock and run in parallel instead of installed and uninstalled in
-  # sequence inside a single environment.
+  # Replaces the old `niche` job.  Each optional extra gets its own environment,
+  # synced from uv.lock rather than pip-installed mid-run, but they all run in a
+  # single job per Python version so that interpreter setup and the Rust build
+  # are paid for once and the uv cache is shared between them.
   extras:
     needs: [basic]
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14t"]
-        extra:
-          - datetime
-          - dpcontracts
-          - redis
-          - typingext
-          - annotated
-          - attrs
-          - scipy
-          - lark
-          - codemods
-          - patching
-          - ghostwriter
-          - django
-          - numpy
-          - pandas
-          - watchdog
+        include:
+          - {python-version: "3.10", slug: py310}
+          - {python-version: "3.11", slug: py311}
+          - {python-version: "3.12", slug: py312}
+          - {python-version: "3.13", slug: py313}
+          - {python-version: "3.14t", slug: py314t}
       fail-fast: false
     steps:
     - uses: actions/checkout@v3
@@ -269,9 +259,9 @@ jobs:
       uses: ./.github/actions/install-base
       with:
         python-version: ${{ matrix.python-version }}
-        task: extra-${{ matrix.extra }}
+        task: ${{ matrix.slug }}-extras
     - name: Run tests
-      run: ./build.sh check-py${{ matrix.python-version }}-extra-${{ matrix.extra }}
+      run: ./build.sh check-${{ matrix.slug }}-extras
 
   test-pyodide:
     needs: [basic]

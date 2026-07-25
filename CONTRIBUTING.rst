@@ -80,8 +80,9 @@ build.  They are separate because their pins conflict with the library's, and
 resolving them together forks the resolution hundreds of ways.
 
 To test an optional extra in isolation, sync its group - e.g.
-``uv sync --directory hypothesis --locked --group redis``.  Run
-``./build.sh upgrade-requirements`` to re-resolve all three lockfiles.
+``uv sync --directory hypothesis --locked --group redis`` - or run its tests with
+``./build.sh check-py313-extra-redis``.  ``check-py313-extras`` runs them all.
+Run ``./build.sh upgrade-requirements`` to re-resolve all three lockfiles.
 
 Installing from source requires a Rust toolchain to be installed on your system. You can install it here: https://rust-lang.org/tools/install/.
 
