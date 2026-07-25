@@ -160,15 +160,15 @@ Replace `requirements/*.in` + pip-tools with dependency groups in
 `uv sync --frozen --group coverage`.
 
 - ✅ One universal lockfile by construction; the union file stops being a thing we maintain.
-- ✅ `--frozen` makes "CI installed something not in the lock" a hard error, not a possibility.
+- ✅ `uv sync --locked` makes "the lockfile is stale" a hard error, and `uv sync` is *exact* by default — it prunes packages that aren't in the requested groups. That is a stronger isolation guarantee than today's `pip uninstall -y`, which doesn't remove transitive deps.
 - ✅ Fastest, and we already require uv in `build.sh` and `tox-uv` in `tox.ini`, so it's not a new dependency.
+- ✅ The escape hatches from §2 can be *locked* rather than exempted — see §7.
 - ❌ Biggest blast radius: rewrites `compile_requirements`, all `deps =` in `tox.ini`, the fuzzing/release workflows, and contributor instructions in `CONTRIBUTING.rst`.
-- ❌ The escape hatches from §2 (old pandas, nightly numpy, old pytest) are less natural under `uv sync` than under `pip install`, so those envs need conflicting-group declarations or to stay on the old path anyway.
-- ❌ pip-tools is boring and works. The value here is speed and ergonomics, not correctness — and correctness is what #4494 is about.
+- ❌ pip-tools is boring and works.
 
-Worth doing eventually; not worth coupling to this bugfix.
+Right answer if we're willing to pay for it; see §7.
 
-## 5. Recommendation
+## 5. Recommendation, if we want the smallest change that works
 
 **Option B as the mechanism, with Option A's cleanup applied on top, and
 `uv pip compile` as the generator.** Concretely:
@@ -206,3 +206,81 @@ Step 6 is what keeps it closed.
 - **`--only-binary` interactions.** Several existing installs pass `--only-binary=:all:`; constraints compose fine with that, but the universal resolution may select a version with no wheel for an exotic target (32-bit Windows, PyPy, GraalVM). The cross-platform matrix should be run before merging.
 - **Do we want the union to cover `tools.in` too?** My recommendation is no, on the numpy evidence in §3 — but the alternative is to move the `numpy<2.5` mypy workaround into a marker (`numpy<2.5 ; python_full_version < '3.12'`) and then unify everything. That's arguably cleaner; it just needs someone to confirm the mypy failure really is 3.10/3.11-only.
 - **Should `constraints.txt` be checked for staleness in CI?** `check-not-changed` after a re-lock would catch a hand-edited lockfile, at the cost of a network-dependent job.
+
+## 7. Recommendation, if churn is free
+
+If we're willing to absorb an arbitrarily large diff, the answer changes: do
+**D and C together**, and skip the constraints file entirely.
+
+They are the same change viewed from two ends. The install/uninstall dance in the
+test scripts exists because creating a fresh environment per extra was expensive
+under pip. Under `uv sync` with a warm cache it isn't, so the dance stops being
+worth its cost — and once nothing is installed *during* a test run, #4494 is
+structurally impossible rather than defended against. A constraints file is a
+guard rail for ad-hoc installs; deleting the ad-hoc installs is strictly better
+than guarding them.
+
+Shape of it:
+
+- Each extra becomes a PEP 735 dependency group in `hypothesis/pyproject.toml`
+  (`lark`, `redis`, `django`, `codemods`, `ghostwriter`, `crosshair`, …), and each
+  gets a tox env that does `uv sync --locked --only-group <name>` and runs one
+  test directory. `basic-test.sh` and `other-tests.sh` mostly cease to exist;
+  so do all 17 greps and both numpy ladders.
+- CI parallelises what is currently a long serial tail. The `niche` and `full`
+  jobs are the slowest things in the matrix today, and they're serial by
+  construction.
+- Isolation gets *better*, not just faster. `uv sync` prunes by default, so
+  "test `tests/redis/` with only the redis extra present" becomes true, where
+  today `pip uninstall -y redis fakeredis` leaves fakeredis's transitive deps
+  installed for every subsequent test in the run.
+
+**The objection I raised against D in §4 doesn't survive checking.** I claimed the
+deliberately-off-lock envs (oldest numpy, old pandas, old pytest) fit `uv sync`
+badly. In fact `[tool.uv] conflicts` handles exactly this: I locked a throwaway
+project with two mutually-exclusive groups pinning `numpy>=2.5` and
+`numpy==2.2.6`, and the single `uv.lock` carries *both* versions —
+
+```toml
+[dependency-groups]
+newnumpy = ["numpy>=2.5"]
+oldnumpy = ["numpy==2.2.6"]
+
+[tool.uv]
+conflicts = [[{group = "newnumpy"}, {group = "oldnumpy"}]]
+```
+
+```
+$ grep 'version = ' uv.lock   # under `name = "numpy"`
+version = "2.2.6"
+version = "2.5.1"
+```
+
+So the whole version matrix — `py310-oldestnumpy`, `py31x-pandasNN`,
+`pytest{54,62,74,84,9}`, the minimum-`lark` install — moves from "deliberately
+unpinned, and therefore also a #4494 hole" to "locked, and mutually exclusive by
+declaration". That's better than the §5 plan, which merely exempts them.
+
+The one job that stays genuinely unlocked is `numpy-nightly`, and it should: its
+entire purpose is to fail when tomorrow's numpy breaks us. It should be marked
+non-required rather than pinned. Worth being explicit that this is the *only*
+intentionally-floating job, so the next #4493 has an obvious first suspect.
+
+Two things to check before committing to this:
+
+- **The maturin build.** `uv sync` builds the local package, which means the Rust
+  extension gets built into every per-extra env. If that isn't cached across envs
+  it would dominate the runtime and wipe out the parallelism win. `uv` caches
+  built wheels by source hash, so it should be built once — but this is the
+  assumption the whole plan rests on and it should be measured, not assumed.
+- **Non-CPython and cross-platform envs.** PyPy, GraalVM, free-threaded, 32-bit
+  Windows, and Pyodide all currently go through the pip path. A universal lock
+  should cover them, but wheel availability on exotic targets is exactly where
+  universal resolution gets awkward.
+
+Sequencing, if we go this way: land the lock/generator switch first (mechanical,
+re-locks everything, easy to revert), then convert extras to groups one at a time
+with the old script path still in place, then delete the scripts once the last
+extra has moved. Each step is independently green, which matters more than usual
+here because the failure mode of getting it wrong is "CI is subtly testing the
+wrong versions" rather than "CI is red".
