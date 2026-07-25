@@ -187,23 +187,207 @@ def test_functions_pure_two_functions_same_args_different_result(f1, f2, arg1, a
 
 
 @settings(verbosity=Verbosity.verbose)
-@given(functions(pure=False))
-def test_functions_note_all_calls_to_impure_functions(f):
+@given(functions(pure=True, returns=integers()))
+def test_functions_are_summarised_after_the_test_not_noted_per_call(f):
+    # We describe the whole function once the test has finished, instead of
+    # cluttering the output with a note on every call.
     ls = []
     with with_reporter(ls.append):
         f()
         f()
-    assert len(ls) == 2
+    assert ls == []
 
 
-@settings(verbosity=Verbosity.verbose)
-@given(functions(pure=True))
-def test_functions_note_only_first_to_pure_functions(f):
-    ls = []
-    with with_reporter(ls.append):
-        f()
-        f()
-    assert len(ls) == 1
+def _falsifying_output(strategy, body):
+    # Run a failing test, and return the reported failing example together with
+    # the description of the generated function.
+    @settings(derandomize=True)
+    @given(f=strategy)
+    def test(f):
+        body(f)
+
+    with pytest.raises(AssertionError) as excinfo:
+        test()
+    return "\n".join(getattr(excinfo.value, "__notes__", []))
+
+
+def fails(body):
+    # Wrap a body which returns True for the cases we want to see reported.
+    def inner(f):
+        assert not body(f)
+
+    return inner
+
+
+def always_fails(call):
+    # Wrap a body which should be reported however the calls turn out.
+    def inner(f):
+        call(f)
+        raise AssertionError
+
+    return inner
+
+
+def func_one_arg(x):
+    pass
+
+
+def test_pure_function_shown_as_dict_lookup():
+    out = _falsifying_output(
+        functions(like=lambda x: None, returns=integers(0, 9), pure=True),
+        fails(lambda f: f(1) != f(2)),
+    )
+    assert "lambda x: {1: 0, 2: 1}[x]" in out
+
+
+def test_pure_function_uses_tuple_key_for_several_args():
+    out = _falsifying_output(
+        functions(like=lambda x, y: None, returns=integers(0, 9), pure=True),
+        fails(lambda f: f(1, 2) != f(3, 4)),
+    )
+    assert "lambda x, y: {(1, 2): 0, (3, 4): 1}[(x, y)]" in out
+
+
+def test_pure_function_with_kwonly_args():
+    out = _falsifying_output(
+        functions(like=func, returns=integers(0, 9), pure=True),
+        fails(lambda f: f(1, kwonly_arg=2) != f(3, kwonly_arg=4)),
+    )
+    assert "lambda arg, *, kwonly_arg: {(1, 2): 0, (3, 4): 1}[(arg, kwonly_arg)]" in out
+
+
+def func_posonly(a, b, /, c):
+    pass
+
+
+def func_args_kwonly(*args, k):
+    pass
+
+
+def test_pure_function_with_positional_only_args():
+    out = _falsifying_output(
+        functions(like=func_posonly, returns=integers(0, 9), pure=True),
+        fails(lambda f: f(1, 2, 3) != f(4, 5, 6)),
+    )
+    assert "lambda a, b, /, c: {(1, 2, 3): 0, (4, 5, 6): 1}[(a, b, c)]" in out
+
+
+def test_pure_function_with_var_positional_args():
+    out = _falsifying_output(
+        functions(like=lambda *args: None, returns=integers(0, 9), pure=True),
+        fails(lambda f: f(1, 2) != f(3)),
+    )
+    assert "lambda *args: {(1, 2): 0, (3,): 1}[args]" in out
+
+
+def test_pure_function_with_var_positional_and_kwonly_args():
+    out = _falsifying_output(
+        functions(like=func_args_kwonly, returns=integers(0, 9), pure=True),
+        fails(lambda f: f(1, 2, k=3) != f(4, k=5)),
+    )
+    assert "lambda *args, k: {((1, 2), 3): 0, ((4,), 5): 1}[(args, k)]" in out
+
+
+def test_pure_function_key_applies_defaults():
+    # Passing a default explicitly is the same call, so it shares a cache entry
+    # - and therefore appears only once in the mapping.
+    out = _falsifying_output(
+        functions(like=lambda a, b=5: None, returns=integers(0, 9), pure=True),
+        fails(lambda f: f(1) == f(1, 5) != f(1, 6)),
+    )
+    assert "lambda a, b: {(1, 5): 0, (1, 6): 1}[(a, b)]" in out
+
+
+def test_pure_function_with_kwargs_falls_back_to_call_log():
+    # The **kwargs dict is unhashable, so a lookup expression would have to
+    # flatten it to sorted pairs - too ugly to be worth showing.
+    out = _falsifying_output(
+        functions(like=func_c, returns=integers(0, 9), pure=True),
+        fails(lambda f: f(a=1) != f(a=2)),
+    )
+    assert "lambda" not in out
+    assert "Called function: func_c(a=1) -> 0" in out
+    assert "Called function: func_c(a=2) -> 1" in out
+
+
+def test_pure_function_with_kwargs_still_shown_as_constant():
+    out = _falsifying_output(
+        functions(like=func_c, returns=integers(0, 9), pure=True),
+        fails(lambda f: f(a=1) == f(a=1) == 0),
+    )
+    assert "lambda **kwargs: 0" in out
+
+
+def test_impure_function_with_varying_results_falls_back_to_call_log():
+    out = _falsifying_output(
+        functions(like=func_one_arg, returns=integers(0, 9), pure=False),
+        fails(lambda f: f(1) != f(1)),
+    )
+    assert "lambda" not in out
+    assert "Called function: func_one_arg(1) -> 0" in out
+    assert "Called function: func_one_arg(1) -> 1" in out
+
+
+@pytest.mark.parametrize(
+    "returns, expected",
+    [
+        (st.just(3), "lambda x: 3"),
+        (st.none(), "lambda x: None"),
+        (st.sampled_from([7]), "lambda x: 7"),
+        (st.just(-5).map(abs), "lambda x: 5"),
+    ],
+)
+@pytest.mark.parametrize("pure", [False, True])
+def test_single_return_value_shown_as_constant(returns, expected, pure):
+    # One distinct return value, so there is no point showing a lookup table -
+    # note that we detect this by comparison, not by inspecting the strategy.
+    out = _falsifying_output(
+        functions(like=lambda x: None, returns=returns, pure=pure),
+        always_fails(lambda f: (f(0), f(1))),
+    )
+    assert expected in out
+
+
+@pytest.mark.parametrize(
+    "like, call, expected",
+    [
+        (func_c, lambda f: f(a=1), "lambda **kwargs: 3"),
+        (lambda *a: None, lambda f: f(1), "lambda *a: 3"),
+        (lambda: None, lambda f: f(), "lambda: 3"),
+    ],
+)
+def test_constant_shown_whatever_the_signature(like, call, expected):
+    out = _falsifying_output(
+        functions(like=like, returns=st.just(3), pure=False),
+        always_fails(call),
+    )
+    assert expected in out
+
+
+class Incomparable:
+    # Like a numpy array, __eq__ does not return a bool
+    def __eq__(self, other):
+        raise ValueError("elementwise comparison")
+
+    __hash__ = None
+
+
+def test_incomparable_results_fall_back_to_call_log():
+    out = _falsifying_output(
+        functions(like=func_one_arg, returns=st.builds(Incomparable), pure=False),
+        always_fails(lambda f: (f(1), f(2))),
+    )
+    assert "lambda" not in out
+    assert out.count("Called function: func_one_arg") == 2
+
+
+def test_single_call_is_shown_as_constant():
+    # Only one set of inputs, so a lookup table would be needless noise.
+    out = _falsifying_output(
+        functions(like=lambda x: None, returns=integers(0, 9), pure=True),
+        fails(lambda f: f(1) == 0),
+    )
+    assert "lambda x: 0" in out
 
 
 def test_functions_supports_find():
