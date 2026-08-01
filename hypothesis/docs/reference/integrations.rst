@@ -109,11 +109,20 @@ because there's no good way to compare multiple traces from these tools and thei
 Python support is relatively immature.
 
 
+.. _observability-configuration:
+
 Configuration
 ~~~~~~~~~~~~~
 
-If you set the ``HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY`` environment variable,
-Hypothesis will log various observations to jsonlines files in the
+Observability is configured with |settings.observability|, either as
+``observability=True`` for the default configuration, or with an
+|ObservabilityConfig| for fine-grained control over what is collected and
+where observations are delivered.  To enable it from the environment - for
+example on CI only - select or construct a settings profile (see
+|settings.register_profile|) based on whatever environment variable you
+prefer.
+
+By default, enabling observability logs observations to jsonlines files in the
 ``.hypothesis/observed/`` directory.  You can load and explore these with e.g.
 :func:`pd.read_json(".hypothesis/observed/*_testcases.jsonl", lines=True) <pandas.read_json>`,
 or by using the :pypi:`sqlite-utils` and :pypi:`datasette` libraries::
@@ -121,9 +130,12 @@ or by using the :pypi:`sqlite-utils` and :pypi:`datasette` libraries::
     sqlite-utils insert testcases.db testcases .hypothesis/observed/*_testcases.jsonl --nl --flatten
     datasette serve testcases.db
 
-If you are experiencing a significant slow-down, you can try setting
-``HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY_NOCOVER`` instead; this will disable coverage information
-collection. This should not be necessary on Python 3.12 or later, where coverage collection is very fast.
+To consume observations in-process instead of (or in addition to) writing them
+to disk, pass your own callbacks in |ObservabilityConfig|, replacing or
+alongside the default :obj:`~hypothesis.observability.deliver_to_file`.
+
+If coverage collection is a significant slow-down - possible before Python
+3.12, where it is very fast - pass ``ObservabilityConfig(coverage=False)``.
 
 
 Collecting more information
@@ -185,7 +197,7 @@ While the observability format is agnostic to the property-based testing library
 Choices metadata
 ++++++++++++++++
 
-These additional metadata elements are included in ``metadata`` (as e.g. ``metadata["choice_nodes"]`` or ``metadata["choice_spans"]``), if and only if |OBSERVABILITY_CHOICES| is set.
+These additional metadata elements are included in ``metadata`` (as e.g. ``metadata["choice_nodes"]`` or ``metadata["choice_spans"]``), if and only if observability is configured to include choices (see |ObservabilityConfig|).
 
 .. jsonschema:: ./schema_metadata_choices.json
    :hide_key: /additionalProperties, /type
@@ -227,6 +239,7 @@ For example if you ran the following with ``--hypothesis-show-statistics``:
 
   from hypothesis import given, strategies as st
 
+
   @given(st.integers())
   def test_integers(i):
       pass
@@ -247,6 +260,7 @@ In some cases (such as filtered and recursive strategies) you will see events me
 .. code-block:: python
 
   from hypothesis import given, strategies as st
+
 
   @given(st.integers().filter(lambda x: x % 2 == 0))
   def test_even_integers(i):

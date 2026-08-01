@@ -33,6 +33,7 @@ from hypothesis.errors import (
     InvalidArgument,
 )
 from hypothesis.internal.conjecture.providers import AVAILABLE_PROVIDERS
+from hypothesis.internal.observability import ObservabilityConfig, envvar_observability
 from hypothesis.internal.reflection import get_pretty_function_description
 from hypothesis.internal.validation import check_type, try_convert
 from hypothesis.utils.conventions import not_set
@@ -57,6 +58,7 @@ all_settings: list[str] = [
     "deadline",
     "print_blob",
     "backend",
+    "observability",
 ]
 
 
@@ -521,6 +523,22 @@ def _validate_deadline(
     raise invalid_deadline_error
 
 
+def _validate_observability(
+    observability: Any,
+) -> ObservabilityConfig | None:
+    check_type(
+        (bool, ObservabilityConfig, type(None)), observability, name="observability"
+    )
+    if isinstance(observability, ObservabilityConfig):
+        if not observability.callbacks:
+            raise InvalidArgument(
+                "must pass at least one callback in ObservabilityConfig.callbacks "
+                f"when using it in settings. Got: {observability!r}"
+            )
+        return observability
+    return ObservabilityConfig() if observability else None
+
+
 def _validate_backend(backend: str) -> str:
     if backend not in AVAILABLE_PROVIDERS:
         if backend == "crosshair":  # pragma: no cover
@@ -573,7 +591,8 @@ class settings(metaclass=settingsMeta):
     |~settings.max_examples|, |~settings.derandomize|, |~settings.database|,
     |~settings.verbosity|, |~settings.phases|, |~settings.stateful_step_count|,
     |~settings.report_multiple_bugs|, |~settings.suppress_health_check|,
-    |~settings.deadline|, |~settings.print_blob|, and |~settings.backend|.
+    |~settings.deadline|, |~settings.print_blob|, |~settings.backend|, and
+    |~settings.observability|.
 
     A settings object can be applied as a decorator to a test function, in which
     case that test function will use those settings. A test may only have one
@@ -676,6 +695,7 @@ class settings(metaclass=settingsMeta):
         deadline: int | float | datetime.timedelta | None = not_set,  # type: ignore
         print_blob: bool = not_set,  # type: ignore
         backend: str = not_set,  # type: ignore
+        observability: "bool | ObservabilityConfig | None" = not_set,  # type: ignore
     ) -> None:
         self._in_definition = True
 
@@ -748,6 +768,15 @@ class settings(metaclass=settingsMeta):
             if backend is not_set  # type: ignore
             else _validate_backend(backend)
         )
+
+        if observability is not_set:  # type: ignore
+            self._observability = (
+                envvar_observability
+                if self._fallback is None
+                else self._fallback.observability
+            )
+        else:
+            self._observability = _validate_observability(observability)
 
         self._in_definition = False
 
@@ -1045,6 +1074,43 @@ class settings(metaclass=settingsMeta):
         """
         return self._backend
 
+    @property
+    def observability(self) -> ObservabilityConfig | None:
+        """
+        Controls :ref:`observability <observability>`.
+
+        Valid values are ``True``, ``False``, ``None``, or an
+        |ObservabilityConfig| instance. Passing ``True`` enables observability
+        with the default configuration, which writes observations to the
+        ``.hypothesis/observed`` directory; passing an |ObservabilityConfig|
+        enables observability with fine-grained control over what data is
+        collected and where it is delivered. ``False`` and ``None`` both
+        disable observability.
+
+        For example:
+
+        .. code-block:: python
+
+            from hypothesis import ObservabilityConfig, settings
+
+            # enable observability
+            settings(observability=True)
+
+            # enable observability, additionally collecting the choice sequence
+            settings(observability=ObservabilityConfig(choices=True))
+
+        When read from a settings instance, this setting is normalized: it is
+        always either an |ObservabilityConfig| instance, or ``None`` if
+        observability is disabled.
+
+        If not set, defaults to ``None``. There is deliberately no supported
+        environment variable for this setting; to configure observability from
+        your environment, select or construct a settings profile (see
+        |settings.register_profile|) based on whatever environment variables
+        you prefer.
+        """
+        return self._observability
+
     def __call__(self, test: T) -> T:
         """Make the settings object (self) an attribute of the test.
 
@@ -1217,6 +1283,7 @@ default = settings(
     deadline=duration(milliseconds=200),
     print_blob=False,
     backend="hypothesis",
+    observability=not_set,  # type: ignore
 )
 settings.register_profile("default", default)
 settings.load_profile("default")

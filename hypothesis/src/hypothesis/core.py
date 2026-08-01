@@ -70,7 +70,6 @@ from hypothesis.errors import (
     Unsatisfiable,
     UnsatisfiedAssumption,
 )
-from hypothesis.internal import observability
 from hypothesis.internal.compat import (
     PYPY,
     BaseExceptionGroup,
@@ -107,6 +106,7 @@ from hypothesis.internal.healthcheck import fail_health_check
 from hypothesis.internal.observability import (
     InfoObservation,
     InfoObservationType,
+    ObservabilityConfig,
     deliver_observation,
     make_testcase,
     observability_enabled,
@@ -969,11 +969,11 @@ class StateForActualGivenExecution:
         ) or get_pretty_function_description(self.wrapped_test)
 
     def _should_trace(self):
-        # NOTE: we explicitly support monkeypatching this. Keep the namespace
-        # access intact.
-        _trace_obs = (
-            observability_enabled() and observability.OBSERVABILITY_COLLECT_COVERAGE
-        )
+        # ObservabilityConfig.current() reads the monkeypatchable globals in
+        # the observability module at call time, so monkeypatching
+        # OBSERVABILITY_COLLECT_COVERAGE continues to work here.
+        config = ObservabilityConfig.current()
+        _trace_obs = config is not None and bool(config.coverage)
         _trace_failure = (
             self.failed_normally
             and not self.failed_due_to_deadline
@@ -1401,7 +1401,8 @@ class StateForActualGivenExecution:
                 property=self.test_identifier,
                 title=title,
                 content=content,
-            )
+            ),
+            self.settings.observability,
         )
 
     def run_engine(self):
@@ -1430,7 +1431,9 @@ class StateForActualGivenExecution:
         # on different inputs.
         runner.run()
         note_statistics(runner.statistics)
-        if observability_enabled():
+        # check our own settings as well as observability_enabled(), because
+        # we are outside the local_settings context of the engine run here.
+        if self.settings.observability is not None or observability_enabled():
             self._deliver_information_message(
                 type="info",
                 title="Hypothesis Statistics",
@@ -1522,9 +1525,12 @@ class StateForActualGivenExecution:
         for falsifying_example in self.falsifying_examples:
             fragments = []
 
-            ran_example = runner.new_conjecture_data(
-                falsifying_example.choices, max_choices=len(falsifying_example.choices)
-            )
+            with local_settings(self.settings):
+                # so that ran_example.observability reflects this test's settings
+                ran_example = runner.new_conjecture_data(
+                    falsifying_example.choices,
+                    max_choices=len(falsifying_example.choices),
+                )
             ran_example.span_comments = falsifying_example.span_comments
             tb = None
             origin = None
@@ -2347,11 +2353,13 @@ def given(
                 if isinstance(buffer, io.IOBase):
                     buffer = buffer.read(BUFFER_SIZE)
                 assert isinstance(buffer, (bytes, bytearray, memoryview))
-                data = ConjectureData(
-                    random=None,
-                    provider=BytestringProvider,
-                    provider_kw={"bytestring": buffer},
-                )
+                with local_settings(state.settings):
+                    # so that data.observability reflects this test's settings
+                    data = ConjectureData(
+                        random=None,
+                        provider=BytestringProvider,
+                        provider_kw={"bytestring": buffer},
+                    )
                 try:
                     state.execute_once(data)
                     status = Status.VALID

@@ -18,7 +18,6 @@ import os
 import sys
 import threading
 import time
-import warnings
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -37,7 +36,6 @@ from typing import (
 )
 
 from hypothesis.configuration import storage_directory
-from hypothesis.errors import HypothesisWarning
 from hypothesis.internal.conjecture.choice import (
     BooleanConstraints,
     BytesConstraints,
@@ -70,27 +68,77 @@ _callbacks: dict[int | None, list[CallbackThreadT]] = {}
 _callbacks_all_threads: list[CallbackAllThreadsT] = []
 
 
+_WROTE_TO: set[Path] = set()
+_deliver_to_file_lock = Lock()
+
+
+def deliver_to_file(observation: Observation) -> None:  # pragma: no cover
+    """
+    The default |observability| callback, which writes each observation to a
+    `jsonlines <https://jsonlines.org/>`_ file in the ``.hypothesis/observed``
+    directory.
+
+    This callback is thread-safe. Like any observability callback, it may be
+    invoked concurrently from every thread which runs tests; custom callbacks
+    are responsible for their own thread-safety.
+    """
+    from hypothesis.strategies._internal.utils import to_jsonable
+
+    kind = "testcases" if observation.type == "test_case" else "info"
+    observed_dir = storage_directory("observed")
+    observed_dir.create_if_missing()
+    observation_p = observed_dir.path / f"{date.today().isoformat()}_{kind}.jsonl"
+
+    observation_bytes = (
+        json.dumps(to_jsonable(observation, avoid_realization=False)) + "\n"
+    )
+    # a global lock serializes writes, keeping each observation line atomic.
+    # This is likely to make file-based observability quite slow under
+    # threading. A queue would be an improvement, but that requires a
+    # background thread, and I would prefer to avoid a thread in the
+    # single-threaded case. We could switch over to a queue if we detect
+    # multithreading, but it's tricky to get right.
+    with _deliver_to_file_lock:
+        _WROTE_TO.add(observation_p)
+        with observation_p.open(mode="a") as f:
+            f.write(observation_bytes)
+
+
 @dataclass(frozen=True)
 class ObservabilityConfig:
     """
-    Fine-grained configuration of |observability|.
-
-    Currently internal-only. This will become part of the public API when
-    observability is stabilized.
+    Fine-grained configuration for the |settings.observability| setting.
 
     The boolean attributes here may generalize to enums in future - for
     example, distinguishing line and branch coverage, or choice values from
     choice nodes - with ``True`` and ``False`` remaining as shorthand for the
     default-enabled and disabled values respectively.
+
+    Parameters
+    ----------
+
+    coverage : bool
+        Whether to include the ``coverage`` field in test case observations.
+        Defaults to ``True``. Coverage collection may be slow on Python 3.11
+        and earlier.
+    choices : bool
+        Whether to include the ``metadata.choice_nodes`` and
+        ``metadata.choice_spans`` fields in test case observations. Defaults
+        to ``False``, as they can be a substantial amount of data.
+    callbacks : tuple[Callable, ...]
+        The callbacks to deliver each observation to. Defaults to
+        ``(deliver_to_file,)``, which writes observations to the
+        ``.hypothesis/observed`` directory.
+
+        Callbacks are invoked synchronously, on the thread which ran the test
+        case. If tests run on more than one thread, a callback may therefore
+        be invoked concurrently from several threads, and is responsible for
+        its own thread-safety - as |deliver_to_file| is.
     """
 
-    #: Whether to include the ``coverage`` field in test case observations.
     coverage: bool = True
-    #: Whether to include the ``metadata.choice_nodes`` and
-    #: ``metadata.choice_spans`` fields in test case observations.
     choices: bool = False
-    #: Callbacks to deliver observations to.
-    callbacks: tuple[CallbackThreadT, ...] = ()
+    callbacks: tuple[CallbackThreadT, ...] = (deliver_to_file,)
 
     def __or__(self, other: "ObservabilityConfig | None") -> "ObservabilityConfig":
         """
@@ -118,17 +166,22 @@ class ObservabilityConfig:
         The observability configuration in effect for newly-created test cases,
         or ``None`` if observability is disabled.
 
-        For now, this is derived from the callback registry and the
-        ``OBSERVABILITY_COLLECT_COVERAGE`` and ``OBSERVABILITY_CHOICES``
-        globals. It will instead be derived from settings once observability
-        is stabilized.
+        This is |settings.observability|, unioned with a config derived from
+        the legacy callback registry and the ``OBSERVABILITY_COLLECT_COVERAGE``
+        and ``OBSERVABILITY_CHOICES`` globals, if any legacy callbacks are
+        registered.
         """
-        if not observability_enabled():
-            return None
-        return cls(
-            coverage=OBSERVABILITY_COLLECT_COVERAGE,
-            choices=OBSERVABILITY_CHOICES,
-        )
+        from hypothesis._settings import settings
+
+        config = settings().observability
+        if _callbacks or _callbacks_all_threads:
+            legacy = cls(
+                coverage=OBSERVABILITY_COLLECT_COVERAGE,
+                choices=OBSERVABILITY_CHOICES,
+                callbacks=(),
+            )
+            config = legacy | config
+        return config
 
 
 @dataclass(slots=True, frozen=False)
@@ -379,14 +432,20 @@ def remove_observability_callback(f: CallbackT, /) -> None:
 def observability_enabled() -> bool:
     """
     Returns whether or not Hypothesis considers |observability|
-    to be enabled. Observability is enabled if there is at least one observability
-    callback present.
+    to be enabled, either via |settings.observability| or by a registered
+    observability callback.
 
     Callers might use this method to determine whether they should compute an
     expensive representation that is only used under observability, for instance
     by |alternative backends|.
     """
-    return bool(_callbacks) or bool(_callbacks_all_threads)
+    from hypothesis._settings import settings
+
+    return (
+        bool(_callbacks)
+        or bool(_callbacks_all_threads)
+        or settings().observability is not None
+    )
 
 
 @contextmanager
@@ -550,37 +609,6 @@ def make_testcase(
     )
 
 
-_WROTE_TO: set[Path] = set()
-_deliver_to_file_lock = Lock()
-
-
-def _deliver_to_file(observation: Observation) -> None:  # pragma: no cover
-    # This callback may be invoked concurrently, from every thread which runs
-    # tests, and is therefore responsible for its own thread-safety - as is
-    # any other observability callback which may receive observations from
-    # more than one thread.
-    from hypothesis.strategies._internal.utils import to_jsonable
-
-    kind = "testcases" if observation.type == "test_case" else "info"
-    observed_dir = storage_directory("observed")
-    observed_dir.create_if_missing()
-    observation_p = observed_dir.path / f"{date.today().isoformat()}_{kind}.jsonl"
-
-    observation_bytes = (
-        json.dumps(to_jsonable(observation, avoid_realization=False)) + "\n"
-    )
-    # a global lock serializes writes, keeping each observation line atomic.
-    # This is likely to make file-based observability quite slow under
-    # threading. A queue would be an improvement, but that requires a
-    # background thread, and I would prefer to avoid a thread in the
-    # single-threaded case. We could switch over to a queue if we detect
-    # multithreading, but it's tricky to get right.
-    with _deliver_to_file_lock:
-        _WROTE_TO.add(observation_p)
-        with observation_p.open(mode="a") as f:
-            f.write(observation_bytes)
-
-
 _imported_at = time.time()
 
 
@@ -593,44 +621,49 @@ def _system_metadata() -> dict[str, Any]:
     }
 
 
-#: If ``False``, do not collect coverage information when observability is enabled.
-#:
-#: This is exposed both for performance (as coverage collection can be slow on
-#: Python 3.11 and earlier) and size (if you do not use coverage information,
-#: you may not want to store it in-memory).
-OBSERVABILITY_COLLECT_COVERAGE = (
-    "HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY_NOCOVER" not in os.environ
-)
-#: If ``True``, include the ``metadata.choice_nodes`` and ``metadata.spans`` keys
-#: in test case observations.
-#:
-#: ``False`` by default. ``metadata.choice_nodes`` and ``metadata.spans`` can be
-#: a substantial amount of data, and so must be opted-in to, even when
-#: observability is enabled.
-#:
 #: .. warning::
 #:
-#:     EXPERIMENTAL AND UNSTABLE. We are actively working towards a better
-#:     interface for this as of June 2025, and this attribute may disappear or
-#:     be renamed without notice.
+#:     Superseded by ``ObservabilityConfig(coverage=...)`` and will eventually
+#:     be removed. This global now only applies to callbacks registered via
+#:     the legacy |add_observability_callback| interface.
 #:
-OBSERVABILITY_CHOICES = "HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY_CHOICES" in os.environ
+#: If ``False``, do not collect coverage information when observability is enabled.
+OBSERVABILITY_COLLECT_COVERAGE = True
+#: .. warning::
+#:
+#:     Superseded by ``ObservabilityConfig(choices=...)`` and will eventually
+#:     be removed. This global now only applies to callbacks registered via
+#:     the legacy |add_observability_callback| interface.
+#:
+#: If ``True``, include the ``metadata.choice_nodes`` and ``metadata.choice_spans``
+#: keys in test case observations.
+OBSERVABILITY_CHOICES = False
 
-if OBSERVABILITY_COLLECT_COVERAGE is False and (
-    sys.version_info[:2] >= (3, 12)
-):  # pragma: no cover
-    warnings.warn(
-        "Coverage data collection should be quite fast in Python 3.12 or later "
-        "so there should be no need to turn coverage reporting off.",
-        HypothesisWarning,
-        stacklevel=2,
-    )
+#: The default value for |settings.observability|, as derived from the
+#: deprecated experimental environment variables. Will be removed when they
+#: are; there is deliberately no supported environment variable for
+#: observability - configure a settings profile instead.
+envvar_observability: ObservabilityConfig | None = None
 
-if (
-    "HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY" in os.environ
-    or OBSERVABILITY_COLLECT_COVERAGE is False
-):  # pragma: no cover
-    add_observability_callback(
-        lambda observation, thread_id: _deliver_to_file(observation),
-        all_threads=True,
+# supported for backwards compatibility. These were always marked as
+# experimental, so a relatively short deprecation cycle is fine.
+if "HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY" in os.environ:  # pragma: no cover
+    note_deprecation(
+        "the HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY environment variable is "
+        "deprecated. Use @settings(observability=...) instead, for example "
+        "via a settings profile conditioned on an environment variable of "
+        "your choice.",
+        since="RELEASEDAY",
+        has_codemod=False,
     )
+    envvar_observability = ObservabilityConfig()
+
+if "HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY_CHOICES" in os.environ:  # pragma: no cover
+    note_deprecation(
+        "the HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY_CHOICES environment variable "
+        "is deprecated. Use "
+        "@settings(observability=ObservabilityConfig(choices=True)) instead.",
+        since="RELEASEDAY",
+        has_codemod=False,
+    )
+    envvar_observability = ObservabilityConfig(choices=True)

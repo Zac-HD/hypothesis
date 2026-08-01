@@ -33,6 +33,7 @@ from hypothesis import (
     target,
 )
 from hypothesis.database import InMemoryExampleDatabase
+from hypothesis.errors import InvalidArgument
 from hypothesis.internal.compat import PYPY
 from hypothesis.internal.conjecture.choice import ChoiceNode, choices_key
 from hypothesis.internal.conjecture.data import Span
@@ -701,7 +702,49 @@ def test_current_observability_config():
             assert ObservabilityConfig.current() == ObservabilityConfig(
                 coverage=hypothesis.internal.observability.OBSERVABILITY_COLLECT_COVERAGE,
                 choices=hypothesis.internal.observability.OBSERVABILITY_CHOICES,
+                callbacks=(),
             )
+
+
+def test_settings_observability_validation():
+    assert settings(observability=True).observability == ObservabilityConfig()
+    assert settings(observability=False).observability is None
+    assert settings(observability=None).observability is None
+
+    config = ObservabilityConfig(coverage=False, callbacks=(print,))
+    assert settings(observability=config).observability == config
+
+    with pytest.raises(InvalidArgument):
+        settings(observability="an invalid value")
+    with pytest.raises(InvalidArgument):
+        # requires at least one callback when used in settings
+        settings(observability=ObservabilityConfig(callbacks=()))
+
+
+def test_settings_observability_delivers_to_callbacks():
+    observations = []
+
+    @settings(
+        observability=ObservabilityConfig(
+            coverage=False, choices=True, callbacks=(observations.append,)
+        ),
+        database=None,
+        max_examples=5,
+    )
+    @given(st.integers())
+    def f(n):
+        pass
+
+    f()
+
+    testcases = [o for o in observations if o.type == "test_case"]
+    assert testcases
+    # choices=True collects the choice sequence; coverage=False disables coverage
+    assert all(o.metadata.choice_nodes is not None for o in testcases)
+    assert all(o.coverage is None for o in testcases)
+    assert [o.title for o in observations if o.type == "info"] == [
+        "Hypothesis Statistics"
+    ]
 
 
 @skipif_threading

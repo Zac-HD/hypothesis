@@ -30,6 +30,7 @@ Alternative backends
 Observability
 -------------
 
+.. autofunction:: hypothesis.observability.deliver_to_file
 .. autofunction:: hypothesis.internal.observability.add_observability_callback
 .. autofunction:: hypothesis.internal.observability.remove_observability_callback
 .. autofunction:: hypothesis.internal.observability.with_observability_callback
