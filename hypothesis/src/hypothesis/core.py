@@ -701,7 +701,7 @@ def execute_explicit_examples(state, wrapped_test, arguments, kwargs, original_s
                         representation=state._string_repr,
                         timing=state._timing_features,
                     )
-                    deliver_observation(tc)
+                    deliver_observation(tc, empty_data.observability)
 
             if fragments_reported:
                 verbose_report(fragments_reported[0].replace("Failing", "Trying", 1))
@@ -1383,7 +1383,7 @@ class StateForActualGivenExecution:
                     phase=phase,
                     backend_metadata=data.provider.observe_test_case(),
                 )
-                deliver_observation(tc)
+                deliver_observation(tc, data.observability)
 
                 for msg in data.provider.observe_information_messages(
                     lifetime="test_case"
@@ -1592,7 +1592,7 @@ class StateForActualGivenExecution:
                         status_reason=str(origin or "unexpected/flaky pass"),
                         metadata={"traceback": tb},
                     )
-                    deliver_observation(tc)
+                    deliver_observation(tc, ran_example.observability)
 
                 # Whether or not replay actually raised the exception again, we want
                 # to print the reproduce_failure decorator for the failing test case.
@@ -2391,7 +2391,7 @@ def given(
                             status=status,
                             backend_metadata=data.provider.observe_test_case(),
                         )
-                        deliver_observation(tc)
+                        deliver_observation(tc, data.observability)
                         state._timing_features = {}
 
                 assert isinstance(data.provider, BytestringProvider)

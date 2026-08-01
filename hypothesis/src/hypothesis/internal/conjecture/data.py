@@ -8,6 +8,7 @@
 # v. 2.0. If a copy of the MPL was not distributed with this file, You can
 # obtain one at https://mozilla.org/MPL/2.0/.
 
+import dataclasses
 import math
 import time
 from collections import defaultdict
@@ -68,7 +69,11 @@ from hypothesis.internal.floats import (
     sign_aware_lte,
 )
 from hypothesis.internal.intervalsets import IntervalSet
-from hypothesis.internal.observability import ObservabilityConfig, PredicateCounts
+from hypothesis.internal.observability import (
+    CallbackThreadT,
+    ObservabilityConfig,
+    PredicateCounts,
+)
 from hypothesis.reporting import debug_report
 from hypothesis.utils.conventions import not_set
 from hypothesis.utils.deprecation import note_deprecation
@@ -656,9 +661,6 @@ class ConjectureData:
         self.length: int = 0
         self.index: int = 0
         self.notes: list[str] = []
-        # The observability configuration in effect for this test case, or None
-        # if observability is disabled.
-        self.observability: ObservabilityConfig | None = ObservabilityConfig.current()
         self.status: Status = Status.VALID
         self.frozen: bool = False
         self.testcounter: int = threadlocal.global_test_counter
@@ -676,6 +678,35 @@ class ConjectureData:
             provider(self, **provider_kw) if isinstance(provider, type) else provider
         )
         assert isinstance(self.provider, PrimitiveProvider)
+
+        # The observability configuration in effect for this test case, or
+        # None if observability is disabled: the user-level config, unioned
+        # with any config the provider declared. A provider passed in as an
+        # instance (which the engine does exactly when a lifetime =
+        # "test_function" backend generates this test case) has its
+        # on_observation wired up as a callback, so it only ever sees
+        # observations for test cases it generated.
+        self.observability: ObservabilityConfig | None = ObservabilityConfig.current()
+        if not isinstance(provider, type):
+            provider_config = self.provider.observability
+            if provider_config is None and self.provider.add_observability_callback:
+                note_deprecation(
+                    "PrimitiveProvider.add_observability_callback is deprecated. "
+                    "Set the PrimitiveProvider.observability attribute to an "
+                    "ObservabilityConfig instead.",
+                    since="RELEASEDAY",
+                    has_codemod=False,
+                )
+                provider_config = ObservabilityConfig(coverage=False, callbacks=())
+            if provider_config is not None:
+                # cast is safe because on_observation is only ever delivered
+                # test_case observations.
+                on_observation = cast(CallbackThreadT, self.provider.on_observation)
+                provider_config = dataclasses.replace(
+                    provider_config,
+                    callbacks=(*provider_config.callbacks, on_observation),
+                )
+                self.observability = self.observability | provider_config
 
         self.__result: ConjectureResult | None = None
 

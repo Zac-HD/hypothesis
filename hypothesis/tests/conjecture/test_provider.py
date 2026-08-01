@@ -17,6 +17,7 @@ import warnings
 from contextlib import contextmanager, nullcontext
 from random import Random
 from threading import RLock
+from typing import ClassVar
 
 import pytest
 
@@ -52,12 +53,17 @@ from hypothesis.internal.conjecture.providers import (
 )
 from hypothesis.internal.floats import SIGNALING_NAN, clamp
 from hypothesis.internal.intervalsets import IntervalSet
-from hypothesis.internal.observability import Observation, _callbacks
+from hypothesis.internal.observability import (
+    ObservabilityConfig,
+    Observation,
+    _callbacks,
+)
 
 from tests.common.debug import minimal
 from tests.common.utils import (
     capture_observations,
     capture_out,
+    checks_deprecated_behaviour,
 )
 from tests.conjecture.common import nodes
 
@@ -761,7 +767,7 @@ def test_replay_choices():
 
 
 class ObservationProvider(TrivialProvider):
-    add_observability_callback = True
+    observability = ObservabilityConfig(coverage=False, callbacks=())
 
     def __init__(self, conjecturedata: "ConjectureData", /) -> None:
         super().__init__(conjecturedata)
@@ -802,6 +808,51 @@ def test_on_observation_alternates_on_failure():
 
     with pytest.raises(ValueError, match="unique identifier"):
         f()
+
+
+class ConfigObservationProvider(TrivialProvider):
+    observability = ObservabilityConfig(coverage=False, choices=True, callbacks=())
+    observations: ClassVar[list[Observation]] = []
+
+    def on_observation(self, observation: Observation) -> None:
+        type(self).observations.append(observation)
+
+
+@temp_register_backend("observation_config", ConfigObservationProvider)
+def test_provider_observability_config():
+    @given(st.integers())
+    @settings(backend="observation_config", max_examples=5)
+    def f(n):
+        pass
+
+    ConfigObservationProvider.observations.clear()
+    f()
+
+    observations = ConfigObservationProvider.observations
+    assert observations
+    assert all(o.type == "test_case" for o in observations)
+    # the provider asked for choices but not coverage, even though
+    # observability is not otherwise enabled
+    assert all(o.metadata.choice_nodes is not None for o in observations)
+    assert all(o.coverage is None for o in observations)
+
+
+class DeprecatedCallbackProvider(TrivialProvider):
+    add_observability_callback = True
+
+    def on_observation(self, observation: Observation) -> None:
+        pass
+
+
+@temp_register_backend("deprecated_observation", DeprecatedCallbackProvider)
+@checks_deprecated_behaviour
+def test_add_observability_callback_deprecated():
+    @given(st.integers())
+    @settings(backend="deprecated_observation", max_examples=2)
+    def f(n):
+        pass
+
+    f()
 
 
 @temp_register_backend("observation", TrivialProvider)

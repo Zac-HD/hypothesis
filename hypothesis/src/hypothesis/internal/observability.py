@@ -404,7 +404,9 @@ def with_observability_callback(
         remove_observability_callback(f)
 
 
-def deliver_observation(observation: Observation) -> None:
+def deliver_observation(
+    observation: Observation, config: ObservabilityConfig | None = None
+) -> None:
     thread_id = threading.get_ident()
 
     for callback in _callbacks.get(thread_id, []):
@@ -412,6 +414,10 @@ def deliver_observation(observation: Observation) -> None:
 
     for callback in _callbacks_all_threads:
         callback(observation, thread_id)
+
+    if config is not None:
+        for callback in config.callbacks:
+            callback(observation)
 
 
 class _TestcaseCallbacks:

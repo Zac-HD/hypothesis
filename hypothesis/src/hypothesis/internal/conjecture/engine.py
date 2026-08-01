@@ -14,7 +14,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Generator, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from enum import Enum
@@ -69,7 +69,6 @@ from hypothesis.internal.conjecture.providers import (
 from hypothesis.internal.conjecture.shrinker import Shrinker, ShrinkPredicateT, sort_key
 from hypothesis.internal.escalation import InterestingOrigin
 from hypothesis.internal.healthcheck import fail_health_check
-from hypothesis.internal.observability import Observation, with_observability_callback
 from hypothesis.reporting import base_report, report, verbose_report
 
 # In most cases, the following constants are all Final. However, we do allow users
@@ -982,29 +981,9 @@ class ConjectureRunner:
 
         self.debug(f"{len(data.choices)} choices -> {status}\n\t{data.choices}")
 
-    def observe_for_provider(self) -> AbstractContextManager:
-        def on_observation(observation: Observation) -> None:
-            assert observation.type == "test_case"
-            # because lifetime == "test_function"
-            assert isinstance(self.provider, PrimitiveProvider)
-            # only fire if we actually used that provider to generate this observation
-            if not self._switch_to_hypothesis_provider:
-                self.provider.on_observation(observation)
-
-        if (
-            self.settings.backend != "hypothesis"
-            # only for lifetime = "test_function" providers (guaranteed
-            # by this isinstance check)
-            and isinstance(self.provider, PrimitiveProvider)
-            # and the provider opted-in to observations
-            and self.provider.add_observability_callback
-        ):
-            return with_observability_callback(on_observation)
-        return nullcontext()
-
     def run(self) -> None:
         _maybe_evict_observations()
-        with local_settings(self.settings), self.observe_for_provider():
+        with local_settings(self.settings):
             try:
                 self._run()
             except RunIsComplete:

@@ -62,7 +62,11 @@ from hypothesis.internal.floats import (
     next_up,
 )
 from hypothesis.internal.intervalsets import IntervalSet
-from hypothesis.internal.observability import InfoObservationType, TestCaseObservation
+from hypothesis.internal.observability import (
+    InfoObservationType,
+    ObservabilityConfig,
+    TestCaseObservation,
+)
 from hypothesis.internal.statistics import (
     LogStudentTDistribution,
     PiecewiseDistribution,
@@ -451,13 +455,28 @@ class PrimitiveProvider(abc.ABC):
     #: Only set this to ``True`` if it is necessary for your backend.
     avoid_realization: ClassVar[bool] = False
 
-    #: If ``True``, |PrimitiveProvider.on_observation| will be added as a
-    #: callback via |add_observability_callback|, enabling observability during
-    # the lifetime of this provider. If ``False``, |PrimitiveProvider.on_observation|
-    #: will never be called by Hypothesis.
+    #: The observability options this provider needs while it is generating
+    #: test cases, as an ``ObservabilityConfig``, or ``None`` (the default) if
+    #: this provider does not use observability.
     #:
-    #: The opt-in behavior of observability is because enabling observability
+    #: If set, Hypothesis takes the union of this config with any user-level
+    #: observability configuration for every test case this provider generates,
+    #: and calls |PrimitiveProvider.on_observation| with each resulting
+    #: observation. For example, a provider which needs the choice sequence
+    #: but not coverage information might set
+    #: ``observability = ObservabilityConfig(coverage=False, choices=True, callbacks=())``.
+    #:
+    #: Observability is opt-in for providers because enabling it
     #: might increase runtime or memory usage.
+    observability: ObservabilityConfig | None = None
+
+    #: .. warning::
+    #:
+    #:     Deprecated in favor of |PrimitiveProvider.observability|, which
+    #:     allows specifying what data the provider needs, and will eventually
+    #:     be removed. Setting this to ``True`` is treated as
+    #:     ``observability = ObservabilityConfig(coverage=False, callbacks=())``,
+    #:     with a deprecation warning.
     add_observability_callback: ClassVar[bool] = False
 
     def __init__(self, conjecturedata: Optional["ConjectureData"], /) -> None:
@@ -652,14 +671,15 @@ class PrimitiveProvider(abc.ABC):
         """
         Called at the end of each |test case| which uses this provider, with the same
         ``observation["type"] == "test_case"`` observation that is passed to
-        other callbacks added via |add_observability_callback|. This method is not
+        other observability callbacks. This method is not
         called with ``observation["type"] in {"info", "alert", "error"}``
         observations.
 
         .. important::
 
             For |PrimitiveProvider.on_observation| to be called by Hypothesis,
-            |PrimitiveProvider.add_observability_callback| must be set to ``True``.
+            |PrimitiveProvider.observability| must be set to an
+            ``ObservabilityConfig``.
 
             |PrimitiveProvider.on_observation| is explicitly opt-in, as enabling
             observability might increase runtime or memory usage.
