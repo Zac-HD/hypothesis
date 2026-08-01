@@ -68,11 +68,7 @@ from hypothesis.internal.floats import (
     sign_aware_lte,
 )
 from hypothesis.internal.intervalsets import IntervalSet
-from hypothesis.internal.observability import (
-    ObservabilityConfig,
-    PredicateCounts,
-    current_observability,
-)
+from hypothesis.internal.observability import ObservabilityConfig, PredicateCounts
 from hypothesis.reporting import debug_report
 from hypothesis.utils.conventions import not_set
 from hypothesis.utils.deprecation import note_deprecation
@@ -662,7 +658,7 @@ class ConjectureData:
         self.notes: list[str] = []
         # The observability configuration in effect for this test case, or None
         # if observability is disabled.
-        self.observability: ObservabilityConfig | None = current_observability()
+        self.observability: ObservabilityConfig | None = ObservabilityConfig.current()
         self.status: Status = Status.VALID
         self.frozen: bool = False
         self.testcounter: int = threadlocal.global_test_counter
@@ -1237,7 +1233,7 @@ class ConjectureData:
                     f"while generating {key.removeprefix('generate:')!r} from {strategy!r}",
                 )
                 raise
-            if self.observability is not None:
+            if self.observability:
                 avoid = self.provider.avoid_realization
                 self._observability_args[key] = to_jsonable(v, avoid_realization=avoid)
             return v

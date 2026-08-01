@@ -72,7 +72,7 @@ def assume(condition: object) -> Literal[True]:
             has_codemod=False,
         )
     context = _current_build_context.value
-    observability = context is not None and context.data.observability is not None
+    observability = context is not None and bool(context.data.observability)
     if observability or not condition:
         where = _calling_function_location("assume", inspect.currentframe())
         if observability:
@@ -283,7 +283,7 @@ def note(value: object) -> None:
     """
     should_report = should_note()
     context = _current_build_context.value
-    observability = context is not None and context.data.observability is not None
+    observability = context is not None and bool(context.data.observability)
     if should_report or observability:
         if not isinstance(value, str):
             value = pretty(value)

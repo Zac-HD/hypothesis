@@ -46,7 +46,6 @@ from hypothesis.internal.observability import (
     TestCaseObservation,
     add_observability_callback,
     choices_to_json,
-    current_observability,
     nodes_to_json,
     observability_enabled,
     remove_observability_callback,
@@ -692,14 +691,14 @@ def test_observability_config_union():
 
 
 @skipif_threading
-def test_current_observability():
+def test_current_observability_config():
     with restore_callbacks():
         hypothesis.internal.observability._callbacks = {}
         hypothesis.internal.observability._callbacks_all_threads = []
-        assert current_observability() is None
+        assert ObservabilityConfig.current() is None
 
         with with_observability_callback(lambda observation: None):
-            assert current_observability() == ObservabilityConfig(
+            assert ObservabilityConfig.current() == ObservabilityConfig(
                 coverage=hypothesis.internal.observability.OBSERVABILITY_COLLECT_COVERAGE,
                 choices=hypothesis.internal.observability.OBSERVABILITY_CHOICES,
             )

@@ -77,6 +77,11 @@ class ObservabilityConfig:
 
     Currently internal-only. This will become part of the public API when
     observability is stabilized.
+
+    The boolean attributes here may generalize to enums in future - for
+    example, distinguishing line and branch coverage, or choice values from
+    choice nodes - with ``True`` and ``False`` remaining as shorthand for the
+    default-enabled and disabled values respectively.
     """
 
     #: Whether to include the ``coverage`` field in test case observations.
@@ -96,31 +101,34 @@ class ObservabilityConfig:
             return self
         if not isinstance(other, ObservabilityConfig):
             return NotImplemented
+        # max() rather than `or`, so that this generalizes to ordered enums
+        # ("collect the most detail either config asks for").
         return ObservabilityConfig(
-            coverage=self.coverage or other.coverage,
-            choices=self.choices or other.choices,
+            coverage=max(self.coverage, other.coverage),
+            choices=max(self.choices, other.choices),
             callbacks=self.callbacks
             + tuple(f for f in other.callbacks if f not in self.callbacks),
         )
 
     __ror__ = __or__
 
+    @classmethod
+    def current(cls) -> "ObservabilityConfig | None":
+        """
+        The observability configuration in effect for newly-created test cases,
+        or ``None`` if observability is disabled.
 
-def current_observability() -> "ObservabilityConfig | None":
-    """
-    The observability configuration in effect for newly-created test cases,
-    or ``None`` if observability is disabled.
-
-    For now, this is derived from the callback registry and the
-    ``OBSERVABILITY_COLLECT_COVERAGE`` and ``OBSERVABILITY_CHOICES`` globals.
-    It will instead be derived from settings once observability is stabilized.
-    """
-    if not observability_enabled():
-        return None
-    return ObservabilityConfig(
-        coverage=OBSERVABILITY_COLLECT_COVERAGE,
-        choices=OBSERVABILITY_CHOICES,
-    )
+        For now, this is derived from the callback registry and the
+        ``OBSERVABILITY_COLLECT_COVERAGE`` and ``OBSERVABILITY_CHOICES``
+        globals. It will instead be derived from settings once observability
+        is stabilized.
+        """
+        if not observability_enabled():
+            return None
+        return cls(
+            coverage=OBSERVABILITY_COLLECT_COVERAGE,
+            choices=OBSERVABILITY_CHOICES,
+        )
 
 
 @dataclass(slots=True, frozen=False)
@@ -472,7 +480,7 @@ def make_testcase(
     # being modified.
     assert data.frozen
 
-    include_choices = data.observability is not None and data.observability.choices
+    include_choices = bool(data.observability and data.observability.choices)
 
     if status_reason is not None:
         pass

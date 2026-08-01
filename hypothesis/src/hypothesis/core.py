@@ -692,7 +692,7 @@ def execute_explicit_examples(state, wrapped_test, arguments, kwargs, original_s
                     )
 
                 empty_data.freeze()
-                if empty_data.observability is not None:
+                if empty_data.observability:
                     tc = make_testcase(
                         run_start=state._start_timestamp,
                         property=state.test_identifier,
@@ -1005,7 +1005,7 @@ class StateForActualGivenExecution:
 
         self._string_repr = ""
         text_repr = None
-        if self.settings.deadline is None and data.observability is None:
+        if self.settings.deadline is None and not data.observability:
 
             @proxies(self.test)
             def test(*args, **kwargs):
@@ -1096,7 +1096,7 @@ class StateForActualGivenExecution:
                     )
                 report(printer.getvalue())
 
-            if data.observability is not None:
+            if data.observability:
                 printer = RepresentationPrinter(context=context)
                 printer.repr_call(
                     test.__name__,
@@ -1130,7 +1130,7 @@ class StateForActualGivenExecution:
                 if data._stateful_repr_parts is not None:
                     self._string_repr = "\n".join(data._stateful_repr_parts)
 
-                if data.observability is not None:
+                if data.observability:
                     printer = RepresentationPrinter(context=context)
                     for name, value in data._observability_args.items():
                         if name.startswith("generate:Draw "):
@@ -1341,7 +1341,7 @@ class StateForActualGivenExecution:
             except BackendCannotProceed:
                 data.events = {}
 
-            if data.observability is not None and not backend_cannot_proceed:
+            if data.observability and not backend_cannot_proceed:
                 if runner := getattr(self, "_runner", None):
                     phase = runner._current_phase
                 else:  # pragma: no cover  # in case of messing with internals
@@ -1577,7 +1577,7 @@ class StateForActualGivenExecution:
                 raise NotImplementedError("This should be unreachable")
             finally:
                 ran_example.freeze()
-                if ran_example.observability is not None:
+                if ran_example.observability:
                     # log our observability line for the final failing test case
                     tc = make_testcase(
                         run_start=self._start_timestamp,
@@ -2377,7 +2377,7 @@ def given(
                     status = Status.INTERESTING
                     raise
                 finally:
-                    if data.observability is not None:
+                    if data.observability:
                         data.freeze()
                         tc = make_testcase(
                             run_start=state._start_timestamp,

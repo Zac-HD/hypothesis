@@ -187,7 +187,7 @@ def get_state_machine_test(
                 # _add_results_to_targets, to avoid printing arguments which are also
                 # a return value using the variable name they are assigned to.
                 # See https://github.com/HypothesisWorks/hypothesis/issues/2341
-                if print_steps or cd.observability is not None:
+                if print_steps or cd.observability:
                     data_to_print = {
                         k: machine._pretty_print(v) for k, v in data.items()
                     }
@@ -224,7 +224,7 @@ def get_state_machine_test(
                             HealthCheck.return_value,
                         )
                 finally:
-                    if print_steps or cd.observability is not None:
+                    if print_steps or cd.observability:
                         # 'result' is only used if the step has target bundles.
                         # If it does, and the result is a 'MultipleResult',
                         # then 'print_step' prints a multi-variable assignment.
@@ -471,7 +471,7 @@ class RuleBasedStateMachine(metaclass=StateMachineMeta):
             if (
                 current_build_context().is_final
                 or settings.verbosity >= Verbosity.debug
-                or current_build_context().data.observability is not None
+                or current_build_context().data.observability
             ):
                 output(f"state.{name}()")
             start = perf_counter()
