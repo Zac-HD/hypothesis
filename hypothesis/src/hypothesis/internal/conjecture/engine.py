@@ -16,13 +16,14 @@ from collections import defaultdict
 from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import date, timedelta
 from enum import Enum
 from random import Random
 from typing import Literal, NoReturn, cast
 
 from hypothesis import HealthCheck, Phase, Verbosity, settings as Settings
 from hypothesis._settings import local_settings
+from hypothesis.configuration import storage_directory
 from hypothesis.database import ExampleDatabase, choices_from_bytes, choices_to_bytes
 from hypothesis.errors import (
     BackendCannotProceed,
@@ -107,6 +108,23 @@ MIN_TEST_CALLS: int = 10
 # to make it easier to reason about our global random warning logic (see
 # deprecate_random_in_strategy).
 _random = Random()
+
+# used to evict old .hypothesis/observed files at most once per process.
+_have_evicted_observations = False
+
+
+def _maybe_evict_observations() -> None:
+    global _have_evicted_observations
+
+    # Remove observation files more than a week old, to cap the size on disk.
+    if not _have_evicted_observations:
+        _have_evicted_observations = True
+        max_age = (date.today() - timedelta(days=8)).isoformat()
+        for p in storage_directory("observed", intent_to_write=False).path.glob(
+            "*.jsonl"
+        ):  # pragma: no cover
+            if p.stem < max_age:
+                p.unlink(missing_ok=True)
 
 
 def shortlex(s):
@@ -985,6 +1003,7 @@ class ConjectureRunner:
         return nullcontext()
 
     def run(self) -> None:
+        _maybe_evict_observations()
         with local_settings(self.settings), self.observe_for_provider():
             try:
                 self._run()

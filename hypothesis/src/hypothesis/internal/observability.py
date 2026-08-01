@@ -22,7 +22,7 @@ import warnings
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
@@ -68,6 +68,59 @@ CallbackT: TypeAlias = CallbackThreadT | CallbackAllThreadsT
 _callbacks: dict[int | None, list[CallbackThreadT]] = {}
 # callbacks where all_threads=True was set
 _callbacks_all_threads: list[CallbackAllThreadsT] = []
+
+
+@dataclass(frozen=True)
+class ObservabilityConfig:
+    """
+    Fine-grained configuration of |observability|.
+
+    Currently internal-only. This will become part of the public API when
+    observability is stabilized.
+    """
+
+    #: Whether to include the ``coverage`` field in test case observations.
+    coverage: bool = True
+    #: Whether to include the ``metadata.choice_nodes`` and
+    #: ``metadata.choice_spans`` fields in test case observations.
+    choices: bool = False
+    #: Callbacks to deliver observations to.
+    callbacks: tuple[CallbackThreadT, ...] = ()
+
+    def __or__(self, other: "ObservabilityConfig | None") -> "ObservabilityConfig":
+        """
+        The union of two configs collects the union of what either config
+        collects, and delivers to the callbacks of both.
+        """
+        if other is None:
+            return self
+        if not isinstance(other, ObservabilityConfig):
+            return NotImplemented
+        return ObservabilityConfig(
+            coverage=self.coverage or other.coverage,
+            choices=self.choices or other.choices,
+            callbacks=self.callbacks
+            + tuple(f for f in other.callbacks if f not in self.callbacks),
+        )
+
+    __ror__ = __or__
+
+
+def current_observability() -> "ObservabilityConfig | None":
+    """
+    The observability configuration in effect for newly-created test cases,
+    or ``None`` if observability is disabled.
+
+    For now, this is derived from the callback registry and the
+    ``OBSERVABILITY_COLLECT_COVERAGE`` and ``OBSERVABILITY_CHOICES`` globals.
+    It will instead be derived from settings once observability is stabilized.
+    """
+    if not observability_enabled():
+        return None
+    return ObservabilityConfig(
+        coverage=OBSERVABILITY_COLLECT_COVERAGE,
+        choices=OBSERVABILITY_CHOICES,
+    )
 
 
 @dataclass(slots=True, frozen=False)
@@ -419,6 +472,8 @@ def make_testcase(
     # being modified.
     assert data.frozen
 
+    include_choices = data.observability is not None and data.observability.choices
+
     if status_reason is not None:
         pass
     elif data.interesting_origin:
@@ -469,8 +524,8 @@ def make_testcase(
                 "data_status": data.status,
                 "phase": phase,
                 "interesting_origin": data.interesting_origin,
-                "choice_nodes": data.nodes if OBSERVABILITY_CHOICES else None,
-                "choice_spans": data.spans if OBSERVABILITY_CHOICES else None,
+                "choice_nodes": data.nodes if include_choices else None,
+                "choice_spans": data.spans if include_choices else None,
                 **_system_metadata(),
                 # unpack last so it takes precedence for duplicate keys
                 **(metadata or {}),
@@ -485,9 +540,7 @@ _WROTE_TO: set[Path] = set()
 _deliver_to_file_lock = Lock()
 
 
-def _deliver_to_file(
-    observation: Observation, thread_id: int
-) -> None:  # pragma: no cover
+def _deliver_to_file(observation: Observation) -> None:  # pragma: no cover
     from hypothesis.strategies._internal.utils import to_jsonable
 
     kind = "testcases" if observation.type == "test_case" else "info"
@@ -559,10 +612,7 @@ if (
     "HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY" in os.environ
     or OBSERVABILITY_COLLECT_COVERAGE is False
 ):  # pragma: no cover
-    add_observability_callback(_deliver_to_file, all_threads=True)
-
-    # Remove files more than a week old, to cap the size on disk
-    max_age = (date.today() - timedelta(days=8)).isoformat()
-    for p in storage_directory("observed", intent_to_write=False).path.glob("*.jsonl"):
-        if p.stem < max_age:  # pragma: no branch
-            p.unlink(missing_ok=True)
+    add_observability_callback(
+        lambda observation, thread_id: _deliver_to_file(observation),
+        all_threads=True,
+    )

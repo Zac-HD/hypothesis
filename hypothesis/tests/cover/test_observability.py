@@ -42,9 +42,11 @@ from hypothesis.internal.intervalsets import IntervalSet
 from hypothesis.internal.observability import (
     TESTCASE_CALLBACKS,
     InfoObservation,
+    ObservabilityConfig,
     TestCaseObservation,
     add_observability_callback,
     choices_to_json,
+    current_observability,
     nodes_to_json,
     observability_enabled,
     remove_observability_callback,
@@ -667,6 +669,40 @@ def test_observability_callbacks():
         remove_observability_callback(f)
         assert _callbacks() == {}
         assert not observability_enabled()
+
+
+def test_observability_config_union():
+    def f(observation):
+        pass
+
+    def g(observation):
+        pass
+
+    a = ObservabilityConfig(coverage=False, choices=True, callbacks=(f,))
+    b = ObservabilityConfig(coverage=True, choices=False, callbacks=(f, g))
+    union = ObservabilityConfig(coverage=True, choices=True, callbacks=(f, g))
+
+    assert a | None == a
+    assert None | a == a
+    assert a | b == union
+    assert b | a == union
+
+    with pytest.raises(TypeError):
+        a | 42
+
+
+@skipif_threading
+def test_current_observability():
+    with restore_callbacks():
+        hypothesis.internal.observability._callbacks = {}
+        hypothesis.internal.observability._callbacks_all_threads = []
+        assert current_observability() is None
+
+        with with_observability_callback(lambda observation: None):
+            assert current_observability() == ObservabilityConfig(
+                coverage=hypothesis.internal.observability.OBSERVABILITY_COLLECT_COVERAGE,
+                choices=hypothesis.internal.observability.OBSERVABILITY_CHOICES,
+            )
 
 
 @skipif_threading

@@ -41,7 +41,6 @@ from hypothesis.internal.conjecture.engine import BUFFER_SIZE
 from hypothesis.internal.conjecture.junkdrawer import gc_cumulative_time
 from hypothesis.internal.conjecture.utils import calc_label_from_name
 from hypothesis.internal.healthcheck import fail_health_check
-from hypothesis.internal.observability import observability_enabled
 from hypothesis.internal.reflection import (
     function_digest,
     get_pretty_function_description,
@@ -188,7 +187,7 @@ def get_state_machine_test(
                 # _add_results_to_targets, to avoid printing arguments which are also
                 # a return value using the variable name they are assigned to.
                 # See https://github.com/HypothesisWorks/hypothesis/issues/2341
-                if print_steps or observability_enabled():
+                if print_steps or cd.observability is not None:
                     data_to_print = {
                         k: machine._pretty_print(v) for k, v in data.items()
                     }
@@ -225,7 +224,7 @@ def get_state_machine_test(
                             HealthCheck.return_value,
                         )
                 finally:
-                    if print_steps or observability_enabled():
+                    if print_steps or cd.observability is not None:
                         # 'result' is only used if the step has target bundles.
                         # If it does, and the result is a 'MultipleResult',
                         # then 'print_step' prints a multi-variable assignment.
@@ -472,7 +471,7 @@ class RuleBasedStateMachine(metaclass=StateMachineMeta):
             if (
                 current_build_context().is_final
                 or settings.verbosity >= Verbosity.debug
-                or observability_enabled()
+                or current_build_context().data.observability is not None
             ):
                 output(f"state.{name}()")
             start = perf_counter()
