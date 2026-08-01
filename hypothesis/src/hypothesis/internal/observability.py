@@ -549,6 +549,10 @@ _deliver_to_file_lock = Lock()
 
 
 def _deliver_to_file(observation: Observation) -> None:  # pragma: no cover
+    # This callback may be invoked concurrently, from every thread which runs
+    # tests, and is therefore responsible for its own thread-safety - as is
+    # any other observability callback which may receive observations from
+    # more than one thread.
     from hypothesis.strategies._internal.utils import to_jsonable
 
     kind = "testcases" if observation.type == "test_case" else "info"
@@ -559,12 +563,12 @@ def _deliver_to_file(observation: Observation) -> None:  # pragma: no cover
     observation_bytes = (
         json.dumps(to_jsonable(observation, avoid_realization=False)) + "\n"
     )
-    # only allow one conccurent file write to avoid write races. This is likely to make
-    # HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY quite slow under threading. A queue
-    # would be an improvement, but that requires a background thread, and I
-    # would prefer to avoid a thread in the single-threaded case. We could
-    # switch over to a queue if we detect multithreading, but it's tricky to get
-    # right.
+    # a global lock serializes writes, keeping each observation line atomic.
+    # This is likely to make file-based observability quite slow under
+    # threading. A queue would be an improvement, but that requires a
+    # background thread, and I would prefer to avoid a thread in the
+    # single-threaded case. We could switch over to a queue if we detect
+    # multithreading, but it's tricky to get right.
     with _deliver_to_file_lock:
         _WROTE_TO.add(observation_p)
         with observation_p.open(mode="a") as f:
