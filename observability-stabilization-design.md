@@ -104,6 +104,14 @@ class ObservabilityConfig:
   the engine) unioned copies; aliasing bugs from in-place mutation are not
   worth the convenience. `__post_init__` converts any iterable `callbacks` to a
   tuple via `object.__setattr__`.
+- **Enum-ready booleans.** The boolean attributes are not necessarily final:
+  we may later want e.g. line *and branch* coverage, or choices as
+  values/nodes/spans, which would generalize each field to an ordered enum.
+  Design for that now: `True`/`False` stay valid forever as shorthand for the
+  default-enabled and disabled enum values, the union takes `max()` per field
+  ("collect the most detail either side asks for") rather than `or`, and
+  disabled enum values are falsy (`IntEnum` with `NONE = 0`) so
+  `config.coverage`-style truthiness checks keep working across the change.
 - **Union**: `a | b` returns a config with `coverage=a.coverage or b.coverage`,
   `choices=a.choices or b.choices`, and the callbacks of `a` followed by those
   of `b` not already present. `config | None == config`, `None` handled via
