@@ -71,9 +71,9 @@ from hypothesis import settings, ObservabilityConfig
 - `hypothesis.ObservabilityConfig` — exported at top level, like `Phase`/`Verbosity`.
 - `settings.observability` — validated to `ObservabilityConfig | None`
   (`True` normalizes to `ObservabilityConfig()`; `False`/`None` to `None`).
-  Inherits like every other setting; the *default profile* value comes from the
-  `HYPOTHESIS_OBSERVABILITY` env var (`1/0/true/false`, case-insensitive) and
-  is otherwise `None`.
+  Inherits like every other setting; defaults to `None` (or, during the
+  deprecation cycle only, to the value implied by the legacy experimental env
+  vars).
 - A new **public module `hypothesis.observability`** as the stable home for the
   supporting types (implementation can stay in `internal/observability.py` and
   be re-exported):
@@ -138,17 +138,15 @@ Every `ConjectureData` gets an attribute set at construction time:
 data.observability: ObservabilityConfig | None
 ```
 
-computed by whoever creates the data object:
-
-- In `ConjectureRunner`: `settings.observability | provider_config`, where
-  `provider_config` is the active backend's contribution (see §2.4) — and only
-  when the backend actually generates this test case (i.e. not while
-  `_switch_to_hypothesis_provider` is set, and not during shrinking with the
-  hypothesis provider). The current callback-time guard in
-  `observe_for_provider` becomes structural: test cases the backend didn't
-  generate simply never carry its callbacks.
-- In `core.py` for the paths that build their own data (explicit examples,
-  `reproduce_failure`, final-failure replay): `state.settings.observability`.
+computed **by the `ConjectureData` constructor itself**: the user-level
+config (from settings), unioned with the provider's contribution (§2.4) when
+the provider was passed in as an *instance* — which is exactly how the engine
+passes a lifetime=`"test_function"` backend while it is generating, and never
+how it passes the hypothesis provider during shrinking or after switching
+away from a backend. The current callback-time guard in
+`observe_for_provider` becomes structural: test cases the backend didn't
+generate simply never carry its callbacks, with no engine-side plumbing at
+all.
 
 Everything that currently asks "is observability on, and what should I
 collect?" *during a test case* consults `data.observability` instead of global
@@ -210,11 +208,11 @@ class PrimitiveProvider(abc.ABC):
 - Empty `callbacks=()` is legal in provider-level configs (delivery comes from
   the union with the user's config and/or `on_observation`); this is why the
   ≥1-callback check belongs in settings validation, not in the dataclass.
-- `add_observability_callback: ClassVar[bool]` is currently documented but
-  provisional: keep it working for one release cycle — if a provider sets it
-  and does not set `observability`, treat it as
-  `observability = ObservabilityConfig(coverage=False, callbacks=())` and warn.
-  Then delete.
+- `add_observability_callback: ClassVar[bool]` is **deprecated** as soon as
+  `PrimitiveProvider.observability` lands: setting it (without setting
+  `observability`) is treated as
+  `observability = ObservabilityConfig(coverage=False, callbacks=())`, with a
+  `note_deprecation` warning. Deleted after the usual cycle.
 - Behavior fix we get for free: today, a backend opting into observations
   flips `observability_enabled()` on globally, which silently enables coverage
   tracing of e.g. crosshair-executed tests. Under this design a backend only
@@ -233,16 +231,47 @@ class PrimitiveProvider(abc.ABC):
   stabilization, but the docs should note that heavy multi-threaded use may
   prefer a custom callback.
 
-### 2.6 Env vars
+### 2.6 Thread-safety
+
+How this all behaves under multithreaded test execution:
+
+- **Configuration is per-thread by construction.** `settings` are thread-local
+  (`DynamicVariable` over `threading.local`), and the default profile is
+  shared by every thread — so a config set on the default/active profile
+  applies to all threads (the replacement for `all_threads=True`), while
+  per-test `@settings` apply on whichever thread runs that test. The effective
+  config is captured onto each `ConjectureData` at creation, on the thread
+  that will run it, so nothing consults shared mutable state mid-test-case.
+- **Delivery is synchronous on the producing thread.** Callbacks are invoked
+  on the thread which ran the test case, immediately after it. A callback that
+  wants the thread identity calls `threading.get_ident()` itself.
+- **Callback thread-safety is the definer's problem.** Because a single config
+  (e.g. on the default profile) can receive observations from many threads,
+  its callbacks may be invoked concurrently; the documented contract is that
+  callbacks are responsible for their own synchronization. `deliver_to_file`
+  honors this itself: a module-level lock serializes writes so each jsonl line
+  is atomic (established in step 1, before the callback becomes public).
+  The known contention cost under heavy threading is the deferred
+  queue+writer-thread follow-up.
+- The legacy registry keeps its existing semantics until removal: per-thread
+  registration plus the two-argument `all_threads=True` form.
+
+### 2.7 Env vars
+
+**Decision: there is deliberately no supported environment variable for
+observability.** Environment-based configuration is the user's job via
+settings profiles (`settings.register_profile` conditioned on whatever
+variables they prefer); Hypothesis does not read observability env vars as
+part of the supported API. The existing experimental variables keep working
+through a deprecation cycle, now that a proper mechanism exists:
 
 | Variable | Fate |
 |---|---|
-| `HYPOTHESIS_OBSERVABILITY` | **New.** `1/true` → default profile gets `ObservabilityConfig()`; `0/false` → `None`; anything else → error at import. Boolean-only for now; comma-separated tokens (`choices`, `nocover`, …) are an easy backwards-compatible extension later, so we deliberately don't design them in yet. |
 | `HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY` | Works + `note_deprecation` for ≥6 months, then removed. |
 | `HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY_CHOICES` | Works (maps to `ObservabilityConfig(choices=True)`) + deprecation, then removed. |
 | `HYPOTHESIS_EXPERIMENTAL_OBSERVABILITY_NOCOVER` | Removed without deprecation (as in #4563; it was experimental, and its main constituency was pre-3.12 `sys.settrace` overhead). `ObservabilityConfig(coverage=False)` is the replacement. |
 
-### 2.7 What is removed / deprecated, and the migration story
+### 2.8 What is removed / deprecated, and the migration story
 
 | Today | Final design |
 |---|---|
@@ -259,7 +288,7 @@ above except `NOCOVER` costs us almost nothing to shim for one deprecation
 cycle, and the known consumers are worth being gentle with:
 
 - **Tyche** — file-based; unaffected except env var rename. Coordinate so its
-  docs recommend `HYPOTHESIS_OBSERVABILITY=1` (per liam's note on #4387).
+  docs recommend a settings profile enabling observability (per liam's note on #4387).
 - **HypoFuzz** — uses the callback registry and the `OBSERVABILITY_CHOICES` /
   `COLLECT_COVERAGE` globals; we control it, migrate it in lockstep, and its
   needs (in-memory delivery, choices on, coverage via its own tracer) are all
@@ -267,7 +296,7 @@ cycle, and the known consumers are worth being gentle with:
 - **hypothesis-crosshair** — `add_observability_callback = True` provider;
   the one-cycle shim in §2.4 covers it until it sets `observability = ...`.
 
-### 2.8 Data format
+### 2.9 Data format
 
 Unchanged from master/#4563: `choice_nodes` (type, value, constraints,
 was_forced) and `choice_spans` (`[label, start, end, discarded]`) under
@@ -311,8 +340,8 @@ crosshair tests; PR to hypothesis-crosshair.
 
 **Step 4 — the public API** *(minor release; the heart of #4563, now much
 smaller)*
-`settings(observability=...)` + validation, `HYPOTHESIS_OBSERVABILITY` env
-var, `hypothesis.ObservabilityConfig` export, public
+`settings(observability=...)` + validation,
+`hypothesis.ObservabilityConfig` export, public
 `hypothesis.observability` module (`deliver_to_file`, observation types), and
 switch the default profile / env-var plumbing over. The engine's
 "effective config" source becomes `settings.observability` instead of the
@@ -362,5 +391,6 @@ steps 2–3 are the new work that answers the review feedback.
 5. **Thread-id delivery**: is dropping the `all_threads=True` two-argument
    callback form acceptable for HypoFuzz? (Callbacks run on the producing
    thread, so `threading.get_ident()` recovers it; recommend yes.)
-6. **`HYPOTHESIS_OBSERVABILITY` richer values now or later?** Recommend later
-   (boolean-only is forward-compatible with token lists).
+6. ~~`HYPOTHESIS_OBSERVABILITY` richer values now or later?~~ **Resolved: no
+   observability environment variable at all** — users condition settings
+   profiles on env vars themselves.
