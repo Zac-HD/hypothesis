@@ -12,6 +12,8 @@ mypy
 # drop this pin after we drop python 3.11.
 numpy<2.5
 pelican[markdown]
+# pip-compile crashes under pip 26.2; drop this pin once pip-tools supports it.
+pip<26.2
 pip-tools
 pyright
 python-dateutil

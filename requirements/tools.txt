@@ -391,6 +391,8 @@ zizmor==1.28.0
 
 # The following packages are considered to be unsafe in a requirements file:
 pip==26.1.2
-    # via pip-tools
+    # via
+    #   -r requirements/tools.in
+    #   pip-tools
 setuptools==83.0.0
     # via pip-tools
