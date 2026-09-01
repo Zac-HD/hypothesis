@@ -822,7 +822,9 @@ tests pass unchanged, except that the listener tests now close their database at
 ## 13. Benchmarks
 
 The code is in `hypothesis/benchmark/database/`, and its README describes the workloads.
-The figures below come from one run of 8 seconds per configuration.
+The figures below come from one run of 8 seconds per configuration, on the code as it
+stands. Since the first run, Redis is faster everywhere, because each call takes one
+round trip, not two. The other backends changed by less than the noise.
 
 ### The test machine, and what that means for the figures
 
@@ -841,24 +843,24 @@ Operations per second. A `core` operation is one `read_many` of three keys, or t
 
 | backend | mode | 1 proc | 4 procs | 16 procs | 64 procs |
 |---|---|---|---|---|---|
-| memory | direct | 26,776 | | | |
-| directory | direct | 3,793 | 8,213 | 8,034 | 7,686 |
-| sqlite | direct | 8,167 | 15,762 | 15,173 | 13,194 |
-| redis | direct | 2,670 | 8,570 | 9,763 | 6,484 |
-| postgres | direct | 1,044 | 7,597 | 6,522 | 4,915 |
-| sqlite | server | 2,959 | 4,468 | 5,422 | 5,499 |
+| memory | direct | 32,912 | |  | |
+| directory | direct | 3,909 | 8,734 | 8,102 | 8,014 |
+| sqlite | direct | 9,084 | 16,766 | 14,804 | 13,965 |
+| redis | direct | 3,176 | 9,422 | 11,220 | 8,654 |
+| postgres | direct | 2,401 | 7,946 | 6,587 | 4,766 |
+| sqlite | server | 3,139 | 4,826 | 5,868 | 5,650 |
 
 Latency at 4 processes, p50 / p99, in µs:
 
 | backend | three `fetch` calls | one `read_many` | `save` |
 |---|---|---|---|
-| directory | 437 / 1,028 | 452 / 1,031 | 368 / 959 |
-| sqlite | 240 / 591 | 199 / 516 | 167 / 4,215 |
-| redis | 720 / 1,746 | 319 / 947 | 463 / 1,137 |
-| postgres | 627 / 1,449 | 433 / 948 | 721 / 1,364 |
+| directory | 412 / 935 | 428 / 971 | 291 / 776 |
+| sqlite | 230 / 553 | 193 / 472 | 136 / 3,365 |
+| redis | 665 / 1,750 | 290 / 908 | 275 / 852 |
+| postgres | 624 / 1,035 | 425 / 748 | 702 / 1,168 |
 
-- `read_many` halves the cost of reading a test's keys from Redis or Postgres, which is
-  what section 7 predicted. Local backends gain little.
+- `read_many` cuts the cost of reading a test's keys by a factor of 2.3 on Redis, and 1.5
+  on Postgres, as section 7 predicted. Local backends gain little.
 - Plain Hypothesis should connect directly. The local server adds a hop, and it is
   for fuzzing, where writes are frequent.
 
@@ -868,20 +870,20 @@ Operations per second, for the `fuzz` workload at full speed.
 
 | backend | mode | 1 proc | 4 procs | 16 procs | 64 procs | server µs/op |
 |---|---|---|---|---|---|---|
-| memory | server | 44,834 | 78,442 | 70,698 | 62,977 | 12 |
-| directory | direct | 3,152 | 6,609 | 2,039 | 2,043 | |
-| directory | server | 2,750 | 2,863 | 1,860 | 2,598 | 353 |
-| sqlite | direct | 3,188 | 5,297 | 4,789 | 2,367 | |
-| sqlite | server | 9,732 | 9,500 | 9,926 | 7,862 | 71 |
-| redis | direct | 2,426 | 6,851 | 10,186 | 7,174 | |
-| redis | server | 10,985 | 10,243 | 10,134 | 8,636 | 55 |
-| postgres | direct | 1,224 | 4,813 | 3,702 | 2,965 | |
-| postgres | server | 5,036 | 5,000 | 5,092 | 4,783 | 98 |
+| memory | server | 47,678 | 93,900 | 83,508 | 65,238 | 12 |
+| directory | direct | 3,052 | 5,220 | 2,282 | 1,894 | |
+| directory | server | 1,839 | 1,713 | 1,643 | 2,878 | 320 |
+| sqlite | direct | 3,257 | 6,478 | 4,882 | 3,472 | |
+| sqlite | server | 8,938 | 9,339 | 9,829 | 10,201 | 65 |
+| redis | direct | 3,312 | 10,339 | 15,161 | 7,684 | |
+| redis | server | 12,462 | 11,982 | 12,205 | 10,604 | 43 |
+| postgres | direct | 1,099 | 4,943 | 4,052 | 2,328 | |
+| postgres | server | 5,739 | 5,262 | 5,779 | 3,981 | 95 |
 
-- Through the local server, SQLite, Redis, and Postgres write 2 to 4 times as fast as one
+- Through the local server, SQLite, Redis, and Postgres write 3 to 5 times as fast as one
   process writing directly. The server batches, so the number of client processes hardly
   matters.
-- A queued write returns in 5 to 6 µs at the median, and 60 µs at p99.
+- A queued write returns in 5 to 6 µs at the median, and in 30 to 100 µs at p99.
 - The design load in section 10 is about 10 writes per second per machine. Every backend
   has a hundred times that, on one machine. The central store's capacity is what matters.
 - The directory database gains nothing from batching, because its emulation does file
@@ -893,13 +895,13 @@ Latency in µs, p50 / p99, to load 200 entries with 3 kB observations, at 4 proc
 
 | backend | mode | old layout, one `fetch` per entry | one `map_items` | speed-up |
 |---|---|---|---|---|
-| directory | direct | 9,700 / 13,793 | 10,205 / 14,856 | none |
-| sqlite | direct | 7,447 / 11,110 | 1,315 / 1,994 | 5.7× |
-| redis | direct | 59,163 / 94,294 | 4,480 / 7,935 | 13× |
-| postgres | direct | 43,944 / 57,189 | 5,620 / 8,058 | 7.8× |
-| sqlite | server | 105,956 / 145,161 | 3,454 / 6,120 | 31× |
-| redis | server | 205,859 / 243,037 | 6,986 / 17,703 | 29× |
-| postgres | server | 248,783 / 325,879 | 10,890 / 29,819 | 23× |
+| directory | direct | 9,998 / 14,846 | 10,522 / 15,621 | none |
+| sqlite | direct | 6,998 / 11,085 | 1,234 / 1,932 | 5.7× |
+| redis | direct | 57,622 / 90,336 | 4,172 / 6,332 | 14× |
+| postgres | direct | 44,272 / 61,921 | 5,836 / 8,968 | 7.6× |
+| sqlite | server | 104,879 / 130,184 | 3,540 / 7,144 | 30× |
+| redis | server | 190,466 / 283,346 | 6,612 / 20,102 | 29× |
+| postgres | server | 225,606 / 262,732 | 10,427 / 28,758 | 22× |
 
 - Loading a corpus in one read is the largest gain in this design. Across a network, the
   old layout's cost grows with the round-trip time, and the new one's does not.
@@ -914,16 +916,16 @@ that follows all 101 partitions. Every change arrived, and no cursor expired.
 
 | backend | mode | procs | p50 | p99 | max |
 |---|---|---|---|---|---|
-| sqlite | direct | 4 | 5.2 | 14.7 | 90 |
-| sqlite | direct | 16 | 5.7 | 40.4 | 189 |
-| redis | direct | 4 | 1.4 | 4.0 | 61 |
-| redis | direct | 16 | 1.9 | 10.5 | 48 |
-| postgres | direct | 4 | 2.3 | 8.2 | 55 |
-| postgres | direct | 16 | 3.6 | 40.1 | 233 |
-| memory | server | 4 | 11.3 | 28.6 | 88 |
-| sqlite | server | 4 | 17.4 | 107.6 | 166 |
-| redis | server | 4 | 16.7 | 66.5 | 148 |
-| postgres | server | 4 | 22.8 | 140.6 | 197 |
+| sqlite | direct | 4 | 5.1 | 12.3 | 40 |
+| sqlite | direct | 16 | 5.4 | 29.5 | 190 |
+| redis | direct | 4 | 1.0 | 2.7 | 49 |
+| redis | direct | 16 | 1.2 | 3.1 | 40 |
+| postgres | direct | 4 | 2.1 | 10.2 | 40 |
+| postgres | direct | 16 | 3.2 | 19.1 | 182 |
+| memory | server | 4 | 11.0 | 18.5 | 47 |
+| sqlite | server | 4 | 15.2 | 80.4 | 126 |
+| redis | server | 4 | 15.4 | 70.5 | 135 |
+| postgres | server | 4 | 20.9 | 164.7 | 216 |
 
 - Through the server, lag includes three batching windows of 5 ms: the client's, the
   journal thread's, and the reply's. That is a deliberate trade for throughput.
@@ -937,10 +939,10 @@ The question was whether SQLite should replace the directory database as a defau
 
 For plain Hypothesis:
 
-- SQLite reads twice as fast: 8,200 against 3,800 operations per second in one process,
-  and 15,800 against 8,200 in four.
-- In absolute terms that is small. The difference is about 250 µs per test, so about
-  1.3 seconds for a suite of 5,000 tests.
+- SQLite reads twice as fast: 9,100 against 3,900 operations per second in one process,
+  and 16,800 against 8,700 in four.
+- In absolute terms that is small. The difference is about 240 µs per test, so about
+  1.2 seconds for a suite of 5,000 tests.
 - SQLite's writes have a worse p99 when several processes write, because writers take
   turns. Plain Hypothesis writes rarely, so this matters little.
 - SQLite needs a local filesystem, because its write-ahead log uses shared memory. The
@@ -950,8 +952,8 @@ For plain Hypothesis:
 
 For HypoFuzz, behind the local server:
 
-- SQLite writes 3.5 times as fast as the directory database: 9,700 against 2,800
-  operations per second.
+- SQLite writes 3.5 to 5.5 times as fast as the directory database, across two runs. In
+  the second, it did 9,300 operations per second against 1,700, with four processes.
 - SQLite's journal works, with a p50 lag of 5 ms. The directory database's journal comes
   from watchdog, whose tests are skipped as flaky.
 
