@@ -44,19 +44,20 @@ from hypothesis.database import (
     ReadOpT,
     WriteOpT,
     _check_atomic,
-    _events_from_change,
+    _Connections,
     _is_conditional,
     _journal_change,
+    _JournalBatch,
+    _ListenerThread,
     _NativeDatabase,
     _not_applied,
-    _positions,
+    _unpack_position,
 )
 from hypothesis.internal.dbcodec import (
     KeyPartT,
     KeyTupleT,
     decode,
     encode,
-    make_cursor,
     short_hash,
 )
 
@@ -94,65 +95,60 @@ _WHERE_FIELD = "ns = %(ns)s AND kh = %(kh)s AND fh = %(fh)s AND key = %(key)s AN
 # Applies every operation for one partition, in one statement, which is one
 # transaction. Returns NULL if the batch is atomic and a condition failed.
 _APPLY_FUNCTION = """
-CREATE OR REPLACE FUNCTION hypothesis_apply_v1(
+CREATE OR REPLACE FUNCTION hypothesis_apply_v2(
     p_ns text, p_ph bytea, p_lock bigint, p_channel text, p_sync boolean,
     p_atomic boolean, p_inline int, p_ops smallint[], p_keys bytea[], p_khs bytea[],
     p_fields bytea[], p_fhs bytea[], p_values bytea[], p_ttls float8[],
-    p_counts int[], p_befores bytea[], p_modes smallint[], p_expects bytea[]
+    p_counts int[], p_befores bytea[], p_ids bytea[], p_modes smallint[],
+    p_expects bytea[]
 ) RETURNS bytea[] LANGUAGE plpgsql AS $$
 DECLARE
     results bytea[] := '{}';
     now_s float8 := extract(epoch from now());
     n int := coalesce(array_length(p_ops, 1), 0);
     cur bytea;
-    present boolean;
-    meta record;
-    new_id bytea;
-    cut bytea;
-    removed bigint;
-    k bigint;
+    failed boolean;
 BEGIN
     IF NOT p_sync THEN
         PERFORM set_config('synchronous_commit', 'off', true);
     END IF;
     PERFORM pg_advisory_xact_lock(p_lock);
+    -- Check every condition first, so that an atomic batch can apply nothing.
     FOR i IN 1..n LOOP
-        IF p_ops[i] IN (1, 2) THEN
+        failed := false;
+        IF p_modes[i] > 0 THEN
             SELECT value INTO cur FROM hypothesis_maps
             WHERE ns = p_ns AND kh = p_khs[i] AND fh = p_fhs[i] AND key = p_keys[i]
             AND field = p_fields[i] AND (exp IS NULL OR exp > now_s);
-            present := FOUND;
-            IF (p_modes[i] = 1 AND present)
-               OR (p_modes[i] = 2 AND (NOT present OR cur IS DISTINCT FROM p_expects[i])) THEN
-                IF p_atomic THEN
-                    RETURN NULL;
-                END IF;
-                results := array_append(results, '\\x00'::bytea);
-                CONTINUE;
-            END IF;
+            failed := (p_modes[i] = 1 AND FOUND)
+                OR (p_modes[i] = 2 AND (NOT FOUND OR cur IS DISTINCT FROM p_expects[i]));
         END IF;
-        IF p_atomic THEN
-            CONTINUE;
+        IF failed AND p_atomic THEN
+            RETURN NULL;
+        ELSIF failed THEN
+            results := array_append(results, '\\x00'::bytea);
+        ELSIF NOT p_atomic THEN
+            results := array_append(results, hypothesis_apply_one_v2(
+                p_ns, p_ph, now_s, p_inline, p_ops[i], p_keys[i], p_khs[i], p_fields[i],
+                p_fhs[i], p_values[i], p_ttls[i], p_counts[i], p_befores[i], p_ids[i]));
         END IF;
-        results := array_append(results, hypothesis_apply_one_v1(
-            p_ns, p_ph, now_s, p_inline, p_ops[i], p_keys[i], p_khs[i], p_fields[i],
-            p_fhs[i], p_values[i], p_ttls[i], p_counts[i], p_befores[i]));
     END LOOP;
     IF p_atomic THEN
         FOR i IN 1..n LOOP
-            results := array_append(results, hypothesis_apply_one_v1(
+            results := array_append(results, hypothesis_apply_one_v2(
                 p_ns, p_ph, now_s, p_inline, p_ops[i], p_keys[i], p_khs[i], p_fields[i],
-                p_fhs[i], p_values[i], p_ttls[i], p_counts[i], p_befores[i]));
+                p_fhs[i], p_values[i], p_ttls[i], p_counts[i], p_befores[i], p_ids[i]));
         END LOOP;
     END IF;
     PERFORM pg_notify(p_channel, '');
     RETURN results;
 END $$;
 
-CREATE OR REPLACE FUNCTION hypothesis_apply_one_v1(
+-- p_ids holds the ids of entries to delete, 16 bytes each, one after another.
+CREATE OR REPLACE FUNCTION hypothesis_apply_one_v2(
     p_ns text, p_ph bytea, now_s float8, p_inline int, p_op smallint, p_key bytea,
     p_kh bytea, p_field bytea, p_fh bytea, p_value bytea, p_ttl float8,
-    p_count int, p_before bytea
+    p_count int, p_before bytea, p_ids bytea
 ) RETURNS bytea LANGUAGE plpgsql AS $$
 DECLARE
     cur bytea;
@@ -160,6 +156,7 @@ DECLARE
     meta record;
     new_id bytea;
     cut bytea;
+    doomed bytea;
     removed bigint := 0;
     k bigint;
 BEGIN
@@ -221,6 +218,18 @@ BEGIN
         END IF;
         RETURN new_id;
     END IF;
+    -- Entries deleted by id are journaled. Trims are not.
+    FOR j IN 0 .. coalesce(length(p_ids), 0) / 16 - 1 LOOP
+        doomed := substring(p_ids FROM j * 16 + 1 FOR 16);
+        DELETE FROM hypothesis_logs WHERE ns = p_ns AND kh = p_kh AND id = doomed
+        RETURNING value INTO cur;
+        IF FOUND THEN
+            removed := removed + 1;
+            INSERT INTO hypothesis_journal (ns, at, ph, op, key, eid, value)
+            VALUES (p_ns, now_s, p_ph, 2, p_key, doomed,
+                    CASE WHEN length(cur) <= p_inline THEN cur END);
+        END IF;
+    END LOOP;
     IF p_before IS NOT NULL THEN
         DELETE FROM hypothesis_logs WHERE ns = p_ns AND kh = p_kh AND id < p_before;
         GET DIAGNOSTICS k = ROW_COUNT;
@@ -241,10 +250,10 @@ END $$;
 """
 
 _APPLY = """
-SELECT hypothesis_apply_v1(
+SELECT hypothesis_apply_v2(
     %s, %s, %s, %s, %s, %s, %s, %s::smallint[], %s::bytea[], %s::bytea[],
     %s::bytea[], %s::bytea[], %s::bytea[], %s::float8[], %s::int[], %s::bytea[],
-    %s::smallint[], %s::bytea[]
+    %s::bytea[], %s::smallint[], %s::bytea[]
 )
 """
 
@@ -262,6 +271,33 @@ FROM s LEFT JOIN LATERAL (
 """
 
 
+class _PostgresListener(_ListenerThread):
+    """Follows every partition in the namespace, for the old listener API."""
+
+    def __init__(self, db: "PostgresExampleDatabase") -> None:
+        super().__init__(db)
+        self.pg = db
+        self.conn = db._connect()
+        self.listen_conn = psycopg.connect(db.conninfo, autocommit=True)
+        for i in range(_CHANNELS):
+            self.listen_conn.execute(f"LISTEN {db._channel_name(i)}")
+        self.position = db._xmin_position(self.conn)
+
+    def fetch(self) -> list[Change]:
+        _, rows = self.pg._read_journal(self.conn, self.position, None, 1000)
+        if rows:
+            self.position = (rows[-1][0], rows[-1][1])
+        return [_row_change(row) for row in rows]
+
+    def wait(self) -> None:
+        for _ in self.listen_conn.notifies(timeout=0.25, stop_after=1):
+            pass
+
+    def release(self) -> None:
+        self.conn.close()
+        self.listen_conn.close()
+
+
 class PostgresExampleDatabase(_NativeDatabase):
     """Store examples in a Postgres database, given a libpq connection string.
 
@@ -269,6 +305,8 @@ class PostgresExampleDatabase(_NativeDatabase):
     Each thread that uses the database opens its own connection, and following
     the journal opens one more.
     """
+
+    _listener_thread_class = _PostgresListener
 
     def __init__(
         self,
@@ -281,20 +319,17 @@ class PostgresExampleDatabase(_NativeDatabase):
         super().__init__()
         self.conninfo = conninfo
         self.namespace = namespace
+        # Without synchronous commit, a crash can lose the last fraction of a
+        # second of writes, but never corrupts anything. That suits a cache.
         self.synchronous_commit = synchronous_commit
-        # A crash can lose the last fraction of a second of writes, but never
-        # corrupts anything. That suits a cache.
         self.journal_retention = journal_retention
         self._ns_hash = short_hash(namespace.encode())[:4].hex()
-        self._local = threading.local()
+        self._connections = _Connections(self._connect)
         self._next_cleanup = time.time() + 1
         self._journal_lock = threading.Lock()
         self._journal_conn: Any = None
         self._journal_pid = 0
         self._channels: set[str] = set()
-        self._listen_stop: threading.Event | None = None
-        self._listen_thread: threading.Thread | None = None
-        self._listen_position: tuple[int, int] = (0, 0)
 
     def __repr__(self) -> str:
         return (
@@ -348,16 +383,12 @@ class PostgresExampleDatabase(_NativeDatabase):
         # Reads the catalog, which takes no locks on the tables.
         row = conn.execute(
             "SELECT to_regclass('hypothesis_journal_at') IS NULL "
-            "OR to_regproc('hypothesis_apply_one_v1') IS NULL"
+            "OR to_regproc('hypothesis_apply_one_v2') IS NULL"
         ).fetchone()
         return bool(row[0])
 
     def _conn(self) -> psycopg.Connection:
-        conn = getattr(self._local, "conn", None)
-        if conn is None or conn.closed or self._local.pid != os.getpid():
-            conn = self._local.conn = self._connect()
-            self._local.pid = os.getpid()
-        return conn
+        return self._connections.get()
 
     def _params(self, key: KeyTupleT) -> dict[str, Any]:
         ek = encode(key)
@@ -372,8 +403,11 @@ class PostgresExampleDatabase(_NativeDatabase):
     def _partition_hash(partition: KeyPartT) -> bytes:
         return short_hash(encode((partition,)))
 
+    def _channel_name(self, index: int) -> str:
+        return f"hypothesis_{self._ns_hash}_{index}"
+
     def _channel(self, ph: bytes) -> str:
-        return f"hypothesis_{self._ns_hash}_{ph[0] % _CHANNELS}"
+        return self._channel_name(ph[0] % _CHANNELS)
 
     def _lock_id(self, ph: bytes) -> int:
         return int.from_bytes(
@@ -429,28 +463,31 @@ class PostgresExampleDatabase(_NativeDatabase):
     # Writes
 
     def _apply_args(self, ph: bytes, ops: list[WriteOpT], atomic: bool) -> list[Any]:
-        columns: list[list[Any]] = [[] for _ in range(11)]
+        """The arguments to hypothesis_apply_v2, with one array per column."""
+        rows = []
         for op in ops:
             ek = encode(op.key)
             ef = encode(op.field) if isinstance(op, (MapPut, MapDelete)) else None
             mode, expect = 0, None
             if _is_conditional(op):
                 mode, expect = (1, None) if op.expect is None else (2, op.expect)
-            row = [
-                _OP_CODES[type(op)],
-                ek,
-                short_hash(ek),
-                ef,
-                None if ef is None else short_hash(ef),
-                getattr(op, "value", None),
-                getattr(op, "ttl", None),
-                getattr(op, "maxlen", None),
-                getattr(op, "before", None),
-                mode,
-                expect,
-            ]
-            for column, value in zip(columns, row, strict=True):
-                column.append(value)
+            ids = op.ids if isinstance(op, LogTrim) else ()
+            rows.append(
+                (
+                    _OP_CODES[type(op)],
+                    ek,
+                    short_hash(ek),
+                    ef,
+                    None if ef is None else short_hash(ef),
+                    getattr(op, "value", None),
+                    getattr(op, "ttl", None),
+                    getattr(op, "maxlen", None),
+                    getattr(op, "before", None),
+                    b"".join(ids) if ids else None,
+                    mode,
+                    expect,
+                )
+            )
         return [
             self.namespace,
             ph,
@@ -459,7 +496,7 @@ class PostgresExampleDatabase(_NativeDatabase):
             self.synchronous_commit,
             atomic,
             INLINE_VALUE_LIMIT,
-            *columns,
+            *map(list, zip(*rows, strict=True)),
         ]
 
     def write_many(self, ops: Sequence[WriteOpT], *, atomic: bool = False) -> list[Any]:
@@ -500,20 +537,6 @@ class PostgresExampleDatabase(_NativeDatabase):
             return int(bytes(reply))
         return None
 
-    def _log_delete(self, key: KeyTupleT, entry_id: bytes) -> None:
-        params = {**self._params(key), "id": entry_id}
-        self._conn().execute(
-            """
-            WITH d AS (
-                DELETE FROM hypothesis_logs
-                WHERE ns = %(ns)s AND kh = %(kh)s AND id = %(id)s RETURNING 1
-            )
-            UPDATE hypothesis_log_meta SET count = count - (SELECT count(*) FROM d)
-            WHERE ns = %(ns)s AND kh = %(kh)s
-            """,
-            params,
-        )
-
     def _cleanup(self, conn: psycopg.Connection) -> None:
         self._next_cleanup = time.time() + min(10.0, self.journal_retention / 4)
         params = {"ns": self.namespace, "retention": self.journal_retention}
@@ -551,14 +574,12 @@ class PostgresExampleDatabase(_NativeDatabase):
 
     # Journal
 
-    def journal_head(self, partition: KeyPartT) -> bytes:
-        row = (
-            self._conn()
-            .execute("SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint")
-            .fetchone()
-        )
+    def _xmin_position(self, conn: psycopg.Connection) -> tuple[int, int]:
+        row = conn.execute(
+            "SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint"
+        ).fetchone()
         # Every transaction before xmin has finished, so it is safe to skip.
-        return make_cursor(struct.pack(">qq", row[0] - 1, _MAX_ID))
+        return (row[0] - 1, _MAX_ID)
 
     def _read_journal(
         self,
@@ -597,122 +618,58 @@ class PostgresExampleDatabase(_NativeDatabase):
         timeout: float | None = 0,
         limit: int | None = None,
     ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
-        positions = _positions(cursors, self.journal_retention, ">qq")
-        if not positions:
-            return [], {}
-        by_hash = {self._partition_hash(p): p for p in positions}
+        # One connection listens for wake-ups, and it is not thread-safe.
         with self._journal_lock:
-            # LISTEN before reading, so that no wake-up is missed.
-            self._listen({self._channel(ph) for ph in by_hash})
-            conn = self._conn()
-            deadline = None if timeout is None else time.monotonic() + timeout
-            while True:
-                low = min(pos for pos, _ in positions.values())
-                xmin, rows = self._read_journal(conn, low, list(by_hash), limit)
-                changes = []
-                for xid, id_, ph, op, key, field, eid, value in rows:
-                    if (xid, id_) > positions[by_hash[bytes(ph)]][0]:
-                        changes.append(
-                            _journal_change(
-                                op,
-                                bytes(key),
-                                _bytes(field),
-                                _bytes(eid),
-                                _bytes(value),
-                            )
-                        )
-                truncated = limit is not None and len(rows) == limit
-                upto = (rows[-1][0], rows[-1][1]) if truncated else (xmin - 1, _MAX_ID)
-                issued = time.time()
-                positions = {
-                    p: (max(pos, upto), issued_at if truncated else issued)
-                    for p, (pos, issued_at) in positions.items()
-                }
-                remaining = None if deadline is None else deadline - time.monotonic()
-                if changes or (remaining is not None and remaining <= 0):
-                    return changes, {
-                        p: make_cursor(struct.pack(">qq", *pos), issued_at)
-                        for p, (pos, issued_at) in positions.items()
-                    }
-                wait = 1.0 if remaining is None else min(remaining, 1.0)
-                woken = any(
-                    True
-                    for _ in self._journal_conn.notifies(timeout=wait, stop_after=1)
-                )
-                # Take every other pending wake-up too, so that one read serves them all.
-                while woken and any(
-                    True for _ in self._journal_conn.notifies(timeout=0, stop_after=1)
-                ):
-                    pass
-                if not woken and remaining is not None and wait >= remaining:
-                    deadline = time.monotonic()
+            return super().journal_read(cursors, timeout=timeout, limit=limit)
 
-    # The old listener API, fed by a thread that follows the whole namespace.
+    def _journal_position(self, partition: KeyPartT) -> bytes:
+        return struct.pack(">qq", *self._xmin_position(self._conn()))
 
-    def _start_listening(self) -> None:
-        stop = self._listen_stop = threading.Event()
-        conn = self._connect()
-        listen_conn = psycopg.connect(self.conninfo, autocommit=True)
-        for i in range(_CHANNELS):
-            listen_conn.execute(f"LISTEN hypothesis_{self._ns_hash}_{i}")
-        row = conn.execute(
-            "SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint"
-        ).fetchone()
-        self._listen_position = (row[0] - 1, _MAX_ID)
+    def _journal_fetch(
+        self, positions: Mapping[KeyPartT, bytes], limit: int | None
+    ) -> _JournalBatch:
+        unpacked = {p: _unpack_position(">qq", pos) for p, pos in positions.items()}
+        by_hash = {self._partition_hash(p): p for p in unpacked}
+        # LISTEN before reading, so that no wake-up is missed.
+        self._listen({self._channel(ph) for ph in by_hash})
+        xmin, rows = self._read_journal(
+            self._conn(), min(unpacked.values()), list(by_hash), limit
+        )
+        changes = [
+            _row_change(row)
+            for row in rows
+            if (row[0], row[1]) > unpacked[by_hash[bytes(row[2])]]
+        ]
+        truncated = limit is not None and len(rows) == limit
+        upto = (rows[-1][0], rows[-1][1]) if truncated else (xmin - 1, _MAX_ID)
+        return _JournalBatch(
+            changes,
+            {p: struct.pack(">qq", *max(pos, upto)) for p, pos in unpacked.items()},
+            set(unpacked) if truncated else set(),
+        )
 
-        def run() -> None:
-            try:
-                while not stop.is_set():
-                    _, rows = self._read_journal(
-                        conn, self._listen_position, None, 1000
-                    )
-                    for xid, id_, _, op, key, field, eid, value in rows:
-                        change = _journal_change(
-                            op, bytes(key), _bytes(field), _bytes(eid), _bytes(value)
-                        )
-                        for event in _events_from_change(change):
-                            self._broadcast_change(event)
-                        self._listen_position = (xid, id_)
-                    if not rows:
-                        for _ in listen_conn.notifies(timeout=0.05, stop_after=1):
-                            pass
-            finally:
-                conn.close()
-                listen_conn.close()
-
-        self._listen_thread = threading.Thread(target=run, daemon=True)
-        self._listen_thread.start()
-
-    def _stop_listening(self) -> None:
-        assert self._listen_stop is not None
-        assert self._listen_thread is not None
-        self._listen_stop.set()
-        self._listen_thread.join()
-        self._listen_thread = self._listen_stop = None
-
-    def _wait_for_listeners(self, timeout: float = 10) -> None:
-        """Wait until listeners have seen every change committed so far."""
-        conn = self._conn()
-        row = conn.execute(
-            "SELECT xid::text::bigint, id FROM hypothesis_journal WHERE ns = %s "
-            "ORDER BY xid DESC, id DESC LIMIT 1",
-            (self.namespace,),
-        ).fetchone()
-        target = (row[0], row[1]) if row else (0, 0)
-        # Wait in real time, with Event.wait, even if the clock is faked.
-        pause = threading.Event()
-        for _ in range(int(timeout / 0.01)):
-            if self._listen_thread is None or not (self._listen_position < target):
-                return
-            pause.wait(0.01)
-        raise TimeoutError("listener thread did not catch up")
+    def _journal_wait(self, batch: _JournalBatch, timeout: float | None) -> None:
+        wait = 1.0 if timeout is None else min(timeout, 1.0)
+        if any(True for _ in self._journal_conn.notifies(timeout=wait, stop_after=1)):
+            # Take every other pending wake-up too, so that one read serves them all.
+            while any(
+                True for _ in self._journal_conn.notifies(timeout=0, stop_after=1)
+            ):
+                pass
 
     def close(self) -> None:
-        """Close this thread's connection, and the journal's connection."""
-        for conn in (getattr(self._local, "conn", None), self._journal_conn):
-            if conn is not None:
-                conn.close()
-        self._local.conn = self._journal_conn = None
+        super().close()
+        self._connections.close()
+        with self._journal_lock:
+            if self._journal_conn is not None and self._journal_pid == os.getpid():
+                self._journal_conn.close()
+            self._journal_conn = None
+            self._channels = set()
+
+
+def _row_change(row: tuple[Any, ...]) -> Change:
+    _xid, _id, _ph, op, key, field, eid, value = row
+    return _journal_change(op, bytes(key), _bytes(field), _bytes(eid), _bytes(value))
 
 
 def _bytes(value: Any) -> bytes | None:

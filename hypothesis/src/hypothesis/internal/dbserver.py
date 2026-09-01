@@ -40,7 +40,7 @@ from hypothesis.database import (
     _JournalBuffer,
 )
 from hypothesis.internal.compat import WINDOWS
-from hypothesis.internal.dbcodec import ENTRY_ID_SIZE, KeyPartT, encode, log_key
+from hypothesis.internal.dbcodec import KeyPartT
 
 
 class _JournalWait:
@@ -125,9 +125,8 @@ class _JournalHub:
             if changes:
                 self.buffer.add(changes)
                 self.wake_loop()
-                time.sleep(
-                    self.linger
-                )  # let more changes arrive, then read them together
+                # Let more changes arrive, then read them together.
+                time.sleep(self.linger)
             with self.lock:
                 for partition, cursor in new.items():
                     if partition in self.backend_cursors:
@@ -268,26 +267,7 @@ class DatabaseServer:
                     conn = self._new_conns.get()
                     clients[conn] = _Client(conn)
                 readable = [c.conn for c in clients.values() if c.pending is None]
-                timeout = self._timeout(clients)
-                before = time.monotonic()
-                found = wait([*readable, self._wake_recv], timeout)
-                if not found and timeout > 0:
-                    # wait() timed out in real time, so the deadlines it waited for
-                    # have passed, even if the clock says otherwise. Tests fake it.
-                    for client in clients.values():
-                        waiting = client.journal
-                        if waiting is None:
-                            continue
-                        if (
-                            waiting.ready_at is not None
-                            and waiting.ready_at - before <= timeout
-                        ):
-                            waiting.ready_at = before
-                        if (
-                            waiting.deadline is not None
-                            and waiting.deadline - before <= timeout
-                        ):
-                            waiting.deadline = before
+                found = wait([*readable, self._wake_recv], self._timeout(clients))
                 for ready in found:
                     if ready is self._wake_recv:
                         try:
@@ -420,8 +400,6 @@ class DatabaseServer:
             return self.db.write_many(ops, atomic=atomic)
         if method == "journal_head":
             return self._hub.head(args[0])
-        if method == "log_delete":
-            return self._log_delete(*args)
         if method == "flush":
             self.db.flush(args[0])
             if client.errors:
@@ -434,13 +412,3 @@ class DatabaseServer:
         if method == "capabilities":
             return self.db.capabilities
         raise ValueError(f"unknown method {method!r}")
-
-    def _log_delete(self, key: tuple, entry_id: bytes) -> None:
-        native = getattr(self.db, "_log_delete", None)
-        if native is not None:
-            native(key, entry_id)
-            return
-        raw = log_key(encode(key))
-        for member in list(self.db.fetch(raw)):
-            if member[:ENTRY_ID_SIZE] == entry_id:
-                self.db.delete(raw, member)

@@ -18,7 +18,11 @@ from hypothesis import settings
 
 from tests.common.utils import time_sleep
 from tests.cover.test_database_backend import _database_conforms_to_listener_api
-from tests.cover.test_database_structured import conforms_to_structured_api
+from tests.cover.test_database_structured import (
+    ForwardingDatabase,
+    conforms_to_structured_api,
+    journal_records_entries_deleted_by_id,
+)
 
 pytest.importorskip("psycopg")
 
@@ -31,10 +35,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _consistently_increment_time():
+    """Use the real clock, not the test suite's fake one, because these tests
+    wait for other threads and processes."""
+
+
 def _database(_path=None):
-    db = PostgresExampleDatabase(POSTGRES_URL, namespace=uuid.uuid4().hex)
-    db._test_cleanup = db.close
-    return db
+    return PostgresExampleDatabase(POSTGRES_URL, namespace=uuid.uuid4().hex)
 
 
 def test_structured_api():
@@ -46,8 +54,8 @@ def test_structured_api():
 def test_listener_api():
     _database_conforms_to_listener_api(
         _database,
-        flush=lambda db: db._wait_for_listeners(),
-        parent_settings=settings(max_examples=5, stateful_step_count=10),
+        flush=None,
+        parent_settings=settings(max_examples=5, stateful_step_count=10, deadline=None),
     )
 
 
@@ -71,6 +79,11 @@ def test_map_entries_expire(make_db):
     time_sleep(1)
     assert db.map_items(("p", "m")) == {("long",): b"2"}
     assert db.map_put(("p", "m"), "short", b"3", expect=None)
+
+
+@pytest.mark.parametrize("wrap", [lambda db: db, ForwardingDatabase])
+def test_journal_records_entries_deleted_by_id(make_db, wrap):
+    journal_records_entries_deleted_by_id(wrap(make_db()))
 
 
 def test_namespaces_are_separate(make_db):

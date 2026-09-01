@@ -34,10 +34,10 @@ from hypothesis.database import (
     _events_from_change,
     _is_conditional,
     _journal_change,
+    _JournalBatch,
     _matches_prefix,
     _NativeDatabase,
     _not_applied,
-    _positions,
     unset,
 )
 from hypothesis.internal.dbcodec import (
@@ -47,7 +47,6 @@ from hypothesis.internal.dbcodec import (
     encode,
     is_legacy,
     log_key,
-    make_cursor,
     make_entry_id,
     split_entry_id,
 )
@@ -202,7 +201,7 @@ if #ARGV[1] <= tonumber(ARGV[6]) then
 end
 journal(KEYS[2], ARGV[5], ARGV[7], fields)
 -- Lua cannot encode base64, so this message is "A", then two length-prefixed
--- strings, then the value.
+-- strings, then the value. A deleted entry's message starts with "D".
 firehose(ARGV[8], 'A' .. #ARGV[9] .. ':' .. ARGV[9] .. #id .. ':' .. id .. ARGV[1])
 return id
 """
@@ -233,9 +232,25 @@ end
 return live
 """
 
-# KEYS: stream. ARGV: maxlen, before.
+# KEYS: stream, journal. ARGV: maxlen, before, ek, retention, wake, firehose
+# channel, legacy key, inline limit, then any ids to delete. Only those are journaled.
 _LOG_TRIM = """
 local removed = 0
+for i = 9, #ARGV do
+  local entry = redis.call('XRANGE', KEYS[1], ARGV[i], ARGV[i])[1]
+  if entry then
+    redis.call('XDEL', KEYS[1], ARGV[i])
+    removed = removed + 1
+    local value = entry[2][2]
+    local fields = {'o', '2', 'k', ARGV[3], 'i', ARGV[i]}
+    if #value <= tonumber(ARGV[8]) then
+      table.insert(fields, 'v')
+      table.insert(fields, value)
+    end
+    journal(KEYS[2], ARGV[4], ARGV[5], fields)
+    firehose(ARGV[6], 'D' .. #ARGV[7] .. ':' .. ARGV[7] .. #ARGV[i] .. ':' .. ARGV[i] .. value)
+  end
+end
 if ARGV[2] ~= '' then removed = removed + redis.call('XTRIM', KEYS[1], 'MINID', ARGV[2]) end
 if ARGV[1] ~= '' then removed = removed + redis.call('XTRIM', KEYS[1], 'MAXLEN', ARGV[1]) end
 return removed
@@ -313,6 +328,8 @@ class RedisExampleDatabase(_NativeDatabase):
         self._journal_lock = threading.Lock()
         self._journal_pubsub: Any = None
         self._wake_partitions: dict[bytes, KeyPartT] = {}
+        self._dirty: set[KeyPartT] = set()
+        self._read_upto: dict[KeyPartT, bytes] = {}
         self._last_swept: dict[KeyPartT, float] = {}
 
     def __repr__(self) -> str:
@@ -443,19 +460,26 @@ class RedisExampleDatabase(_NativeDatabase):
 
     def _queue_write(self, pipe: Any, op: WriteOpT, *, check: bool) -> None:
         retention = int(self.journal_retention * 1000)
+        wake = self._wake_channel(op.key[0])
+        journal = self._journal_key(op.key[0])
+        ek = encode(op.key)
         if isinstance(op, LogTrim):
             self._scripts["log_trim"](
-                keys=[self._log_key(op.key)],
+                keys=[self._log_key(op.key), journal],
                 args=[
                     "" if op.maxlen is None else op.maxlen,
                     "" if op.before is None else _stream_id(op.before),
+                    ek,
+                    retention,
+                    wake,
+                    self.listener_channel,
+                    log_key(ek),
+                    INLINE_VALUE_LIMIT,
+                    *map(_stream_id, op.ids),
                 ],
                 client=pipe,
             )
             return
-        wake = self._wake_channel(op.key[0])
-        journal = self._journal_key(op.key[0])
-        ek = encode(op.key)
         if isinstance(op, LogAppend):
             self._scripts["log_append"](
                 keys=[self._log_key(op.key), journal],
@@ -605,18 +629,14 @@ class RedisExampleDatabase(_NativeDatabase):
                 )
         return currents
 
-    def _log_delete(self, key: KeyTupleT, entry_id: bytes) -> None:
-        self.redis.xdel(self._log_key(key), _stream_id(entry_id))
-
     def current_time(self) -> float:
         seconds, micros = self.redis.time()
         return seconds + micros / 1e6
 
-    # Journal
-
-    def journal_head(self, partition: KeyPartT) -> bytes:
-        last = self.redis.xrevrange(self._journal_key(partition), "+", "-", count=1)
-        return make_cursor(_entry_id(last[0][0]) if last else make_entry_id(0, 0))
+    # Journal. Reading a partition costs a round trip, so it is read only when it
+    # may have changed: when a wake-up arrives on its channel, when the caller is
+    # behind a position that this object has already read, or when its periodic
+    # sweep is due.
 
     def journal_read(
         self,
@@ -625,95 +645,100 @@ class RedisExampleDatabase(_NativeDatabase):
         timeout: float | None = 0,
         limit: int | None = None,
     ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
-        positions = {
-            p: (make_entry_id(*pos), issued)
-            for p, (pos, issued) in _positions(
-                cursors, self.journal_retention, ">QQ"
-            ).items()
-        }
-        if not positions:
-            return [], {}
+        # The pubsub connection is not thread-safe.
         with self._journal_lock:
-            return self._journal_read(positions, timeout, limit)
+            return super().journal_read(cursors, timeout=timeout, limit=limit)
 
-    def _journal_read(
-        self,
-        positions: dict[KeyPartT, tuple[bytes, float]],
-        timeout: float | None,
-        limit: int | None,
-    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
+    def _journal_position(self, partition: KeyPartT) -> bytes:
+        last = self.redis.xrevrange(self._journal_key(partition), "+", "-", count=1)
+        return _entry_id(last[0][0]) if last else _MIN_ID
+
+    def _journal_fetch(
+        self, positions: Mapping[KeyPartT, bytes], limit: int | None
+    ) -> _JournalBatch:
+        for position in positions.values():
+            split_entry_id(position)
         if self._journal_pubsub is None:
             self._journal_pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
-        pubsub = self._journal_pubsub
-        # Read every partition on the first call. After that, read a partition
-        # when it is woken up, or when its periodic sweep is due.
-        dirty = {
-            p for p in positions if self._wake_channel(p) not in self._wake_partitions
+        channels = {
+            self._wake_channel(p): p
+            for p in positions
+            if self._wake_channel(p) not in self._wake_partitions
         }
-        if dirty:
-            channels = {self._wake_channel(p): p for p in dirty}
-            pubsub.subscribe(*channels)
+        if channels:
+            self._journal_pubsub.subscribe(*channels)
             self._wake_partitions.update(channels)
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            while (message := pubsub.get_message(timeout=0)) is not None:
-                if message["type"] == "message":
-                    dirty.add(self._wake_partitions.get(message["channel"]))
-            now = time.monotonic()
-            due = [
-                p
-                for p in positions
-                if p in dirty or now - self._last_swept.get(p, 0) > self._sweep_interval
-            ]
-            changes: list[Change] = []
-            truncated: set[KeyPartT] = set()
-            if due:
-                streams = {
-                    self._journal_key(p): _stream_id(positions[p][0]) for p in due
-                }
-                by_stream = {self._journal_key(p): p for p in due}
-                for stream, entries in self.redis.xread(streams, count=limit) or []:
-                    partition = by_stream[stream]
-                    for stream_id, fields in entries:
-                        if limit is not None and len(changes) >= limit:
-                            truncated.add(partition)
-                            break
-                        changes.append(
-                            _journal_change(
-                                int(fields[b"o"]),
-                                fields[b"k"],
-                                fields.get(b"f"),
-                                _entry_id(fields[b"i"]) if b"i" in fields else None,
-                                fields.get(b"v"),
-                            )
+            self._dirty.update(channels.values())
+        while (message := self._journal_pubsub.get_message(timeout=0)) is not None:
+            self._note_wakeup(message)
+        now = time.monotonic()
+        due = [
+            p
+            for p, position in positions.items()
+            if p in self._dirty
+            or position < self._read_upto.get(p, _MIN_ID)
+            or now - self._last_swept.get(p, 0) > self._sweep_interval
+        ]
+        changes: list[Change] = []
+        cut: set[KeyPartT] = set()
+        new_positions = dict(positions)
+        if due:
+            by_stream = {self._journal_key(p): p for p in due}
+            streams = {self._journal_key(p): _stream_id(positions[p]) for p in due}
+            for stream, entries in self.redis.xread(streams, count=limit) or []:
+                partition = by_stream[stream]
+                for stream_id, fields in entries:
+                    if limit is not None and len(changes) >= limit:
+                        cut.add(partition)
+                        break
+                    changes.append(
+                        _journal_change(
+                            int(fields[b"o"]),
+                            fields[b"k"],
+                            fields.get(b"f"),
+                            _entry_id(fields[b"i"]) if b"i" in fields else None,
+                            fields.get(b"v"),
                         )
-                        positions[partition] = (
-                            _entry_id(stream_id),
-                            positions[partition][1],
-                        )
-                    if limit is not None and len(entries) >= limit:
-                        truncated.add(partition)
-                for p in due:
-                    self._last_swept[p] = now
-                    if p not in truncated:
-                        dirty.discard(p)
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if changes or (remaining is not None and remaining <= 0):
-                issued = time.time()
-                return changes, {
-                    p: make_cursor(pos, issued_at if p in truncated else issued)
-                    for p, (pos, issued_at) in positions.items()
-                }
-            wait = (
-                self._sweep_interval
-                if remaining is None
-                else min(remaining, self._sweep_interval)
-            )
-            message = pubsub.get_message(timeout=max(wait, 0.001))
-            if message is None and remaining is not None and wait >= remaining:
-                deadline = time.monotonic()
-            elif message is not None and message["type"] == "message":
-                dirty.add(self._wake_partitions.get(message["channel"]))
+                    )
+                    new_positions[partition] = _entry_id(stream_id)
+                if limit is not None and len(entries) >= limit:
+                    cut.add(partition)
+            for p in due:
+                self._last_swept[p] = now
+                if p not in cut:
+                    self._dirty.discard(p)
+                    self._read_upto[p] = max(
+                        new_positions[p], self._read_upto.get(p, _MIN_ID)
+                    )
+        return _JournalBatch(changes, new_positions, cut)
+
+    def _journal_wait(self, batch: _JournalBatch, timeout: float | None) -> None:
+        wait = self._sweep_interval
+        if timeout is not None:
+            wait = min(timeout, wait)
+        message = self._journal_pubsub.get_message(timeout=max(wait, 0.001))
+        if message is not None:
+            self._note_wakeup(message)
+
+    def _note_wakeup(self, message: dict) -> None:
+        if message["type"] == "message":
+            partition = self._wake_partitions.get(message["channel"])
+            if partition is not None:
+                self._dirty.add(partition)
+
+    def close(self) -> None:
+        super().close()
+        with self._journal_lock:
+            if self._journal_pubsub is not None:
+                self._journal_pubsub.close()
+                self._journal_pubsub = None
+            for state in (
+                self._wake_partitions,
+                self._dirty,
+                self._read_upto,
+                self._last_swept,
+            ):
+                state.clear()
 
     # The old listener API, fed by the firehose channel.
 
@@ -722,12 +747,13 @@ class RedisExampleDatabase(_NativeDatabase):
         # sent to the client, but not to the pubsub channel.
         assert message["type"] == "message"
         data = message["data"]
-        if data.startswith(b"A"):
+        if data[:1] in (b"A", b"D"):  # a log entry, appended or deleted
             size, rest = data[1:].split(b":", 1)
             key, rest = rest[: int(size)], rest[int(size) :]
             size, rest = rest.split(b":", 1)
             stream_id, value = rest[: int(size)], rest[int(size) :]
-            self._broadcast_change(("save", (key, _entry_id(stream_id) + value)))
+            kind = "save" if data[:1] == b"A" else "delete"
+            self._broadcast_change((kind, (key, _entry_id(stream_id) + value)))
             return
         event_type, (key, value) = json.loads(data)
         self._broadcast_change(

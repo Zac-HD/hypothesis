@@ -160,7 +160,7 @@ def log_key(ek: bytes) -> bytes:
 class LegacyKey(NamedTuple):
     kind: Literal["set", "field", "index", "log"]
     key: KeyTupleT
-    field: KeyTupleT | None = None
+    field: KeyTupleT = ()  # only for the "field" kind
 
 
 def parse_legacy_key(raw: bytes) -> LegacyKey:

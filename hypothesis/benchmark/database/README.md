@@ -1,5 +1,5 @@
 This directory benchmarks the database backends, for the design in
-`guides/database-design.md`. Results are in section 12 of that document.
+`guides/database-design.md`. Results are in section 13 of that document.
 
 To run everything:
 

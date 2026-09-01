@@ -53,6 +53,13 @@ from hypothesis.stateful import (
 from tests.common.utils import wait_for
 from tests.cover.test_database_backend import _database_conforms_to_listener_api
 
+
+@pytest.fixture(autouse=True)
+def _consistently_increment_time():
+    """Use the real clock, not the test suite's fake one, because these tests
+    wait for other threads and processes."""
+
+
 LEGACY_KEYS = [(b"a",), (b"b",)]
 STRUCTURED_KEYS = [(b"a", "m"), (b"a", "n", 1), (b"b", "m"), ("index", "x")]
 MAP_KEYS = LEGACY_KEYS + STRUCTURED_KEYS
@@ -90,6 +97,10 @@ class ForwardingDatabase(ExampleDatabase):
     def _stop_listening(self):
         self._db.remove_listener(self._broadcast_change)
 
+    def close(self):
+        super().close()
+        self._db.close()
+
 
 def _is_suffix(short, long):
     return len(short) <= len(long) and long[len(long) - len(short) :] == short
@@ -98,9 +109,9 @@ def _is_suffix(short, long):
 def conforms_to_structured_api(create_db, *, journal=True, parent_settings=None):
     """Check a database against a model.
 
-    ``create_db`` takes a temporary directory and returns a database. If the
-    database has a ``_test_cleanup`` attribute, it is called at the end. With
-    ``journal=True``, a mirror built from the journal must match the model.
+    ``create_db`` takes a temporary directory and returns a database, which is
+    closed at the end. With ``journal=True``, a mirror built from the journal
+    must match the model.
     """
 
     @settings(
@@ -123,7 +134,7 @@ def conforms_to_structured_api(create_db, *, journal=True, parent_settings=None)
             )
 
         def teardown(self):
-            getattr(self.db, "_test_cleanup", lambda: None)()
+            self.db.close()
             shutil.rmtree(self.tmp, ignore_errors=True)
 
         def _field(self, data, key, *, existing=False):
@@ -218,17 +229,18 @@ def conforms_to_structured_api(create_db, *, journal=True, parent_settings=None)
         @rule(data=st.data(), key=st.sampled_from(LOG_KEYS))
         def trim(self, data, key):
             entries = self.db.log_range(key)
+            ids = st.sampled_from([i for i, _ in entries] or [bytes(16)])
             maxlen = data.draw(st.none() | st.integers(0, 4))
-            before = data.draw(
-                st.none() | st.sampled_from([i for i, _ in entries] or [bytes(16)])
-            )
-            keep = (
-                entries
-                if maxlen is None
-                else entries[len(entries) - min(maxlen, len(entries)) :]
-            )
-            keep = [e for e in keep if before is None or e[0] >= before]
-            removed = self.db.log_trim(key, maxlen=maxlen, before=before)
+            before = data.draw(st.none() | ids)
+            doomed = data.draw(st.lists(ids, max_size=2))
+            keep = [
+                e
+                for e in entries
+                if e[0] not in doomed and (before is None or e[0] >= before)
+            ]
+            if maxlen is not None:
+                keep = keep[len(keep) - min(maxlen, len(keep)) :]
+            removed = self.db.log_trim(key, maxlen=maxlen, before=before, ids=doomed)
             assert removed in (len(entries) - len(keep), None)
             self.logs[key] = [v for _, v in keep]
 
@@ -287,8 +299,15 @@ def conforms_to_structured_api(create_db, *, journal=True, parent_settings=None)
             )
 
         def _apply_change(self, change):
-            if change.op == "append":
-                self.mirror_logs[change.key].append(change.value)
+            if change.op == "invalidate" and change.key in LOG_KEYS:
+                self.mirror_logs[change.key] = self.db.log_range(change.key)
+                return
+            if change.entry_id is not None:  # an entry of a log
+                log = self.mirror_logs[change.key]
+                if change.op == "append":
+                    log.append((change.entry_id, change.value))
+                else:
+                    log[:] = [e for e in log if e[0] != change.entry_id]
                 return
             fields = self.mirror_maps[change.key]
             if change.op == "clear" or (
@@ -316,8 +335,11 @@ def conforms_to_structured_api(create_db, *, journal=True, parent_settings=None)
                 if not changes:
                     break
             return all(self.mirror_maps[k] == self.maps[k] for k in MAP_KEYS) and all(
-                _is_suffix(self.logs[k], self.mirror_logs[k]) for k in LOG_KEYS
+                _is_suffix(self.logs[k], self._mirror_values(k)) for k in LOG_KEYS
             )
+
+        def _mirror_values(self, key):
+            return [value for _, value in self.mirror_logs[key]]
 
         @precondition(lambda self: self.journal)
         @rule()
@@ -329,35 +351,35 @@ def conforms_to_structured_api(create_db, *, journal=True, parent_settings=None)
                 for key in MAP_KEYS:
                     assert self.mirror_maps[key] == self.maps[key], key
                 for key in LOG_KEYS:
-                    assert self.mirror_logs[key] == self.logs[key], key
+                    assert self._mirror_values(key) == self.logs[key], key
                 raise
 
     run_state_machine_as_test(StructuredMachine)
 
 
+class ServedDatabase(RemoteDatabase):
+    """A client that closes its server when it is closed."""
+
+    def __init__(self, server):
+        super().__init__(server.address, server.authkey)
+        self.server = server
+
+    def close(self):
+        super().close()
+        self.server.close()
+
+
 def _served(create):
-    def create_db(tmp):
-        server = serve_database(create(tmp))
-        client = server.client()
-        client._test_cleanup = lambda: (client.close(), server.close())
-        return client
-
-    return create_db
-
-
-def _forwarding_sqlite(tmp):
-    inner = SQLiteExampleDatabase(tmp / "db.sqlite", poll_interval=0.001)
-    db = ForwardingDatabase(inner)
-    # Stops the listener thread, which the emulated journal starts.
-    db._test_cleanup = inner.clear_listeners
-    return db
+    return lambda tmp: ServedDatabase(serve_database(create(tmp)))
 
 
 BACKENDS = {
     "memory": lambda tmp: InMemoryExampleDatabase(),
     "sqlite": lambda tmp: SQLiteExampleDatabase(tmp / "db.sqlite"),
     "forwarding-memory": lambda tmp: ForwardingDatabase(InMemoryExampleDatabase()),
-    "forwarding-sqlite": lambda tmp: _forwarding_sqlite(tmp),
+    "forwarding-sqlite": lambda tmp: ForwardingDatabase(
+        SQLiteExampleDatabase(tmp / "db.sqlite", poll_interval=0.001)
+    ),
     "background-memory": lambda tmp: BackgroundWriteDatabase(InMemoryExampleDatabase()),
     "multiplexed-memory": lambda tmp: MultiplexedDatabase(InMemoryExampleDatabase()),
     "read-through-memory": lambda tmp: ReadThroughDatabase(
@@ -389,19 +411,19 @@ def test_structured_api_directory():
 def test_sqlite_listener_api(tmp_path):
     _database_conforms_to_listener_api(
         lambda path: SQLiteExampleDatabase(path / "db.sqlite", poll_interval=0.001),
-        flush=lambda db: db._wait_for_listeners(),
-        parent_settings=settings(max_examples=5, stateful_step_count=10),
+        flush=None,
+        parent_settings=settings(max_examples=5, stateful_step_count=10, deadline=None),
     )
 
 
 @pytest.mark.parametrize("name", ["memory", "sqlite"])
 def test_map_entries_expire(name, tmp_path):
     db = BACKENDS[name](tmp_path)
-    db.map_put(("p", "m"), "short", b"1", ttl=1)
+    db.map_put(("p", "m"), "short", b"1", ttl=0.2)
     db.map_put(("p", "m"), "long", b"2", ttl=100)
-    db.map_put(("p", "m"), "forever", b"3", ttl=1)
+    db.map_put(("p", "m"), "forever", b"3", ttl=0.2)
     db.map_put(("p", "m"), "forever", b"3")
-    time.sleep(2)  # advances the test suite's clock, which both backends use
+    time.sleep(0.5)
     assert db.map_items(("p", "m")) == {("long",): b"2", ("forever",): b"3"}
     assert db.map_put(("p", "m"), "short", b"4", expect=None)
 
@@ -411,7 +433,7 @@ def test_atomic_batches_must_use_one_partition(name, tmp_path):
     db = BACKENDS[name](tmp_path)
     with pytest.raises(InvalidArgument):
         db.write_many([MapPut(("p", "m"), "f"), MapPut(("q", "m"), "f")], atomic=True)
-    getattr(db, "_test_cleanup", lambda: None)()
+    db.close()
 
 
 @pytest.mark.parametrize(
@@ -441,10 +463,10 @@ def test_old_cursors_expire(name, tmp_path):
         db.journal_read({"p": stale})
     assert info.value.partitions == ["p"]
     assert pickle.loads(pickle.dumps(info.value)).partitions == ["p"]
-    getattr(db, "_test_cleanup", lambda: None)()
+    db.close()
 
 
-@pytest.mark.parametrize("name", ["memory", "remote-memory"])
+@pytest.mark.parametrize("name", ["memory", "sqlite", "remote-memory", "remote-sqlite"])
 def test_journal_read_wakes_up_for_a_change(name, tmp_path):
     db = BACKENDS[name](tmp_path)
     cursors = {"p": db.journal_head("p")}
@@ -455,7 +477,54 @@ def test_journal_read_wakes_up_for_a_change(name, tmp_path):
     assert [(c.op, c.key, c.field, c.value) for c in changes] == [
         ("put", ("p", "m"), ("f",), b"v")
     ]
-    getattr(db, "_test_cleanup", lambda: None)()
+    db.close()
+
+
+def journal_records_entries_deleted_by_id(db):
+    """Trims are not journaled, so a deletion by id must be, with its value."""
+    key = (b"p", "log")
+    for value in [b"a", b"b", b"c"]:
+        db.log_append(key, value)
+    db.flush()
+    ids = [entry_id for entry_id, _ in db.log_range(key)]
+    cursors = {b"p": db.journal_head(b"p")}
+    assert db.log_trim(key, ids=[ids[1]]) in (1, None)
+    db.flush()
+    seen = []
+
+    def deleted():
+        nonlocal cursors
+        changes, cursors = db.journal_read(cursors)
+        seen.extend(changes)
+        return seen
+
+    wait_for(deleted, timeout=10)
+    assert [(c.op, c.key, c.entry_id, c.value) for c in seen] == [
+        ("delete", key, ids[1], b"b")
+    ]
+
+
+@pytest.mark.parametrize("name", sorted(BACKENDS))
+def test_the_journal_records_entries_deleted_by_id(name, tmp_path):
+    with BACKENDS[name](tmp_path) as db:
+        journal_records_entries_deleted_by_id(db)
+
+
+def test_closing_a_database_stops_its_listener_thread(tmp_path):
+    # The emulated journal listens to the inner database, which starts a thread.
+    with ForwardingDatabase(SQLiteExampleDatabase(tmp_path / "db.sqlite")) as db:
+        db.journal_head("p")
+        thread = db._db.__dict__["_listener_thread"]
+        assert thread.is_alive()
+    assert not thread.is_alive()
+
+
+def test_a_closed_database_opens_new_connections(tmp_path):
+    db = SQLiteExampleDatabase(tmp_path / "db.sqlite")
+    db.map_put(("p", "m"), "f", b"v")
+    db.close()
+    assert db.map_get(("p", "m"), "f") == b"v"
+    db.close()
 
 
 def test_only_the_journal_of_followed_partitions_is_read():

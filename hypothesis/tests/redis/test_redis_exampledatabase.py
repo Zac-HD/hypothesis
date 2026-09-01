@@ -23,10 +23,20 @@ from hypothesis.stateful import Bundle, RuleBasedStateMachine, rule
 
 from tests.common.utils import time_sleep
 from tests.cover.test_database_backend import _database_conforms_to_listener_api
-from tests.cover.test_database_structured import conforms_to_structured_api
+from tests.cover.test_database_structured import (
+    ForwardingDatabase,
+    conforms_to_structured_api,
+    journal_records_entries_deleted_by_id,
+)
 
 # Set this to a URL, such as redis://localhost:6379, to also test a real server.
 REDIS_URL = os.environ.get("HYPOTHESIS_TEST_REDIS_URL")
+
+
+@pytest.fixture(autouse=True)
+def _consistently_increment_time():
+    """Use the real clock, not the test suite's fake one, because these tests
+    wait for other threads and processes."""
 
 
 @pytest.mark.parametrize(
@@ -108,16 +118,11 @@ def flush_messages(db):
 
 
 def test_redis_listener():
+    # A thread delivers the events, so steps wait for it, and can be slow.
     _database_conforms_to_listener_api(
         lambda _path: RedisExampleDatabase(FakeRedis()),
-        flush=flush_messages,
-        parent_settings=settings(
-            max_examples=5,
-            stateful_step_count=10,
-            # fakeredis waits for messages with time.sleep, which the test suite
-            # replaces with a fake clock, so the listener thread advances it.
-            deadline=None,
-        ),
+        flush=None,
+        parent_settings=settings(max_examples=5, stateful_step_count=10, deadline=None),
     )
 
 
@@ -151,7 +156,7 @@ def test_redis_listener_explicit():
     db.save(b"a", b"c")
     flush_messages(db)
     assert calls == 3
-    db.clear_listeners()
+    db.close()
 
 
 def test_redis_move_from_key_without_value():
@@ -197,6 +202,14 @@ def test_structured_api_fakeredis():
     )
 
 
+@pytest.mark.parametrize("wrap", [lambda db: db, ForwardingDatabase])
+def test_journal_records_entries_deleted_by_id_fakeredis(wrap):
+    # The wrapper's journal comes from the firehose channel.
+    db = RedisExampleDatabase(FakeRedis(host=uuid.uuid4().hex), listener_channel="x")
+    with wrap(db) as db:
+        journal_records_entries_deleted_by_id(db)
+
+
 def _real_redis(_path):
     name = uuid.uuid4().hex
     return RedisExampleDatabase(
@@ -217,8 +230,8 @@ def test_structured_api_real_redis():
 def test_listener_api_real_redis():
     _database_conforms_to_listener_api(
         _real_redis,
-        flush=flush_messages,
-        parent_settings=settings(max_examples=5, stateful_step_count=10),
+        flush=None,
+        parent_settings=settings(max_examples=5, stateful_step_count=10, deadline=None),
     )
 
 

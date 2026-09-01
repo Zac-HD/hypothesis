@@ -2,7 +2,7 @@
 
 Status: draft for discussion, 2026-09-01.
 Scope: the interface and backends in `hypothesis.database`, and the HypoFuzz storage schema built on them.
-Prototype code and benchmarks accompany this document; results are in section 12.
+Prototype code and benchmarks accompany this document; results are in section 13.
 
 ## Summary
 
@@ -201,7 +201,12 @@ class ExampleDatabase:
         reverse: bool = False,
     ) -> list[tuple[bytes, bytes]]: ...
     def log_trim(
-        self, key: KeyT, *, maxlen: int | None = None, before: bytes | None = None
+        self,
+        key: KeyT,
+        *,
+        maxlen: int | None = None,
+        before: bytes | None = None,
+        ids: Iterable[bytes] = (),
     ) -> int | None: ...
 
     # Batches. The single-operation methods above are sugar for these.
@@ -225,14 +230,17 @@ class ExampleDatabase:
 
     def current_time(self) -> float: ...
     def flush(self, timeout: float | None = None) -> None: ...
+    def close(self) -> None: ...  # also a context manager
 ```
 
 `WriteOp` is one of the dataclasses `MapPut`, `MapDelete`, `MapClear`, `LogAppend`, and
 `LogTrim`, with the same fields as the methods. The read operations are `MapGet`, `MapItems`,
 and `LogRange`.
 
-A backend author implements `read_many`, `write_many`, the two journal methods, and
-`capabilities`. Everything else has a default.
+A backend author implements `read_many`, `write_many`, `capabilities`, and the three
+journal hooks in section 4.4. Everything else has a default. A backend that holds
+connections or threads also extends `close()`, which releases them. Using a closed database
+opens what it needs again.
 
 ### 4.1 Maps
 
@@ -258,7 +266,9 @@ A backend author implements `read_many`, `write_many`, the two journal methods, 
   Trimming is approximate so that backends can trim in bulk.
 - `ttl` applies to the whole log: the `ttl` of the most recent append says entries older
   than that may be removed.
-- `log_trim` is exact. It returns the number of entries removed, or `None` if queued.
+- `log_trim` is exact. It removes the entries in `ids`, and the entries before `before`,
+  and then all but the newest `maxlen`. It returns the number of entries removed, or `None`
+  if queued.
 - `log_append` returns the new entry's id, or `None` if the database applied the write
   asynchronously, as the write-behind wrappers do.
 
@@ -283,8 +293,10 @@ class Change:
     op: Literal["put", "delete", "clear", "append", "invalidate"]
     key: tuple  # key[0] is the partition
     field: tuple | None = None  # put, delete, and invalidate; None means the whole key
-    entry_id: bytes | None = None  # append
-    value: bytes | None = None  # put and append; None if omitted, so re-read it
+    entry_id: bytes | None = None  # append, and delete of a log entry
+    value: bytes | None = (
+        None  # put, append, and delete of a log entry; None if omitted
+    )
 ```
 
 Guarantees:
@@ -300,7 +312,10 @@ Guarantees:
   An expired cursor raises `JournalCursorExpired`, which names the partitions. The consumer
   then reloads those partitions and continues from `journal_head`.
 - **Values inline when small**, up to 64 KiB by default. Larger values arrive as `None`.
-- Trimming and expiry are not journaled.
+- Trimming by `maxlen` or `before` is not journaled, and neither is expiry. Deleting log
+  entries by id is journaled, because a reader cannot work it out. The change is a
+  `delete` with `entry_id` set, and it carries the entry's value, so that the old listener
+  API can name the member that went.
 - `invalidate` means "something here changed, read it again". Emulated backends emit it
   when their change listener cannot say what changed.
 
@@ -311,6 +326,16 @@ Anything that arrived during the load is applied twice, which is harmless.
 `timeout=0` polls. `timeout=None` blocks until something arrives. A positive timeout
 blocks for at most that long. Backends with the `blocking` capability wake up when a change
 arrives. Others poll.
+
+Backends implement three hooks, and one function in the base class does the rest: it
+checks the age of each cursor, issues new ones, and handles the timeout. A position is
+bytes that only the backend understands.
+
+- `_journal_position(partition)` returns the position at the end of the partition.
+- `_journal_fetch(positions, limit)` returns the changes after each position, the new
+  positions, and the partitions that `limit` cut short.
+- `_journal_wait(batch, timeout)` returns when a change may have arrived since that fetch,
+  or when the timeout passes. Returning early does no harm.
 
 ### 4.5 Time, expiry, capabilities
 
@@ -390,7 +415,7 @@ use. The journal comes from watchdog, so deletions arrive as `invalidate`.
 - Expired rows are filtered on read and deleted every few seconds.
 
 WAL mode does not work on network filesystems, which matters for the choice of a default
-(section 12).
+(section 13).
 
 ### Redis (6.2 or later)
 
@@ -467,6 +492,7 @@ WAL mode does not work on network filesystems, which matters for the choice of a
 - `BackgroundWriteDatabase` queues writes that are neither atomic nor conditional, and
   applies reads after the queue drains. Queued writes return `None`.
 - `ReadThroughDatabase(primary, fallback)` is new, and is described in section 9.
+- Every wrapper forwards `close()` to the databases it wraps.
 
 ## 6. The per-machine database server
 
@@ -544,7 +570,7 @@ noted below.
 | `(T + b".secondary",)` | set | unshrunk failures (core Hypothesis's key; its own partition) |
 | `(T, "failure-info")` | map | field: the choice sequence. Value: state, origin, observation, timestamps |
 | `(T, "corpus")` | map | field: the choice sequence. Value: the observation, or empty |
-| `(T, "reports")` | log | reports at coverage changes and phase changes; `ttl` 30 days |
+| `(T, "reports")` | log | reports at coverage changes and phase changes; `ttl` 30 days, `maxlen` 2,000 (section 11) |
 | `(T, "history")` | map | at most 1,000 coarse points, kept indefinitely (8.5) |
 | `(T, "progress")` | map | field: the worker. Value: its latest timed report; `ttl` 1 hour |
 | `(T, "campaigns")` | map | field: the worker. Value: cumulative counts for that campaign |
@@ -729,12 +755,40 @@ Conclusions:
 
 1. Coalescing replay reports is required at this scale, not optional.
 2. A 30-day `ttl` alone does not bound storage, because storage scales with the campaign
-   start rate. **Recommendation:** also cap each test's report log. `maxlen=2000` bounds
-   the total at about 6 GB.
+   start rate. So each test's report log is also capped, by `report_log_maxlen` in section
+   11. The default of 2,000 bounds the total at about 6 GB.
 3. Postgres suits full scale. Redis suits up to about 1,000 workers, or a deployment with
    30 to 60 GB of memory to spare.
 
-## 11. Testing
+## 11. Tunable controls
+
+Each of these trades freshness or history against storage or load. Each has one name, one
+default, and one place where it is set. In HypoFuzz, each is a named setting with a
+command-line flag, and the dashboard shows the values in use. A change to a default that
+bounds storage should come with a new estimate for section 10.
+
+| control | default | set in | trades |
+|---|---|---|---|
+| `failure_ttl` | 8 days | HypoFuzz | how long a fixed failure is kept, against storage |
+| `report_ttl` | 30 days | HypoFuzz | how far back the dashboard shows change points, against storage |
+| `report_log_maxlen` | 2,000 per test | HypoFuzz | the same, for tests that restart often. Bounds reports at about 6 GB at full scale |
+| `history_points` | 1,000 per test | HypoFuzz | detail in the coarse history, against 3 GB at full scale |
+| `observation_log_maxlen` | 300 per test | HypoFuzz | observations the dashboard can show, against 9 GB at full scale |
+| `observation_rate` | 1 per second if watched, else 1 per minute | HypoFuzz | freshness, against write load |
+| `watcher_ttl` | 60 seconds | HypoFuzz | how long workers keep a closed dashboard's rate |
+| `heartbeat_interval`, `machine_timeout` | 15 and 60 seconds | HypoFuzz | how soon a dead machine's tests move, against writes |
+| `scheduling_interval` | 30 seconds | HypoFuzz | how soon work rebalances, against churn |
+| `gc_inactivity` | 90 days | HypoFuzz | when an inactive test's data is deleted |
+| `journal_retention` | 5 minutes | each database | how far a reader can fall behind before it reloads, against journal storage |
+| `INLINE_VALUE_LIMIT` | 64 KiB | `hypothesis.database` | journal size, against re-reading large values |
+| `batch_delay`, `batch_size` | 5 ms, 200 operations | `RemoteDatabase` | batching, against latency |
+| `linger` | 5 ms | `DatabaseServer` | batching journal reads, against lag |
+| `poll_timeout` | 0.5 seconds | `DatabaseServer` | how late a newly followed partition's first changes can be, against idle reads |
+| `sweep_interval` | 5 seconds | Redis | how late a lost wake-up is noticed, against reads |
+| `synchronous_commit` | off | Postgres | durability of the last fraction of a second, against write latency |
+| `poll_interval` | 10 ms | SQLite | journal latency, against idle work |
+
+## 12. Testing
 
 - **Conformance:** one `RuleBasedStateMachine` runs against every backend, and against every
   wrapper around every backend. It checks maps, logs, batches, and conditions against a plain
@@ -744,13 +798,16 @@ Conclusions:
 - **Expiry:** timing-based unit tests, for backends with `ttl`.
 - **Compatibility:** the existing listener tests keep passing, and existing directory and
   Redis data remains readable.
+- **Real time:** the test suite fakes the clock, so that timing does not make tests flaky.
+  These tests wait for other threads and processes, so they use the real clock instead, and
+  the library needs no code that works around a fake one.
 
 Status of the prototype: the state machine passes against the in-memory, SQLite, directory,
 Redis, and Postgres backends, through `RemoteDatabase`, and through a wrapper that forwards
 only the old methods. It ran 200 to 300 examples of 40 steps each. The existing database
-tests pass unchanged, except that the listener tests now stop their listeners at teardown.
+tests pass unchanged, except that the listener tests now close their database at teardown.
 
-## 12. Benchmarks
+## 13. Benchmarks
 
 The code is in `hypothesis/benchmark/database/`, and its README describes the workloads.
 The figures below come from one run of 8 seconds per configuration.
@@ -886,11 +943,15 @@ For HypoFuzz, behind the local server:
 - SQLite's journal works, with a p50 lag of 5 ms. The directory database's journal comes
   from watchdog, whose tests are skipped as flaky.
 
-Recommendation: make SQLite the default for HypoFuzz, and keep the directory database as
-the default for plain Hypothesis. I am about 75% confident of the second half. The gain is
-real but small, and the compatibility costs are real too. Evidence that many users hit the
-directory database's file counts, or run large suites where 1.3 seconds matters, would
-change that.
+Status: undecided. For HypoFuzz, the evidence favors SQLite. For plain Hypothesis, the gain
+is real but small, and so are the compatibility costs. This evidence would settle it:
+
+- How many projects commit `.hypothesis/examples` to version control, or keep it on a
+  network filesystem. A code search for committed example directories would give a count.
+- Whether the directory database's many small files cause trouble, such as slow CI caches
+  or inode limits.
+- The time per test on a large real suite, with each backend. The benchmark here is
+  synthetic.
 
 ### Bugs the benchmarks found
 
@@ -903,7 +964,7 @@ change that.
 - **The local server:** the first two designs cost more in thread handoffs than in work.
   Section 6 has the details.
 
-## 13. Non-goals and open questions
+## 14. Non-goals and open questions
 
 Not in version 1:
 
@@ -916,12 +977,15 @@ Not in version 1:
 
 Open questions:
 
-1. The per-test cap on the report log (section 10).
-2. Whether corpus values carry fingerprints (section 8.4).
-3. Whether to make SQLite the default for plain Hypothesis. Section 12 recommends not.
-4. A public `close()`. The SQLite, Redis, Postgres, and remote databases hold connections
-   and threads, and only some of them have a `close()` method today.
-5. The batching windows in the local server. Three windows of 5 ms give 11 to 25 ms of
+1. Whether corpus values carry fingerprints (section 8.4).
+2. Whether to make SQLite the default, for HypoFuzz and for plain Hypothesis. Section 13
+   has the evidence so far, and what would settle it.
+3. The batching windows in the local server. Three windows of 5 ms give 11 to 25 ms of
    journal lag. Halving them would halve the lag, and cost some batching.
-6. A faster local transport. `multiprocessing.connection` costs about 100 µs per round
+4. A faster local transport. `multiprocessing.connection` costs about 100 µs per round
    trip on the test machine.
+
+Decided since the first draft:
+
+- `close()` is part of the interface (section 4).
+- Each test's report log is capped, by a tunable control (section 11).
