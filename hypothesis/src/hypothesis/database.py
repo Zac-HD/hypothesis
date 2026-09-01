@@ -9,18 +9,26 @@
 # obtain one at https://mozilla.org/MPL/2.0/.
 
 import abc
+import enum
 import errno
 import json
 import os
+import random
+import sqlite3
 import struct
 import sys
 import tempfile
+import threading
+import time
 import warnings
 import weakref
-from collections.abc import Callable, Iterable
+from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from hashlib import sha384
+from multiprocessing.connection import Client
 from os import PathLike, getenv
 from pathlib import Path, PurePath
 from queue import Queue
@@ -38,22 +46,60 @@ from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
 
 from hypothesis.configuration import StorageDirectory, storage_directory
-from hypothesis.errors import HypothesisException, HypothesisWarning
+from hypothesis.errors import HypothesisException, HypothesisWarning, InvalidArgument
 from hypothesis.internal.conjecture.choice import ChoiceT
+from hypothesis.internal.dbcodec import (
+    ENTRY_ID_SIZE,
+    KeyPartT,
+    KeyTupleT,
+    _pack_uleb128,
+    _unpack_uleb128,
+    as_tuple,
+    decode,
+    encode,
+    field_key,
+    index_key,
+    is_legacy,
+    log_key,
+    make_cursor,
+    make_entry_id,
+    next_entry_id,
+    parse_legacy_key,
+    short_hash,
+    split_cursor,
+    split_entry_id,
+)
 from hypothesis.utils.conventions import UniqueIdentifier, not_set
 from hypothesis.utils.deprecation import note_deprecation
 
 __all__ = [
+    "BackgroundWriteDatabase",
+    "Change",
     "DirectoryBasedExampleDatabase",
     "ExampleDatabase",
     "GitHubArtifactDatabase",
     "InMemoryExampleDatabase",
+    "JournalCursorExpired",
+    "LogAppend",
+    "LogRange",
+    "LogTrim",
+    "MapClear",
+    "MapDelete",
+    "MapGet",
+    "MapItems",
+    "MapPut",
     "MultiplexedDatabase",
     "ReadOnlyDatabase",
+    "ReadThroughDatabase",
+    "RemoteDatabase",
+    "SQLiteExampleDatabase",
+    "serve_database",
 ]
 
 if TYPE_CHECKING:
     from watchdog.observers.api import BaseObserver
+
+    from hypothesis.internal.dbserver import DatabaseServer
 
 StrPathT: TypeAlias = str | PathLike[str]
 SaveDataT: TypeAlias = tuple[bytes, bytes]  # key, value
@@ -62,6 +108,605 @@ ListenerEventT: TypeAlias = (
     tuple[Literal["save"], SaveDataT] | tuple[Literal["delete"], DeleteDataT]
 )
 ListenerT: TypeAlias = Callable[[ListenerEventT], Any]
+KeyT: TypeAlias = KeyPartT | KeyTupleT
+TTLT: TypeAlias = float | timedelta | None
+
+
+class _Unset(enum.Enum):
+    unset = "unset"
+
+    def __repr__(self) -> str:
+        return "unset"
+
+
+#: The default for ``expect=``, meaning that the write is unconditional.
+unset = _Unset.unset
+
+
+def _normalize_key(key: object) -> KeyTupleT:
+    return as_tuple(key, what="key", allow_empty=False)
+
+
+def _normalize_field(key: KeyTupleT, field: object) -> KeyTupleT:
+    normalized = as_tuple(field, what="field", allow_empty=True)
+    if is_legacy(key) and not (
+        len(normalized) == 1 and isinstance(normalized[0], bytes)
+    ):
+        raise InvalidArgument(
+            f"The key {key!r} holds a set, so each field must be a single bytes "
+            f"component, not {field!r}"
+        )
+    return normalized
+
+
+def _normalize_ttl(ttl: TTLT) -> float | None:
+    if ttl is None:
+        return None
+    seconds = ttl.total_seconds() if isinstance(ttl, timedelta) else float(ttl)
+    if not seconds > 0:
+        raise InvalidArgument(f"ttl must be positive, not {ttl!r}")
+    return seconds
+
+
+def _check_bytes(value: object, name: str) -> bytes:
+    if isinstance(value, (bytearray, memoryview)):
+        return bytes(value)
+    if not isinstance(value, bytes):
+        raise InvalidArgument(f"{name} must be bytes, not {value!r}")
+    return value
+
+
+def _check_count(value: int | None, name: str, *, minimum: int) -> None:
+    if value is not None and (not isinstance(value, int) or value < minimum):
+        raise InvalidArgument(f"{name} must be an integer >= {minimum}, not {value!r}")
+
+
+def _check_log_key(key: KeyTupleT) -> None:
+    if is_legacy(key):
+        raise InvalidArgument(f"The key {key!r} holds a set, so it cannot hold a log")
+
+
+class _Op:
+    __slots__ = ()
+
+    def _set(self, name: str, value: object) -> None:
+        object.__setattr__(self, name, value)
+
+
+@dataclass(frozen=True, slots=True)
+class MapGet(_Op):
+    """Read one field of a map. The result is the value, or ``None``."""
+
+    key: KeyTupleT
+    field: KeyTupleT
+
+    def __post_init__(self) -> None:
+        self._set("key", _normalize_key(self.key))
+        self._set("field", _normalize_field(self.key, self.field))
+
+
+@dataclass(frozen=True, slots=True)
+class MapItems(_Op):
+    """Read every field of a map that extends ``prefix``, as a dict."""
+
+    key: KeyTupleT
+    prefix: KeyTupleT = ()
+
+    def __post_init__(self) -> None:
+        self._set("key", _normalize_key(self.key))
+        self._set("prefix", as_tuple(self.prefix, what="prefix", allow_empty=True))
+
+
+@dataclass(frozen=True, slots=True)
+class LogRange(_Op):
+    """Read log entries as ``(entry_id, value)`` pairs, oldest first unless ``reverse``.
+
+    ``after`` and ``before`` are exclusive bounds on the entry id.
+    """
+
+    key: KeyTupleT
+    after: bytes | None = None
+    before: bytes | None = None
+    limit: int | None = None
+    reverse: bool = False
+
+    def __post_init__(self) -> None:
+        self._set("key", _normalize_key(self.key))
+        _check_log_key(self.key)
+        _check_count(self.limit, "limit", minimum=0)
+        for bound in (self.after, self.before):
+            if bound is not None:
+                split_entry_id(bound)
+
+
+@dataclass(frozen=True, slots=True)
+class MapPut(_Op):
+    """Set a field of a map. See :meth:`ExampleDatabase.map_put`."""
+
+    key: KeyTupleT
+    field: KeyTupleT
+    value: bytes = b""
+    ttl: float | None = None
+    expect: bytes | _Unset | None = unset
+
+    def __post_init__(self) -> None:
+        self._set("key", _normalize_key(self.key))
+        self._set("field", _normalize_field(self.key, self.field))
+        self._set("value", _check_bytes(self.value, "value"))
+        self._set("ttl", _normalize_ttl(self.ttl))
+        if self.expect is not unset and self.expect is not None:
+            self._set("expect", _check_bytes(self.expect, "expect"))
+        if is_legacy(self.key) and self.value:
+            raise InvalidArgument(
+                f"The key {self.key!r} holds a set, so values must be empty"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class MapDelete(_Op):
+    """Delete a field of a map, if it exists and matches ``expect``."""
+
+    key: KeyTupleT
+    field: KeyTupleT
+    expect: bytes | _Unset = unset
+
+    def __post_init__(self) -> None:
+        self._set("key", _normalize_key(self.key))
+        self._set("field", _normalize_field(self.key, self.field))
+        if self.expect is not unset:
+            self._set("expect", _check_bytes(self.expect, "expect"))
+
+
+@dataclass(frozen=True, slots=True)
+class MapClear(_Op):
+    """Delete every field of a map."""
+
+    key: KeyTupleT
+
+    def __post_init__(self) -> None:
+        self._set("key", _normalize_key(self.key))
+
+
+@dataclass(frozen=True, slots=True)
+class LogAppend(_Op):
+    """Append an entry to a log. See :meth:`ExampleDatabase.log_append`."""
+
+    key: KeyTupleT
+    value: bytes
+    maxlen: int | None = None
+    ttl: float | None = None
+
+    def __post_init__(self) -> None:
+        self._set("key", _normalize_key(self.key))
+        _check_log_key(self.key)
+        self._set("value", _check_bytes(self.value, "value"))
+        _check_count(self.maxlen, "maxlen", minimum=1)
+        self._set("ttl", _normalize_ttl(self.ttl))
+
+
+@dataclass(frozen=True, slots=True)
+class LogTrim(_Op):
+    """Remove all but the newest ``maxlen`` entries, and entries before ``before``."""
+
+    key: KeyTupleT
+    maxlen: int | None = None
+    before: bytes | None = None
+
+    def __post_init__(self) -> None:
+        self._set("key", _normalize_key(self.key))
+        _check_log_key(self.key)
+        _check_count(self.maxlen, "maxlen", minimum=0)
+        if self.before is not None:
+            split_entry_id(self.before)
+
+
+ReadOpT: TypeAlias = MapGet | MapItems | LogRange
+WriteOpT: TypeAlias = MapPut | MapDelete | MapClear | LogAppend | LogTrim
+ChangeOpT: TypeAlias = Literal["put", "delete", "clear", "append", "invalidate"]
+
+
+@dataclass(frozen=True, slots=True)
+class Change:
+    """One entry in a partition's journal. See :meth:`ExampleDatabase.journal_read`."""
+
+    op: ChangeOpT
+    key: KeyTupleT
+    field: KeyTupleT | None = None
+    entry_id: bytes | None = None
+    value: bytes | None = None
+
+    @property
+    def partition(self) -> KeyPartT:
+        return self.key[0]
+
+
+class JournalCursorExpired(HypothesisException):
+    """Raised by :meth:`ExampleDatabase.journal_read` when changes may have been lost.
+
+    Reload the data for each of ``partitions``, and continue from a new cursor
+    taken with :meth:`ExampleDatabase.journal_head` before reloading.
+    """
+
+    def __init__(self, partitions: Iterable[KeyPartT]) -> None:
+        self.partitions = list(partitions)
+        super().__init__(
+            f"Journal cursors expired for partitions {self.partitions!r}. Reload "
+            "them, then continue from journal_head()."
+        )
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (type(self), (self.partitions,))
+
+
+def _is_conditional(op: object) -> bool:
+    return isinstance(op, (MapPut, MapDelete)) and op.expect is not unset
+
+
+def _check_atomic(ops: Sequence[WriteOpT]) -> None:
+    partitions = {op.key[0] for op in ops}
+    if len(partitions) > 1:
+        raise InvalidArgument(
+            "An atomic batch must write to a single partition, but this one writes "
+            f"to {sorted(map(repr, partitions))}"
+        )
+
+
+def _not_applied(ops: Sequence[WriteOpT]) -> list[Any]:
+    return [
+        (
+            False
+            if isinstance(op, (MapPut, MapDelete))
+            else 0 if isinstance(op, LogTrim) else None
+        )
+        for op in ops
+    ]
+
+
+def _matches_prefix(field: KeyTupleT, prefix: KeyTupleT) -> bool:
+    return field[: len(prefix)] == prefix
+
+
+def _select_entries(
+    entries: list[tuple[bytes, bytes]], op: LogRange
+) -> list[tuple[bytes, bytes]]:
+    """Apply the bounds, direction, and limit of ``op`` to entries sorted by id."""
+    lo, hi = 0, len(entries)
+    if op.after is not None:
+        lo = bisect_right(entries, op.after, key=lambda e: e[0])
+    if op.before is not None:
+        hi = bisect_left(entries, op.before, key=lambda e: e[0])
+    selected = entries[lo:hi]
+    if op.reverse:
+        selected.reverse()
+    return selected if op.limit is None else selected[: op.limit]
+
+
+def _change_from_event(event: ListenerEventT) -> Change | None:
+    """Translate an old-style listener event into a journal entry."""
+    kind, (raw, value) = event
+    parsed = parse_legacy_key(raw)
+    if parsed.kind == "set":
+        if kind == "save":
+            return Change("put", parsed.key, (value,), value=b"")
+        if value is None:
+            return Change("invalidate", parsed.key)
+        return Change("delete", parsed.key, (value,))
+    if parsed.kind == "field":
+        if kind == "save":
+            return Change("put", parsed.key, parsed.field, value=value)
+        # The value in a field key can be replaced by saving the new value and
+        # then deleting the old one, so a deletion only tells us to re-read.
+        return Change("invalidate", parsed.key, parsed.field)
+    if (
+        parsed.kind == "log"
+        and kind == "save"
+        and value
+        and len(value) >= ENTRY_ID_SIZE
+    ):
+        return Change(
+            "append",
+            parsed.key,
+            entry_id=value[:ENTRY_ID_SIZE],
+            value=value[ENTRY_ID_SIZE:],
+        )
+    return None
+
+
+def _events_from_change(change: Change) -> list[ListenerEventT]:
+    """Translate a journal entry into old-style listener events."""
+    if is_legacy(change.key):
+        raw = cast(bytes, change.key[0])
+        member = None if change.field is None else cast(bytes, change.field[0])
+        if change.op == "put" and member is not None:
+            return [("save", (raw, member))]
+        return [("delete", (raw, member if change.op == "delete" else None))]
+    ek = encode(change.key)
+    if change.op == "append":
+        if change.value is None or change.entry_id is None:
+            return []
+        return [("save", (log_key(ek), change.entry_id + change.value))]
+    if change.field is None:
+        return [("delete", (index_key(ek), None))]
+    fk = field_key(ek, encode(change.field))
+    if change.op == "put" and change.value is not None:
+        return [("save", (fk, change.value))]
+    return [("delete", (fk, None))]
+
+
+class _JournalBuffer:
+    """Changes for the partitions that someone is following, held in memory.
+
+    This serves the journal for the in-memory database, for databases that
+    emulate a journal with a change listener, and for the local database server.
+    Cursors name this buffer, so a cursor from another buffer is expired.
+    """
+
+    def __init__(self, retention: float, *, max_entries: int = 100_000) -> None:
+        self.retention = retention
+        self.max_entries = max_entries
+        self.token = os.urandom(8)
+        self.cond = threading.Condition()
+        self.seq = 0
+        self.queues: dict[KeyPartT, list[tuple[int, float, Change]]] = {}
+        self.dropped: dict[KeyPartT, int] = {}
+        self.last_read: dict[KeyPartT, float] = {}
+        self._next_expiry = 0.0
+
+    def _cursor(self, seq: int, issued_at: float | None = None) -> bytes:
+        return make_cursor(self.token + seq.to_bytes(8, "big"), issued_at)
+
+    def head(self, partition: KeyPartT) -> bytes:
+        with self.cond:
+            self.queues.setdefault(partition, [])
+            self.last_read[partition] = time.monotonic()
+            return self._cursor(self.seq)
+
+    def add(self, changes: Iterable[Change]) -> None:
+        now = time.monotonic()
+        with self.cond:
+            added = False
+            for change in changes:
+                queue = self.queues.get(change.key[0])
+                if queue is not None:
+                    self.seq += 1
+                    queue.append((self.seq, now, change))
+                    added = True
+                    if len(queue) > self.max_entries:
+                        self._drop(change.key[0], len(queue) - self.max_entries)
+            if now >= self._next_expiry:
+                self._expire(now)
+            if added:
+                self.cond.notify_all()
+
+    def _drop(self, partition: KeyPartT, count: int) -> None:
+        queue = self.queues[partition]
+        self.dropped[partition] = queue[count - 1][0]
+        del queue[:count]
+
+    def _expire(self, now: float) -> None:
+        self._next_expiry = now + min(1.0, self.retention / 10)
+        for partition, queue in list(self.queues.items()):
+            if now - self.last_read.get(partition, now) > self.retention:
+                del self.queues[partition]
+                self.dropped.pop(partition, None)
+                self.last_read.pop(partition, None)
+                continue
+            stale = bisect_left(queue, now - self.retention, key=lambda e: e[1])
+            if stale:
+                self._drop(partition, stale)
+
+    def expire_partitions(self, partitions: Iterable[KeyPartT]) -> None:
+        """Expire every cursor for these partitions, because changes were lost."""
+        with self.cond:
+            self.seq += 1
+            for partition in partitions:
+                if partition in self.queues:
+                    self.queues[partition].clear()
+                    self.dropped[partition] = self.seq
+            self.cond.notify_all()
+
+    def read(
+        self,
+        cursors: Mapping[KeyPartT, bytes],
+        timeout: float | None,
+        limit: int | None,
+    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        parsed = {partition: split_cursor(c) for partition, c in cursors.items()}
+        with self.cond:
+            while True:
+                expired = []
+                changes: list[Change] = []
+                new_cursors = {}
+                now = time.monotonic()
+                for partition, (issued_at, position) in parsed.items():
+                    seq = int.from_bytes(position[8:16], "big")
+                    queue = self.queues.get(partition)
+                    if (
+                        queue is None
+                        or position[:8] != self.token
+                        or seq < self.dropped.get(partition, 0)
+                        or time.time() - issued_at > self.retention / 2
+                    ):
+                        expired.append(partition)
+                        continue
+                    self.last_read[partition] = now
+                    if not queue or queue[-1][0] <= seq:
+                        new_cursors[partition] = self._cursor(self.seq)
+                        continue
+                    start = bisect_right(queue, seq, key=lambda e: e[0])
+                    stop = (
+                        len(queue)
+                        if limit is None
+                        else min(len(queue), start + limit - len(changes))
+                    )
+                    changes.extend(change for _, _, change in queue[start:stop])
+                    if stop < len(queue):
+                        # Not drained, so the cursor keeps its old issue time.
+                        last = queue[stop - 1][0] if stop > start else seq
+                        new_cursors[partition] = self._cursor(last, issued_at)
+                    else:
+                        new_cursors[partition] = self._cursor(self.seq)
+                if expired:
+                    raise JournalCursorExpired(expired)
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if changes or (remaining is not None and remaining <= 0):
+                    return changes, new_cursors
+                if not self.cond.wait(remaining):
+                    # Trust the condition's timeout, which uses real time, over
+                    # the clock. Collect once more, then return.
+                    deadline = time.monotonic()
+
+
+class _EmulationState:
+    """Per-instance state for databases that emulate the structured API."""
+
+    _init_lock = threading.Lock()
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.last_id: bytes | None = None
+        self.appends_since_trim: dict[bytes, int] = {}
+
+    @classmethod
+    def of(cls, db: "ExampleDatabase") -> "_EmulationState":
+        try:
+            return db.__dict__["_emulation_state"]
+        except KeyError:
+            with cls._init_lock:
+                return db.__dict__.setdefault("_emulation_state", cls())
+
+    def new_entry_id(self) -> bytes:
+        # Ids increase within this process. The random sequence number makes them
+        # unique across processes, but ids from different processes in the same
+        # millisecond are not ordered.
+        with self.lock:
+            now_ms = int(time.time() * 1000)
+            last_ms = split_entry_id(self.last_id)[0] if self.last_id else -1
+            if now_ms > last_ms:
+                self.last_id = make_entry_id(now_ms, random.getrandbits(48))
+            else:
+                self.last_id = next_entry_id(self.last_id, now_ms)
+            return self.last_id
+
+
+def _pick(members: Iterable[bytes]) -> bytes | None:
+    # Concurrent puts can leave more than one value in a field key. Any
+    # deterministic choice will do, and the next put removes the others.
+    return max(members, default=None)
+
+
+def _emulated_log_entries(
+    db: "ExampleDatabase", ek: bytes
+) -> list[tuple[bytes, bytes]]:
+    members = {m for m in db.fetch(log_key(ek)) if len(m) >= ENTRY_ID_SIZE}
+    return sorted((m[:ENTRY_ID_SIZE], m[ENTRY_ID_SIZE:]) for m in members)
+
+
+def _emulated_read(db: "ExampleDatabase", op: ReadOpT) -> Any:
+    if isinstance(op, LogRange):
+        return _select_entries(_emulated_log_entries(db, encode(op.key)), op)
+    if is_legacy(op.key):
+        members = set(db.fetch(cast(bytes, op.key[0])))
+        if isinstance(op, MapGet):
+            return b"" if op.field[0] in members else None
+        return {(m,): b"" for m in members if _matches_prefix((m,), op.prefix)}
+    ek = encode(op.key)
+    if isinstance(op, MapGet):
+        return _pick(db.fetch(field_key(ek, encode(op.field))))
+    prefix = encode(op.prefix)
+    result = {}
+    for ef in set(db.fetch(index_key(ek))):
+        if (
+            ef.startswith(prefix)
+            and (value := _pick(db.fetch(field_key(ek, ef)))) is not None
+        ):
+            try:
+                result[decode(ef)] = value
+            except ValueError:
+                continue
+    return result
+
+
+def _emulated_current(db: "ExampleDatabase", op: MapPut | MapDelete) -> bytes | None:
+    return _emulated_read(db, MapGet(op.key, op.field))
+
+
+def _emulated_trim(
+    db: "ExampleDatabase",
+    ek: bytes,
+    *,
+    maxlen: int | None = None,
+    before: bytes | None = None,
+) -> int:
+    entries = _emulated_log_entries(db, ek)
+    doomed = set()
+    if maxlen is not None:
+        doomed.update(entries[: max(0, len(entries) - maxlen)])
+    if before is not None:
+        doomed.update(e for e in entries if e[0] < before)
+    for entry_id, value in doomed:
+        db.delete(log_key(ek), entry_id + value)
+    return len(doomed)
+
+
+def _emulated_write(db: "ExampleDatabase", op: WriteOpT, *, check: bool) -> Any:
+    if isinstance(op, (MapPut, MapDelete)):
+        if check and _is_conditional(op) and _emulated_current(db, op) != op.expect:
+            return False
+        if is_legacy(op.key):
+            raw, member = cast(bytes, op.key[0]), cast(bytes, op.field[0])
+            if isinstance(op, MapPut):
+                db.save(raw, member)
+                return True
+            present = member in set(db.fetch(raw))
+            if present:
+                db.delete(raw, member)
+            return present
+        ek, ef = encode(op.key), encode(op.field)
+        fk = field_key(ek, ef)
+        members = set(db.fetch(fk))
+        if isinstance(op, MapPut):
+            # Write the index entry first, so that a crash leaves an index entry
+            # with no value, which reads as absent.
+            db.save(index_key(ek), ef)
+            if op.value not in members:
+                db.save(fk, op.value)
+            members.discard(op.value)
+        for member in members:
+            db.delete(fk, member)
+        if isinstance(op, MapPut):
+            return True
+        db.delete(index_key(ek), ef)
+        return bool(members)
+    if isinstance(op, MapClear):
+        if is_legacy(op.key):
+            raw = cast(bytes, op.key[0])
+            for member in list(db.fetch(raw)):
+                db.delete(raw, member)
+            return None
+        ek = encode(op.key)
+        for ef in list(db.fetch(index_key(ek))):
+            for member in list(db.fetch(field_key(ek, ef))):
+                db.delete(field_key(ek, ef), member)
+            db.delete(index_key(ek), ef)
+        return None
+    ek = encode(op.key)
+    if isinstance(op, LogTrim):
+        return _emulated_trim(db, ek, maxlen=op.maxlen, before=op.before)
+    state = _EmulationState.of(db)
+    entry_id = state.new_entry_id()
+    db.save(log_key(ek), entry_id + op.value)
+    if op.maxlen is not None:
+        # Trimming reads the whole log, so do it after every maxlen/4 appends
+        # from this process, rather than after every append.
+        lk = log_key(ek)
+        count = state.appends_since_trim.get(lk, 0) + 1
+        if count >= max(1, op.maxlen // 4):
+            _emulated_trim(db, ek, maxlen=op.maxlen)
+            count = 0
+        state.appends_since_trim[lk] = count
+    return entry_id
 
 
 def _usable_dir(path: StrPathT) -> bool:
@@ -226,7 +871,22 @@ class ExampleDatabase(metaclass=_EDMeta):
     * |ExampleDatabase._start_listening|
     * |ExampleDatabase._stop_listening|
     * |ExampleDatabase._broadcast_change|
+
+    Structured data
+    ---------------
+
+    Every database also stores maps, logs, and a change journal, for tools such as
+    HypoFuzz. Keys are tuples, and the first component of a key is its partition.
+    A key with a single bytes component holds a set, as the methods above do.
+
+    A database that implements only ``save``, ``fetch``, and ``delete`` supports
+    all of this through emulation, which is slower and not atomic. A backend can
+    instead implement ``read_many``, ``write_many``, ``journal_head``,
+    ``journal_read``, and ``capabilities``. See ``guides/database-design.md``.
     """
+
+    #: How long, in seconds, journal entries are kept after they are written.
+    journal_retention: float = 300.0
 
     def __init__(self) -> None:
         self._listeners: list[ListenerT] = []
@@ -287,9 +947,9 @@ class ExampleDatabase(metaclass=_EDMeta):
         the database knows that a deletion has occurred in ``key``, but does not
         know what value was deleted.
         """
-        had_listeners = bool(self._listeners)
+        was_listening = self._wants_events()
         self._listeners.append(f)
-        if not had_listeners:
+        if not was_listening:
             self._start_listening()
 
     def remove_listener(self, f: ListenerT, /) -> None:
@@ -301,15 +961,18 @@ class ExampleDatabase(metaclass=_EDMeta):
         if f not in self._listeners:
             return
         self._listeners.remove(f)
-        if not self._listeners:
+        if not self._wants_events():
             self._stop_listening()
 
     def clear_listeners(self) -> None:
         """Remove all change listeners."""
         had_listeners = bool(self._listeners)
         self._listeners.clear()
-        if had_listeners:
+        if had_listeners and not self._wants_events():
             self._stop_listening()
+
+    def _wants_events(self) -> bool:
+        return bool(self._listeners) or "_journal_buffer" in self.__dict__
 
     def _broadcast_change(self, event: ListenerEventT) -> None:
         """
@@ -331,6 +994,9 @@ class ExampleDatabase(metaclass=_EDMeta):
         """
         for listener in self._listeners:
             listener(event)
+        journal = self.__dict__.get("_journal_buffer")
+        if journal is not None and (change := _change_from_event(event)) is not None:
+            journal.add([change])
 
     def _start_listening(self) -> None:
         """
@@ -364,8 +1030,257 @@ class ExampleDatabase(metaclass=_EDMeta):
             stacklevel=4,
         )
 
+    # Structured data. The single-operation methods are shorthand for read_many
+    # and write_many, which backends override. See guides/database-design.md.
 
-class InMemoryExampleDatabase(ExampleDatabase):
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """What this database guarantees, as a subset of ``native``, ``atomic``,
+        ``journal``, ``blocking``, ``shared``, ``ttl``, and ``server_time``."""
+        return frozenset()
+
+    def map_get(self, key: KeyT, field: KeyT) -> bytes | None:
+        """Return the value of ``field`` in the map at ``key``, or ``None``."""
+        return self.read_many([MapGet(key, field)])[0]
+
+    def map_items(self, key: KeyT, *, prefix: KeyT = ()) -> dict[KeyTupleT, bytes]:
+        """Return the fields of the map at ``key`` that extend ``prefix``."""
+        return self.read_many([MapItems(key, prefix)])[0]
+
+    def map_put(
+        self,
+        key: KeyT,
+        field: KeyT,
+        value: bytes = b"",
+        *,
+        ttl: TTLT = None,
+        expect: bytes | _Unset | None = unset,
+    ) -> bool | None:
+        """Set ``field`` to ``value`` in the map at ``key``.
+
+        With ``expect=None`` the write applies only if the field is absent, and
+        with ``expect=b"..."`` only if the field has that value. The entry may
+        disappear at any time after ``ttl`` seconds.
+
+        Returns ``True`` if the write applied, ``False`` if a condition failed,
+        and ``None`` if the database queued the write to apply later.
+        """
+        return self.write_many([MapPut(key, field, value, ttl, expect)])[0]
+
+    def map_delete(
+        self, key: KeyT, field: KeyT, *, expect: bytes | _Unset = unset
+    ) -> bool | None:
+        """Delete ``field`` from the map at ``key``.
+
+        Returns ``True`` if the field existed and matched ``expect``, and ``None``
+        if the database queued the write to apply later.
+        """
+        return self.write_many([MapDelete(key, field, expect)])[0]
+
+    def map_clear(self, key: KeyT) -> None:
+        """Delete every field of the map at ``key``."""
+        self.write_many([MapClear(key)])
+
+    def log_append(
+        self, key: KeyT, value: bytes, *, maxlen: int | None = None, ttl: TTLT = None
+    ) -> bytes | None:
+        """Append ``value`` to the log at ``key``, and return the new entry's id.
+
+        The log keeps at least the newest ``maxlen`` entries. Entries older than
+        ``ttl`` seconds may be removed. Returns ``None`` if the database queued
+        the write to apply later.
+        """
+        return self.write_many([LogAppend(key, value, maxlen, ttl)])[0]
+
+    def log_range(
+        self,
+        key: KeyT,
+        *,
+        after: bytes | None = None,
+        before: bytes | None = None,
+        limit: int | None = None,
+        reverse: bool = False,
+    ) -> list[tuple[bytes, bytes]]:
+        """Return ``(entry_id, value)`` pairs from the log at ``key``.
+
+        Entry ids increase in the order the entries were appended. ``after``
+        and ``before`` are exclusive bounds.
+        """
+        return self.read_many([LogRange(key, after, before, limit, reverse)])[0]
+
+    def log_trim(
+        self, key: KeyT, *, maxlen: int | None = None, before: bytes | None = None
+    ) -> int | None:
+        """Remove all but the newest ``maxlen`` entries, and any entries before
+        ``before``. Returns the number of entries removed, or ``None`` if the
+        database queued the write to apply later."""
+        return self.write_many([LogTrim(key, maxlen, before)])[0]
+
+    def read_many(self, ops: Sequence[ReadOpT]) -> list[Any]:
+        """Run several reads, in one round trip where the backend allows."""
+        return [_emulated_read(self, op) for op in ops]
+
+    def write_many(self, ops: Sequence[WriteOpT], *, atomic: bool = False) -> list[Any]:
+        """Apply several writes in order, and return their results.
+
+        With ``atomic=True``, every operation must be in the same partition, and
+        either all of them apply or none do. This emulation is not atomic.
+        """
+        ops = list(ops)
+        if atomic:
+            _check_atomic(ops)
+            if not all(
+                _emulated_current(self, op) == op.expect
+                for op in ops
+                if _is_conditional(op)
+            ):
+                return _not_applied(ops)
+        return [_emulated_write(self, op, check=not atomic) for op in ops]
+
+    def journal_head(self, partition: KeyPartT) -> bytes:
+        """Return a cursor for the current end of ``partition``'s journal."""
+        return self._listener_journal().head(partition)
+
+    def journal_read(
+        self,
+        cursors: Mapping[KeyPartT, bytes],
+        *,
+        timeout: float | None = 0,
+        limit: int | None = None,
+    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
+        """Return changes after each cursor, and new cursors for every partition.
+
+        Changes arrive at least once, in order within each partition. With a
+        positive ``timeout``, wait up to that many seconds for a change, or
+        forever if ``timeout`` is ``None``. Raises :class:`JournalCursorExpired`
+        if changes may have been lost.
+        """
+        return self._listener_journal().read(cursors, timeout, limit)
+
+    def _listener_journal(self) -> _JournalBuffer:
+        # A journal built from the change listener. It sees only the changes that
+        # the listener reports, and only from when the first cursor was taken.
+        try:
+            return self.__dict__["_journal_buffer"]
+        except KeyError:
+            with _EmulationState._init_lock:
+                if "_journal_buffer" in self.__dict__:
+                    return self.__dict__["_journal_buffer"]
+                was_listening = self._wants_events()
+                journal = self.__dict__["_journal_buffer"] = _JournalBuffer(
+                    self.journal_retention
+                )
+            if not was_listening:
+                self._start_listening()
+            return journal
+
+    def current_time(self) -> float:
+        """The store's clock, in seconds since the epoch."""
+        return time.time()
+
+    def flush(self, timeout: float | None = None) -> None:
+        """Wait until every queued write has been applied."""
+
+
+class _NativeDatabase(ExampleDatabase):
+    """A backend that implements the structured API directly.
+
+    The old methods become views onto the structured data. Keys passed to
+    ``save``, ``fetch`` and ``delete`` are sets, unless they are one of the
+    reserved keys that the emulation uses, which map onto fields and logs.
+    """
+
+    @abc.abstractmethod
+    def read_many(self, ops: Sequence[ReadOpT]) -> list[Any]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def write_many(self, ops: Sequence[WriteOpT], *, atomic: bool = False) -> list[Any]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def journal_head(self, partition: KeyPartT) -> bytes:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def journal_read(
+        self,
+        cursors: Mapping[KeyPartT, bytes],
+        *,
+        timeout: float | None = 0,
+        limit: int | None = None,
+    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
+        raise NotImplementedError
+
+    def _log_delete(self, key: KeyTupleT, entry_id: bytes) -> None:
+        raise NotImplementedError(f"{type(self).__name__}._log_delete")
+
+    def save(self, key: bytes, value: bytes) -> None:
+        parsed = parse_legacy_key(key)
+        if parsed.kind == "set":
+            self.write_many([MapPut(parsed.key, (bytes(value),))])
+        elif parsed.kind == "field":
+            self.write_many([MapPut(parsed.key, parsed.field, value)])
+        elif parsed.kind == "log" and len(value) >= ENTRY_ID_SIZE:
+            # The store assigns its own ids.
+            self.write_many([LogAppend(parsed.key, value[ENTRY_ID_SIZE:])])
+
+    def fetch(self, key: bytes) -> Iterable[bytes]:
+        # Read now, but return an iterator, as the old implementations did.
+        parsed = parse_legacy_key(key)
+        if parsed.kind == "set":
+            return iter([cast(bytes, f[0]) for f in self.map_items(parsed.key)])
+        if parsed.kind == "field":
+            value = self.map_get(parsed.key, parsed.field)
+            return iter([] if value is None else [value])
+        if parsed.kind == "index":
+            return iter([encode(f) for f in self.map_items(parsed.key)])
+        return iter(
+            [entry_id + value for entry_id, value in self.log_range(parsed.key)]
+        )
+
+    def delete(self, key: bytes, value: bytes) -> None:
+        parsed = parse_legacy_key(key)
+        if parsed.kind == "set":
+            self.write_many([MapDelete(parsed.key, (bytes(value),))])
+        elif parsed.kind == "field":
+            self.write_many([MapDelete(parsed.key, parsed.field, expect=value)])
+        elif parsed.kind == "log" and len(value) >= ENTRY_ID_SIZE:
+            self._log_delete(parsed.key, value[:ENTRY_ID_SIZE])
+
+    def move(self, src: bytes, dest: bytes, value: bytes) -> None:
+        if src == dest:
+            self.save(src, value)
+            return
+        source, target = parse_legacy_key(src), parse_legacy_key(dest)
+        if source.kind == target.kind == "set":
+            self.write_many(
+                [
+                    MapDelete(source.key, (bytes(value),)),
+                    MapPut(target.key, (bytes(value),)),
+                ]
+            )
+        else:
+            super().move(src, dest, value)
+
+
+class _MemoryLog:
+    __slots__ = ("entries", "last_id", "ttl")
+
+    def __init__(self) -> None:
+        self.entries: list[tuple[bytes, bytes]] = []
+        self.last_id: bytes | None = None
+        self.ttl: float | None = None
+
+    def live(self, now: float) -> list[tuple[bytes, bytes]]:
+        if self.ttl is not None and self.entries:
+            cutoff = make_entry_id(max(0, int((now - self.ttl) * 1000)), 0)
+            if stale := bisect_left(self.entries, cutoff, key=lambda e: e[0]):
+                del self.entries[:stale]
+        return self.entries
+
+
+class InMemoryExampleDatabase(_NativeDatabase):
     """A non-persistent example database, implemented in terms of an in-memory
     dictionary.
 
@@ -377,6 +1292,10 @@ class InMemoryExampleDatabase(ExampleDatabase):
     def __init__(self) -> None:
         super().__init__()
         self.data: dict[bytes, set[bytes]] = {}
+        self._maps: dict[KeyTupleT, dict[KeyTupleT, tuple[bytes, float | None]]] = {}
+        self._logs: dict[KeyTupleT, _MemoryLog] = {}
+        self._lock = threading.RLock()
+        self._journal = _JournalBuffer(self.journal_retention)
 
     def __repr__(self) -> str:
         return f"InMemoryExampleDatabase({self.data!r})"
@@ -384,31 +1303,139 @@ class InMemoryExampleDatabase(ExampleDatabase):
     def __eq__(self, other: object) -> bool:
         return isinstance(other, InMemoryExampleDatabase) and self.data is other.data
 
-    def fetch(self, key: bytes) -> Iterable[bytes]:
-        yield from self.data.get(key, ())
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return frozenset({"native", "atomic", "journal", "blocking", "ttl"})
 
-    def save(self, key: bytes, value: bytes) -> None:
-        value = bytes(value)
-        values = self.data.setdefault(key, set())
-        changed = value not in values
-        values.add(value)
+    def _live_value(self, key: KeyTupleT, field: KeyTupleT, now: float) -> bytes | None:
+        if is_legacy(key):
+            return b"" if field[0] in self.data.get(cast(bytes, key[0]), ()) else None
+        entry = self._maps.get(key, {}).get(field)
+        if entry is None or (entry[1] is not None and entry[1] <= now):
+            return None
+        return entry[0]
 
-        if changed:
-            self._broadcast_change(("save", (key, value)))
+    def read_many(self, ops: Sequence[ReadOpT]) -> list[Any]:
+        now = time.time()
+        with self._lock:
+            return [self._read(op, now) for op in ops]
 
-    def delete(self, key: bytes, value: bytes) -> None:
-        value = bytes(value)
-        values = self.data.get(key, set())
-        changed = value in values
-        values.discard(value)
+    def _read(self, op: ReadOpT, now: float) -> Any:
+        if isinstance(op, MapGet):
+            return self._live_value(op.key, op.field, now)
+        if isinstance(op, LogRange):
+            log = self._logs.get(op.key)
+            return _select_entries(log.live(now) if log else [], op)
+        if is_legacy(op.key):
+            members = self.data.get(cast(bytes, op.key[0]), ())
+            return {(m,): b"" for m in members if _matches_prefix((m,), op.prefix)}
+        return {
+            field: value
+            for field, (value, expires) in self._maps.get(op.key, {}).items()
+            if (expires is None or expires > now) and _matches_prefix(field, op.prefix)
+        }
 
-        if changed:
-            self._broadcast_change(("delete", (key, value)))
+    def write_many(self, ops: Sequence[WriteOpT], *, atomic: bool = False) -> list[Any]:
+        ops = list(ops)
+        if atomic:
+            _check_atomic(ops)
+        now = time.time()
+        changes: list[Change] = []
+        with self._lock:
+            if atomic and not all(
+                self._live_value(op.key, op.field, now) == op.expect
+                for op in ops
+                if _is_conditional(op)
+            ):
+                return _not_applied(ops)
+            results = [self._write(op, now, changes, check=not atomic) for op in ops]
+            if changes:
+                self._journal.add(changes)
+        # Call listeners outside the lock, as the old implementation did.
+        if changes and self._listeners:
+            for change in changes:
+                for event in _events_from_change(change):
+                    self._broadcast_change(event)
+        return results
+
+    def _write(
+        self, op: WriteOpT, now: float, changes: list[Change], *, check: bool
+    ) -> Any:
+        if isinstance(op, (MapPut, MapDelete)):
+            current = self._live_value(op.key, op.field, now)
+            if check and _is_conditional(op) and current != op.expect:
+                return False
+            if isinstance(op, MapPut):
+                if is_legacy(op.key):
+                    self.data.setdefault(cast(bytes, op.key[0]), set()).add(
+                        cast(bytes, op.field[0])
+                    )
+                else:
+                    expires = None if op.ttl is None else now + op.ttl
+                    self._maps.setdefault(op.key, {})[op.field] = (op.value, expires)
+                if current != op.value:
+                    changes.append(Change("put", op.key, op.field, value=op.value))
+                return True
+            if current is None:
+                return False
+            if is_legacy(op.key):
+                self.data[cast(bytes, op.key[0])].discard(cast(bytes, op.field[0]))
+            else:
+                del self._maps[op.key][op.field]
+            changes.append(Change("delete", op.key, op.field))
+            return True
+        if isinstance(op, MapClear):
+            if is_legacy(op.key):
+                members = self.data.get(cast(bytes, op.key[0]))
+                cleared = bool(members)
+                if members:
+                    members.clear()
+            else:
+                cleared = bool(self._read(MapItems(op.key), now))
+                self._maps.pop(op.key, None)
+            if cleared:
+                changes.append(Change("clear", op.key))
+            return None
+        log = self._logs.setdefault(op.key, _MemoryLog())
+        if isinstance(op, LogTrim):
+            doomed = len(log.entries) - op.maxlen if op.maxlen is not None else 0
+            if op.before is not None:
+                doomed = max(
+                    doomed, bisect_left(log.entries, op.before, key=lambda e: e[0])
+                )
+            doomed = max(0, doomed)
+            del log.entries[:doomed]
+            return doomed
+        entry_id = next_entry_id(log.last_id, int(now * 1000))
+        log.entries.append((entry_id, op.value))
+        log.last_id = entry_id
+        log.ttl = op.ttl
+        if op.maxlen is not None and len(log.entries) > op.maxlen:
+            del log.entries[: len(log.entries) - op.maxlen]
+        changes.append(Change("append", op.key, entry_id=entry_id, value=op.value))
+        return entry_id
+
+    def _log_delete(self, key: KeyTupleT, entry_id: bytes) -> None:
+        with self._lock:
+            log = self._logs.get(key)
+            if log is not None:
+                log.entries = [e for e in log.entries if e[0] != entry_id]
+
+    def journal_head(self, partition: KeyPartT) -> bytes:
+        return self._journal.head(partition)
+
+    def journal_read(
+        self,
+        cursors: Mapping[KeyPartT, bytes],
+        *,
+        timeout: float | None = 0,
+        limit: int | None = None,
+    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
+        return self._journal.read(cursors, timeout, limit)
 
     def _start_listening(self) -> None:
-        # declare compatibility with the listener api, but do the actual
-        # implementation in .delete and .save, since we know we are the only
-        # writer to .data.
+        # Listeners are called directly by write_many, since every write to
+        # this database goes through this object.
         pass
 
     def _stop_listening(self) -> None:
@@ -464,6 +1491,10 @@ class DirectoryBasedExampleDatabase(ExampleDatabase):
         return (
             isinstance(other, DirectoryBasedExampleDatabase) and self.path == other.path
         )
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return frozenset({"journal"})
 
     def _key_path(self, key: bytes) -> Path:
         try:
@@ -737,12 +1768,56 @@ class ReadOnlyDatabase(ExampleDatabase):
     def delete(self, key: bytes, value: bytes) -> None:
         pass
 
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self._wrapped.capabilities
+
+    def read_many(self, ops: Sequence[ReadOpT]) -> list[Any]:
+        return self._wrapped.read_many(ops)
+
+    def write_many(self, ops: Sequence[WriteOpT], *, atomic: bool = False) -> list[Any]:
+        return _not_applied(list(ops))
+
+    def journal_head(self, partition: KeyPartT) -> bytes:
+        return self._wrapped.journal_head(partition)
+
+    def journal_read(
+        self,
+        cursors: Mapping[KeyPartT, bytes],
+        *,
+        timeout: float | None = 0,
+        limit: int | None = None,
+    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
+        return self._wrapped.journal_read(cursors, timeout=timeout, limit=limit)
+
+    def current_time(self) -> float:
+        return self._wrapped.current_time()
+
     def _start_listening(self) -> None:
         # we're read only, so there are no changes to broadcast.
         pass
 
     def _stop_listening(self) -> None:
         pass
+
+
+def _pack_cursors(cursors: list[bytes]) -> bytes:
+    return make_cursor(b"".join(_pack_uleb128(len(c)) + c for c in cursors))
+
+
+def _unpack_cursors(cursor: bytes, count: int) -> list[bytes]:
+    _, data = split_cursor(cursor)
+    parts = []
+    try:
+        while data:
+            used, size = _unpack_uleb128(data)
+            parts.append(data[used : used + size])
+            data = data[used + size :]
+    except ValueError:
+        pass
+    if len(parts) != count:
+        raise InvalidArgument(f"invalid journal cursor {cursor!r}")
+    return parts
 
 
 class MultiplexedDatabase(ExampleDatabase):
@@ -803,6 +1878,68 @@ class MultiplexedDatabase(ExampleDatabase):
     def move(self, src: bytes, dest: bytes, value: bytes) -> None:
         for db in self._wrapped:
             db.move(src, dest, value)
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        caps = [db.capabilities for db in self._wrapped]
+        return frozenset.intersection(*caps) if caps else frozenset()
+
+    def read_many(self, ops: Sequence[ReadOpT]) -> list[Any]:
+        ops = list(ops)
+        per_db = [db.read_many(ops) for db in self._wrapped]
+        results: list[Any] = []
+        for i, op in enumerate(ops):
+            found = [r[i] for r in per_db]
+            if isinstance(op, MapGet):
+                results.append(next((v for v in found if v is not None), None))
+            elif isinstance(op, MapItems):
+                # Earlier databases take precedence.
+                results.append(
+                    {k: v for items in reversed(found) for k, v in items.items()}
+                )
+            else:
+                merged = sorted({entry for entries in found for entry in entries})
+                results.append(_select_entries(merged, op))
+        return results
+
+    def write_many(self, ops: Sequence[WriteOpT], *, atomic: bool = False) -> list[Any]:
+        ops = list(ops)
+        results = [db.write_many(ops, atomic=atomic) for db in self._wrapped]
+        return results[0] if results else _not_applied(ops)
+
+    def journal_head(self, partition: KeyPartT) -> bytes:
+        return _pack_cursors([db.journal_head(partition) for db in self._wrapped])
+
+    def journal_read(
+        self,
+        cursors: Mapping[KeyPartT, bytes],
+        *,
+        timeout: float | None = 0,
+        limit: int | None = None,
+    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
+        per_db: list[dict[KeyPartT, bytes]] = [{} for _ in self._wrapped]
+        for partition, cursor in cursors.items():
+            parts = _unpack_cursors(cursor, len(self._wrapped))
+            for i, part in enumerate(parts):
+                per_db[i][partition] = part
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            changes: list[Change] = []
+            for i, db in enumerate(self._wrapped):
+                found, per_db[i] = db.journal_read(per_db[i], timeout=0, limit=limit)
+                changes.extend(found)
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if changes or (remaining is not None and remaining <= 0):
+                new = {p: _pack_cursors([c[p] for c in per_db]) for p in cursors}
+                return changes, new
+            time.sleep(0.05 if remaining is None else min(0.05, remaining))
+
+    def current_time(self) -> float:
+        return self._wrapped[0].current_time() if self._wrapped else time.time()
+
+    def flush(self, timeout: float | None = None) -> None:
+        for db in self._wrapped:
+            db.flush(timeout)
 
     def _start_listening(self) -> None:
         for db in self._wrapped:
@@ -1193,8 +2330,16 @@ class BackgroundWriteDatabase(ExampleDatabase):
     def _worker(self) -> None:
         while True:
             method, args = self._queue.get()
-            getattr(self._db, method)(*args)
-            self._queue.task_done()
+            try:
+                getattr(self._db, method)(*args)
+            except Exception as err:
+                warnings.warn(
+                    f"{self!r} could not apply a queued {method}: {err!r}",
+                    HypothesisWarning,
+                    stacklevel=1,
+                )
+            finally:
+                self._queue.task_done()
 
     def _join(self, timeout: float | None = None) -> None:
         # copy of Queue.join with a timeout. https://bugs.python.org/issue9634
@@ -1218,6 +2363,42 @@ class BackgroundWriteDatabase(ExampleDatabase):
         self._ensure_thread()
         self._queue.put(("move", (src, dest, value)))
 
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self._db.capabilities
+
+    def read_many(self, ops: Sequence[ReadOpT]) -> list[Any]:
+        self._join()
+        return self._db.read_many(ops)
+
+    def write_many(self, ops: Sequence[WriteOpT], *, atomic: bool = False) -> list[Any]:
+        ops = list(ops)
+        if atomic or any(_is_conditional(op) for op in ops):
+            self._join()
+            return self._db.write_many(ops, atomic=atomic)
+        self._ensure_thread()
+        self._queue.put(("write_many", (ops,)))
+        return [None] * len(ops)
+
+    def journal_head(self, partition: KeyPartT) -> bytes:
+        return self._db.journal_head(partition)
+
+    def journal_read(
+        self,
+        cursors: Mapping[KeyPartT, bytes],
+        *,
+        timeout: float | None = 0,
+        limit: int | None = None,
+    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
+        return self._db.journal_read(cursors, timeout=timeout, limit=limit)
+
+    def current_time(self) -> float:
+        return self._db.current_time()
+
+    def flush(self, timeout: float | None = None) -> None:
+        self._join(timeout)
+        self._db.flush(timeout)
+
     def _start_listening(self) -> None:
         self._db.add_listener(self._broadcast_change)
 
@@ -1225,43 +2406,757 @@ class BackgroundWriteDatabase(ExampleDatabase):
         self._db.remove_listener(self._broadcast_change)
 
 
-def _pack_uleb128(value: int) -> bytes:
+_PUT, _DELETE, _CLEAR, _APPEND, _INVALIDATE = 1, 2, 3, 4, 5
+_CHANGE_OPS: dict[int, ChangeOpT] = {
+    _PUT: "put",
+    _DELETE: "delete",
+    _CLEAR: "clear",
+    _APPEND: "append",
+    _INVALIDATE: "invalidate",
+}
+#: Journal entries include values up to this size. Larger values arrive as None.
+INLINE_VALUE_LIMIT = 64 * 1024
+
+
+def _journal_change(
+    op: int,
+    key: bytes,
+    field: bytes | None,
+    entry_id: bytes | None,
+    value: bytes | None,
+) -> Change:
+    """Build a Change from a journal row, as stored by the SQL backends."""
+    return Change(
+        _CHANGE_OPS[op],
+        decode(key),
+        None if field is None else decode(field),
+        entry_id,
+        value,
+    )
+
+
+_SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS maps (
+    kh BLOB NOT NULL, fh BLOB NOT NULL, key BLOB NOT NULL, field BLOB NOT NULL,
+    value BLOB NOT NULL, exp REAL, PRIMARY KEY (kh, fh)
+);
+CREATE INDEX IF NOT EXISTS maps_exp ON maps (exp) WHERE exp IS NOT NULL;
+CREATE TABLE IF NOT EXISTS logs (
+    kh BLOB NOT NULL, id BLOB NOT NULL, value BLOB NOT NULL, PRIMARY KEY (kh, id)
+);
+CREATE TABLE IF NOT EXISTS log_meta (
+    kh BLOB PRIMARY KEY, key BLOB NOT NULL, last_id BLOB NOT NULL,
+    count INTEGER NOT NULL, ttl REAL
+);
+CREATE TABLE IF NOT EXISTS journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, ph BLOB NOT NULL,
+    op INTEGER NOT NULL, key BLOB NOT NULL, field BLOB, eid BLOB, value BLOB
+);
+CREATE INDEX IF NOT EXISTS journal_at ON journal (at);
+"""
+
+
+class SQLiteExampleDatabase(_NativeDatabase):
+    """Store examples in a SQLite database file.
+
+    Any number of processes on one machine can use the same file. The file must
+    not be on a network filesystem, because SQLite's write-ahead log needs
+    shared memory.
     """
-    Serialize an integer into variable-length bytes. For each byte, the first 7
-    bits represent (part of) the integer, while the last bit indicates whether the
-    integer continues into the next byte.
 
-    https://en.wikipedia.org/wiki/LEB128
+    def __init__(
+        self,
+        path: StrPathT,
+        *,
+        journal_retention: float = 300.0,
+        poll_interval: float = 0.01,
+    ) -> None:
+        super().__init__()
+        self.path = Path(path)
+        self.journal_retention = journal_retention
+        self._poll_interval = poll_interval
+        self._local = threading.local()
+        self._next_cleanup = time.time() + 1
+        self._listen_stop: threading.Event | None = None
+        self._listen_thread: Thread | None = None
+        self._listen_position = 0
+
+    def __repr__(self) -> str:
+        return f"SQLiteExampleDatabase({self.path!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, SQLiteExampleDatabase) and self.path == other.path
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {"path": self.path, "journal_retention": self.journal_retention}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__init__(state["path"], journal_retention=state["journal_retention"])  # type: ignore
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return frozenset({"native", "atomic", "journal", "blocking", "ttl"})
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None or self._local.pid != os.getpid():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(
+                self.path, timeout=60, isolation_level=None, check_same_thread=False
+            )
+            self._use_wal(conn)
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.executescript(_SQLITE_SCHEMA)
+            self._local.conn = conn
+            self._local.pid = os.getpid()
+        return conn
+
+    @staticmethod
+    def _use_wal(conn: sqlite3.Connection) -> None:
+        # The journal mode is stored in the file, so check it before setting it.
+        # Setting it takes a lock, and SQLite does not wait for that lock, so
+        # processes that open a new file together can fail here. Retry them.
+        for attempt in range(50):
+            try:
+                if conn.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                    conn.execute("PRAGMA journal_mode=WAL")
+                return
+            except sqlite3.OperationalError:
+                if attempt == 49:
+                    raise
+                time.sleep(0.1)
+
+    @staticmethod
+    def _partition_hash(key: KeyTupleT) -> bytes:
+        return short_hash(encode(key[:1]))
+
+    @staticmethod
+    def _inline(value: bytes) -> bytes | None:
+        return value if len(value) <= INLINE_VALUE_LIMIT else None
+
+    def read_many(self, ops: Sequence[ReadOpT]) -> list[Any]:
+        conn = self._conn()
+        now = time.time()
+        results: list[Any] = []
+        for op in ops:
+            ek = encode(op.key)
+            kh = short_hash(ek)
+            if isinstance(op, MapGet):
+                ef = encode(op.field)
+                row = conn.execute(
+                    "SELECT value, exp FROM maps WHERE kh=? AND fh=? AND key=? AND field=?",
+                    (kh, short_hash(ef), ek, ef),
+                ).fetchone()
+                results.append(
+                    row[0] if row and (row[1] is None or row[1] > now) else None
+                )
+            elif isinstance(op, MapItems):
+                prefix = encode(op.prefix)
+                rows = conn.execute(
+                    "SELECT field, value, exp FROM maps WHERE kh=? AND key=?", (kh, ek)
+                )
+                results.append(
+                    {
+                        decode(field): value
+                        for field, value, exp in rows
+                        if (exp is None or exp > now) and field.startswith(prefix)
+                    }
+                )
+            else:
+                sql = "SELECT id, value FROM logs WHERE kh=?"
+                params: list[Any] = [kh]
+                if op.after is not None:
+                    sql += " AND id > ?"
+                    params.append(op.after)
+                if op.before is not None:
+                    sql += " AND id < ?"
+                    params.append(op.before)
+                sql += " ORDER BY id DESC" if op.reverse else " ORDER BY id"
+                if op.limit is not None:
+                    sql += " LIMIT ?"
+                    params.append(op.limit)
+                results.append([tuple(row) for row in conn.execute(sql, params)])
+        return results
+
+    def write_many(self, ops: Sequence[WriteOpT], *, atomic: bool = False) -> list[Any]:
+        ops = list(ops)
+        if not ops:
+            return []
+        if atomic:
+            _check_atomic(ops)
+        conn = self._conn()
+        now = time.time()
+        journal: list[tuple[Any, ...]] = []
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if atomic and not all(
+                self._current(conn, op, now) == op.expect
+                for op in ops
+                if _is_conditional(op)
+            ):
+                conn.execute("ROLLBACK")
+                return _not_applied(ops)
+            results = [
+                self._write(conn, op, now, journal, check=not atomic) for op in ops
+            ]
+            if journal:
+                conn.executemany(
+                    "INSERT INTO journal (at, ph, op, key, field, eid, value) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    journal,
+                )
+            conn.execute("COMMIT")
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+        if now > self._next_cleanup:
+            self._cleanup(conn, now)
+        return results
+
+    @staticmethod
+    def _row(
+        conn: sqlite3.Connection, ek: bytes, ef: bytes
+    ) -> tuple[bytes, float | None] | None:
+        return conn.execute(
+            "SELECT value, exp FROM maps WHERE kh=? AND fh=? AND key=? AND field=?",
+            (short_hash(ek), short_hash(ef), ek, ef),
+        ).fetchone()
+
+    def _current(
+        self, conn: sqlite3.Connection, op: MapPut | MapDelete, now: float
+    ) -> bytes | None:
+        row = self._row(conn, encode(op.key), encode(op.field))
+        return row[0] if row and (row[1] is None or row[1] > now) else None
+
+    def _write(
+        self,
+        conn: sqlite3.Connection,
+        op: WriteOpT,
+        now: float,
+        journal: list[tuple[Any, ...]],
+        *,
+        check: bool,
+    ) -> Any:
+        ek = encode(op.key)
+        kh = short_hash(ek)
+        ph = self._partition_hash(op.key)
+        if isinstance(op, (MapPut, MapDelete)):
+            ef = encode(op.field)
+            fh = short_hash(ef)
+            row = self._row(conn, ek, ef)
+            current = row[0] if row and (row[1] is None or row[1] > now) else None
+            if check and _is_conditional(op) and current != op.expect:
+                return False
+            if isinstance(op, MapPut):
+                expires = None if op.ttl is None else now + op.ttl
+                if (
+                    current != op.value
+                    or expires is not None
+                    or (row and row[1] is not None)
+                ):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO maps VALUES (?, ?, ?, ?, ?, ?)",
+                        (kh, fh, ek, ef, op.value, expires),
+                    )
+                if current != op.value:
+                    journal.append(
+                        (now, ph, _PUT, ek, ef, None, self._inline(op.value))
+                    )
+                return True
+            conn.execute(
+                "DELETE FROM maps WHERE kh=? AND fh=? AND key=? AND field=?",
+                (kh, fh, ek, ef),
+            )
+            if current is None:
+                return False
+            journal.append((now, ph, _DELETE, ek, ef, None, None))
+            return True
+        if isinstance(op, MapClear):
+            if conn.execute("DELETE FROM maps WHERE kh=? AND key=?", (kh, ek)).rowcount:
+                journal.append((now, ph, _CLEAR, ek, None, None, None))
+            return None
+        if isinstance(op, LogTrim):
+            removed = self._trim(conn, kh, maxlen=op.maxlen, before=op.before)
+            conn.execute(
+                "UPDATE log_meta SET count = count - ? WHERE kh=?", (removed, kh)
+            )
+            return removed
+        meta = conn.execute(
+            "SELECT last_id, count FROM log_meta WHERE kh=?", (kh,)
+        ).fetchone()
+        entry_id = next_entry_id(meta[0] if meta else None, int(now * 1000))
+        count = (meta[1] if meta else 0) + 1
+        conn.execute("INSERT INTO logs VALUES (?, ?, ?)", (kh, entry_id, op.value))
+        if op.maxlen is not None and count > op.maxlen + max(1, op.maxlen // 4):
+            count -= self._trim(conn, kh, maxlen=op.maxlen)
+        conn.execute(
+            "INSERT OR REPLACE INTO log_meta VALUES (?, ?, ?, ?, ?)",
+            (kh, ek, entry_id, count, op.ttl),
+        )
+        journal.append((now, ph, _APPEND, ek, None, entry_id, self._inline(op.value)))
+        return entry_id
+
+    @staticmethod
+    def _trim(
+        conn: sqlite3.Connection,
+        kh: bytes,
+        *,
+        maxlen: int | None = None,
+        before: bytes | None = None,
+    ) -> int:
+        removed = 0
+        if before is not None:
+            removed += conn.execute(
+                "DELETE FROM logs WHERE kh=? AND id<?", (kh, before)
+            ).rowcount
+        if maxlen is not None:
+            row = conn.execute(
+                "SELECT id FROM logs WHERE kh=? ORDER BY id DESC LIMIT 1 OFFSET ?",
+                (kh, maxlen),
+            ).fetchone()
+            if row:
+                removed += conn.execute(
+                    "DELETE FROM logs WHERE kh=? AND id<=?", (kh, row[0])
+                ).rowcount
+        return removed
+
+    def _log_delete(self, key: KeyTupleT, entry_id: bytes) -> None:
+        kh = short_hash(encode(key))
+        conn = self._conn()
+        with conn:
+            if conn.execute(
+                "DELETE FROM logs WHERE kh=? AND id=?", (kh, entry_id)
+            ).rowcount:
+                conn.execute("UPDATE log_meta SET count = count - 1 WHERE kh=?", (kh,))
+
+    def _cleanup(self, conn: sqlite3.Connection, now: float) -> None:
+        self._next_cleanup = now + min(10.0, self.journal_retention / 4)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "DELETE FROM journal WHERE at < ?", (now - self.journal_retention,)
+            )
+            conn.execute("DELETE FROM maps WHERE exp < ?", (now,))
+            for kh, ttl in conn.execute(
+                "SELECT kh, ttl FROM log_meta WHERE ttl IS NOT NULL"
+            ).fetchall():
+                cutoff = make_entry_id(max(0, int((now - ttl) * 1000)), 0)
+                if removed := self._trim(conn, kh, before=cutoff):
+                    conn.execute(
+                        "UPDATE log_meta SET count = count - ? WHERE kh=?",
+                        (removed, kh),
+                    )
+            conn.execute("COMMIT")
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+
+    @staticmethod
+    def _head(conn: sqlite3.Connection) -> int:
+        # Ids are assigned in commit order, since SQLite has one writer at a time.
+        row = conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='journal'"
+        ).fetchone()
+        return row[0] if row else 0
+
+    def journal_head(self, partition: KeyPartT) -> bytes:
+        return make_cursor(struct.pack(">q", self._head(self._conn())))
+
+    def journal_read(
+        self,
+        cursors: Mapping[KeyPartT, bytes],
+        *,
+        timeout: float | None = 0,
+        limit: int | None = None,
+    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
+        positions = _positions(cursors, self.journal_retention, ">q")
+        if not positions:
+            return [], {}
+        by_hash = {short_hash(encode((p,))): p for p in positions}
+        conn = self._conn()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        placeholders = ",".join("?" * len(by_hash))
+        while True:
+            conn.execute("BEGIN")
+            try:
+                head = self._head(conn)
+                rows = conn.execute(
+                    "SELECT id, ph, op, key, field, eid, value FROM journal "
+                    f"WHERE id > ? AND ph IN ({placeholders}) ORDER BY id LIMIT ?",
+                    (
+                        min(pos for pos, _ in positions.values()),
+                        *by_hash,
+                        -1 if limit is None else limit,
+                    ),
+                ).fetchall()
+                version = conn.execute("PRAGMA data_version").fetchone()[0]
+            finally:
+                conn.execute("COMMIT")
+            changes = [
+                _journal_change(op, key, field, eid, value)
+                for id_, ph, op, key, field, eid, value in rows
+                if id_ > positions[by_hash[ph]][0]
+            ]
+            truncated = limit is not None and len(rows) == limit
+            upto = rows[-1][0] if truncated else head
+            issued = time.time()
+            positions = {
+                p: (max(pos, upto), issued_at if truncated else issued)
+                for p, (pos, issued_at) in positions.items()
+            }
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if changes or (remaining is not None and remaining <= 0):
+                return changes, {
+                    p: make_cursor(struct.pack(">q", pos), issued_at)
+                    for p, (pos, issued_at) in positions.items()
+                }
+            # Other connections' commits change data_version, which is cheap to poll.
+            while remaining is None or remaining > 0:
+                time.sleep(
+                    self._poll_interval
+                    if remaining is None
+                    else min(self._poll_interval, remaining)
+                )
+                if conn.execute("PRAGMA data_version").fetchone()[0] != version:
+                    break
+                remaining = None if deadline is None else deadline - time.monotonic()
+
+    def _start_listening(self) -> None:
+        stop = self._listen_stop = threading.Event()
+        # Open the thread's connection here, so it works even if the thread
+        # starts after the file has been moved or deleted.
+        conn = self._conn()
+        self._listen_position = self._head(conn)
+
+        def run() -> None:
+            while not stop.is_set():
+                rows = conn.execute(
+                    "SELECT id, op, key, field, eid, value FROM journal WHERE id > ? "
+                    "ORDER BY id LIMIT 1000",
+                    (self._listen_position,),
+                ).fetchall()
+                for id_, *row in rows:
+                    for event in _events_from_change(_journal_change(*row)):
+                        self._broadcast_change(event)
+                    self._listen_position = id_
+                if not rows:
+                    stop.wait(self._poll_interval)
+
+        self._listen_thread = Thread(target=run, daemon=True)
+        self._listen_thread.start()
+
+    def _stop_listening(self) -> None:
+        assert self._listen_stop is not None
+        assert self._listen_thread is not None
+        self._listen_stop.set()
+        self._listen_thread.join()
+        self._listen_thread = self._listen_stop = None
+
+    def _wait_for_listeners(self, timeout: float = 10) -> None:
+        """Wait until listeners have seen every change committed so far."""
+        head = self._head(self._conn())
+        # Wait in real time, with Event.wait, even if the clock is faked.
+        pause = threading.Event()
+        for _ in range(int(timeout / 0.01)):
+            if self._listen_thread is None or not (self._listen_position < head):
+                return
+            pause.wait(0.01)
+        raise TimeoutError("listener thread did not catch up")
+
+
+def _positions(
+    cursors: Mapping[KeyPartT, bytes], retention: float, fmt: str
+) -> dict[KeyPartT, tuple[Any, float]]:
+    """Unpack cursors that hold a struct of ``fmt``, and check their age."""
+    positions: dict[KeyPartT, tuple[Any, float]] = {}
+    expired = []
+    now = time.time()
+    for partition, cursor in cursors.items():
+        issued_at, position = split_cursor(cursor)
+        if now - issued_at > retention / 2:
+            expired.append(partition)
+            continue
+        try:
+            unpacked = struct.unpack(fmt, position)
+        except struct.error:
+            raise InvalidArgument(f"invalid journal cursor {cursor!r}") from None
+        positions[partition] = (
+            unpacked[0] if len(unpacked) == 1 else unpacked,
+            issued_at,
+        )
+    if expired:
+        raise JournalCursorExpired(expired)
+    return positions
+
+
+class ReadThroughDatabase(ExampleDatabase):
+    """Copies data from a ``fallback`` database into ``primary`` as it is read.
+
+    The first time a set is read, its members in ``fallback`` are copied into
+    ``primary``, and a marker in ``primary`` records that this happened. Later
+    reads and all writes use only ``primary``. Use this to move examples from an
+    old database to a new one, without a separate migration step.
     """
-    parts = bytearray()
-    assert value >= 0
-    while True:
-        # chop off 7 bits
-        byte = value & ((1 << 7) - 1)
-        value >>= 7
-        # set the continuation bit if we have more left
-        if value:
-            byte |= 1 << 7
 
-        parts.append(byte)
-        if not value:
-            break
-    return bytes(parts)
+    def __init__(self, primary: ExampleDatabase, fallback: ExampleDatabase) -> None:
+        super().__init__()
+        self.primary = primary
+        self.fallback = fallback
+        self._checked: set[bytes] = set()
+
+    def __repr__(self) -> str:
+        return f"ReadThroughDatabase({self.primary!r}, {self.fallback!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, ReadThroughDatabase)
+            and self.primary == other.primary
+            and self.fallback == other.fallback
+        )
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self.primary.capabilities
+
+    def _copy_up(self, keys: Iterable[bytes]) -> None:
+        todo = list(dict.fromkeys(k for k in keys if k not in self._checked))
+        if not todo:
+            return
+        markers = self.primary.read_many(
+            [MapGet((k, "_meta"), ("read-through",)) for k in todo]
+        )
+        writes: list[WriteOpT] = []
+        stamp = struct.pack(">d", time.time())
+        for key, marker in zip(todo, markers, strict=True):
+            if marker is None:
+                writes.extend(
+                    MapPut((key,), (value,)) for value in self.fallback.fetch(key)
+                )
+                writes.append(MapPut((key, "_meta"), ("read-through",), stamp))
+        if writes:
+            self.primary.write_many(writes)
+        self._checked.update(todo)
+
+    def fetch(self, key: bytes) -> Iterable[bytes]:
+        self._copy_up([key])
+        return self.primary.fetch(key)
+
+    def save(self, key: bytes, value: bytes) -> None:
+        self.primary.save(key, value)
+
+    def delete(self, key: bytes, value: bytes) -> None:
+        # Copy first, so that a later read cannot bring the value back.
+        self._copy_up([key])
+        self.primary.delete(key, value)
+
+    def move(self, src: bytes, dest: bytes, value: bytes) -> None:
+        self._copy_up([src, dest])
+        self.primary.move(src, dest, value)
+
+    def read_many(self, ops: Sequence[ReadOpT]) -> list[Any]:
+        ops = list(ops)
+        self._copy_up(cast(bytes, op.key[0]) for op in ops if is_legacy(op.key))
+        return self.primary.read_many(ops)
+
+    def write_many(self, ops: Sequence[WriteOpT], *, atomic: bool = False) -> list[Any]:
+        ops = list(ops)
+        self._copy_up(
+            cast(bytes, op.key[0])
+            for op in ops
+            if is_legacy(op.key) and not isinstance(op, MapPut)
+        )
+        return self.primary.write_many(ops, atomic=atomic)
+
+    def journal_head(self, partition: KeyPartT) -> bytes:
+        return self.primary.journal_head(partition)
+
+    def journal_read(
+        self,
+        cursors: Mapping[KeyPartT, bytes],
+        *,
+        timeout: float | None = 0,
+        limit: int | None = None,
+    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
+        return self.primary.journal_read(cursors, timeout=timeout, limit=limit)
+
+    def current_time(self) -> float:
+        return self.primary.current_time()
+
+    def flush(self, timeout: float | None = None) -> None:
+        self.primary.flush(timeout)
+
+    def _start_listening(self) -> None:
+        self.primary.add_listener(self._broadcast_change)
+
+    def _stop_listening(self) -> None:
+        self.primary.remove_listener(self._broadcast_change)
 
 
-def _unpack_uleb128(buffer: bytes) -> tuple[int, int]:
+class RemoteDatabase(_NativeDatabase):
+    """A database served by another process on this machine.
+
+    See :func:`serve_database`. Writes that are neither atomic nor conditional
+    are queued, and return ``None``. Writes from one process are applied in
+    order, and a read waits until that process's earlier writes have been
+    applied. Instances can be pickled, so they can be passed to subprocesses.
     """
-    Inverts _pack_uleb128, and also returns the index at which at which we stopped
-    reading.
-    """
-    value = 0
-    for i, byte in enumerate(buffer):
-        n = byte & ((1 << 7) - 1)
-        value |= n << (i * 7)
 
-        if not byte >> 7:
-            break
-    return (i + 1, value)
+    #: Queued writes are sent together, after this many seconds or operations.
+    batch_delay: float = 0.005
+    batch_size: int = 200
+
+    def __init__(self, address: Any, authkey: bytes) -> None:
+        super().__init__()
+        self.address = address
+        self._authkey = authkey
+        self._locks = {False: threading.Lock(), True: threading.Lock()}
+        self._conns: dict[bool, Any] = {}
+        self._pid = os.getpid()
+        self._capabilities: frozenset[str] | None = None
+        self._pending: list[WriteOpT] = []
+        self._pending_lock = threading.Condition()
+        self._flusher: threading.Thread | None = None
+
+    def __repr__(self) -> str:
+        return f"RemoteDatabase({self.address!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, RemoteDatabase) and self.address == other.address
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (RemoteDatabase, (self.address, self._authkey))
+
+    def _check_pid(self) -> None:
+        # After a fork, this process has no connections, no queued writes, and
+        # no flusher thread. The caller holds _pending_lock.
+        if self._pid != os.getpid():
+            self._conns.clear()
+            self._pending, self._flusher = [], None
+            self._pid = os.getpid()
+
+    def _flush_loop(self) -> None:
+        # One thread per process. Starting a thread for each batch cost more than
+        # sending the batch did.
+        while True:
+            with self._pending_lock:
+                while not self._pending:
+                    self._pending_lock.wait()
+            time.sleep(self.batch_delay)  # let more writes join the batch
+            self._send_pending_later()
+
+    def _send_pending(self) -> None:
+        with self._locks[False]:
+            self._send_pending_locked()
+
+    def _send_pending_later(self) -> None:
+        try:
+            self._send_pending()
+        except (OSError, EOFError) as err:
+            warnings.warn(
+                f"{self!r} could not send queued writes: {err!r}",
+                HypothesisWarning,
+                stacklevel=1,
+            )
+
+    def _take_pending(self) -> list[WriteOpT]:
+        with self._pending_lock:
+            self._check_pid()
+            ops, self._pending = self._pending, []
+        return ops
+
+    def _send_pending_locked(self) -> None:
+        # The caller holds the connection's lock, so writes are sent in order.
+        if ops := self._take_pending():
+            self._connection(journal=False).send((None, (), ops))
+
+    def _connection(self, *, journal: bool) -> Any:
+        conn = self._conns.get(journal)
+        if conn is None:
+            conn = self._conns[journal] = Client(self.address, authkey=self._authkey)
+        return conn
+
+    def _call(self, method: str, *args: Any, journal: bool = False) -> Any:
+        # Each message is (method, args, queued writes). The server applies the
+        # writes first, so this process's reads see its writes. Journal reads
+        # block, so they use their own connection, and carry no writes.
+        with self._locks[journal]:
+            writes = [] if journal else self._take_pending()
+            conn = self._connection(journal=journal)
+            conn.send((method, args, writes))
+            ok, result = conn.recv()
+        if not ok:
+            raise result
+        return result
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        if self._capabilities is None:
+            self._capabilities = self._call("capabilities")
+        return self._capabilities
+
+    def read_many(self, ops: Sequence[ReadOpT]) -> list[Any]:
+        return self._call("read_many", list(ops))
+
+    def write_many(self, ops: Sequence[WriteOpT], *, atomic: bool = False) -> list[Any]:
+        ops = list(ops)
+        if atomic or any(_is_conditional(op) for op in ops):
+            return self._call("write_many", ops, atomic)
+        with self._pending_lock:
+            self._check_pid()
+            first = not self._pending
+            self._pending.extend(ops)
+            full = len(self._pending) >= self.batch_size
+            if self._flusher is None:
+                self._flusher = threading.Thread(
+                    target=self._flush_loop, daemon=True, name="hypothesis-db-flush"
+                )
+                self._flusher.start()
+            if first:
+                self._pending_lock.notify()
+        if full:
+            self._send_pending()
+        return [None] * len(ops)
+
+    def _log_delete(self, key: KeyTupleT, entry_id: bytes) -> None:
+        self._call("log_delete", key, entry_id)
+
+    def journal_head(self, partition: KeyPartT) -> bytes:
+        return self._call("journal_head", partition)
+
+    def journal_read(
+        self,
+        cursors: Mapping[KeyPartT, bytes],
+        *,
+        timeout: float | None = 0,
+        limit: int | None = None,
+    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
+        return self._call("journal_read", dict(cursors), timeout, limit, journal=True)
+
+    def current_time(self) -> float:
+        return self._call("current_time")
+
+    def flush(self, timeout: float | None = None) -> None:
+        self._call("flush", timeout)
+
+    def close(self) -> None:
+        self._send_pending()
+        for conn in self._conns.values():
+            conn.close()
+        self._conns.clear()
+
+
+def serve_database(
+    db: ExampleDatabase, *, address: Any = None, authkey: bytes | None = None
+) -> "DatabaseServer":
+    """Serve ``db`` to other processes on this machine, from a background thread.
+
+    Returns a server whose ``client()`` method returns a :class:`RemoteDatabase`.
+    Pass that to worker processes, so that they share this process's connection
+    to the underlying store.
+    """
+    from hypothesis.internal.dbserver import DatabaseServer
+
+    return DatabaseServer(db, address=address, authkey=authkey)
 
 
 def choices_to_bytes(choices: Iterable[ChoiceT], /) -> bytes:

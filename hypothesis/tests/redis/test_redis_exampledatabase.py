@@ -8,10 +8,12 @@
 # v. 2.0. If a copy of the MPL was not distributed with this file, You can
 # obtain one at https://mozilla.org/MPL/2.0/.
 
+import os
 import uuid
 
 import pytest
 from fakeredis import FakeRedis
+from redis import Redis
 
 from hypothesis import settings, strategies as st
 from hypothesis.database import InMemoryExampleDatabase
@@ -19,7 +21,12 @@ from hypothesis.errors import InvalidArgument
 from hypothesis.extra.redis import RedisExampleDatabase
 from hypothesis.stateful import Bundle, RuleBasedStateMachine, rule
 
+from tests.common.utils import time_sleep
 from tests.cover.test_database_backend import _database_conforms_to_listener_api
+from tests.cover.test_database_structured import conforms_to_structured_api
+
+# Set this to a URL, such as redis://localhost:6379, to also test a real server.
+REDIS_URL = os.environ.get("HYPOTHESIS_TEST_REDIS_URL")
 
 
 @pytest.mark.parametrize(
@@ -96,13 +103,8 @@ TestDBs = DatabaseComparison.TestCase
 
 
 def flush_messages(db):
-    # fake redis doesn't have the background polling for pubsub that an actual
-    # redis server does, so we have to flush when we want them.
-    if db._pubsub is None:
-        return
-    # arbitrarily high.
-    for _ in range(100):
-        db._pubsub.get_message()
+    # A thread delivers messages to listeners, polling every 10ms.
+    time_sleep(0.2)
 
 
 def test_redis_listener():
@@ -112,6 +114,9 @@ def test_redis_listener():
         parent_settings=settings(
             max_examples=5,
             stateful_step_count=10,
+            # fakeredis waits for messages with time.sleep, which the test suite
+            # replaces with a fake clock, so the listener thread advances it.
+            deadline=None,
         ),
     )
 
@@ -146,6 +151,7 @@ def test_redis_listener_explicit():
     db.save(b"a", b"c")
     flush_messages(db)
     assert calls == 3
+    db.clear_listeners()
 
 
 def test_redis_move_from_key_without_value():
@@ -182,3 +188,46 @@ def test_redis_equality():
     assert RedisExampleDatabase(redis) == RedisExampleDatabase(redis)
     # FakeRedis() != FakeRedis(), not much we can do here
     assert RedisExampleDatabase(FakeRedis()) != RedisExampleDatabase(FakeRedis())
+
+
+def test_structured_api_fakeredis():
+    conforms_to_structured_api(
+        lambda _path: RedisExampleDatabase(FakeRedis(host=uuid.uuid4().hex)),
+        parent_settings=settings(max_examples=20, stateful_step_count=25),
+    )
+
+
+def _real_redis(_path):
+    name = uuid.uuid4().hex
+    return RedisExampleDatabase(
+        Redis.from_url(REDIS_URL),
+        key_prefix=f"test-{name}:".encode(),
+        listener_channel=f"test-{name}",
+    )
+
+
+@pytest.mark.skipif(REDIS_URL is None, reason="needs HYPOTHESIS_TEST_REDIS_URL")
+def test_structured_api_real_redis():
+    conforms_to_structured_api(
+        _real_redis, parent_settings=settings(max_examples=50, stateful_step_count=30)
+    )
+
+
+@pytest.mark.skipif(REDIS_URL is None, reason="needs HYPOTHESIS_TEST_REDIS_URL")
+def test_listener_api_real_redis():
+    _database_conforms_to_listener_api(
+        _real_redis,
+        flush=flush_messages,
+        parent_settings=settings(max_examples=5, stateful_step_count=10),
+    )
+
+
+@pytest.mark.skipif(REDIS_URL is None, reason="needs HYPOTHESIS_TEST_REDIS_URL")
+def test_map_entries_expire_real_redis():
+    db = _real_redis(None)
+    db.map_put(("p", "m"), "short", b"1", ttl=0.5)
+    db.map_put(("p", "m"), "long", b"2", ttl=100)
+    time_sleep(1)
+    assert db.map_items(("p", "m")) == {("long",): b"2"}
+    db.map_delete(("p", "m"), "long")
+    assert not db.redis.exists(db._data_keys(("p", "m"))[0])

@@ -691,6 +691,9 @@ def _database_conforms_to_listener_api(
             assert Counter(self.expected_events) == Counter(self.actual_events)
 
         def teardown(self):
+            # Stops any thread that delivers events, so it cannot outlive the test.
+            self.db.clear_listeners()
+            getattr(self.db, "_test_cleanup", lambda: None)()
             shutil.rmtree(self.temp_dir)
 
     run_state_machine_as_test(TestDatabaseListener)
