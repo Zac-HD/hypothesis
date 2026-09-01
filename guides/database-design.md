@@ -288,8 +288,7 @@ Every change to a map or a log is recorded in its partition's journal, in the sa
 transaction as the change.
 
 ```python
-@dataclass(frozen=True, slots=True)
-class Change:
+class Change:  # immutable
     op: Literal["put", "delete", "clear", "append", "invalidate"]
     key: tuple  # key[0] is the partition
     field: tuple | None = None  # put, delete, and invalidate; None means the whole key
@@ -433,12 +432,20 @@ WAL mode does not work on network filesystems, which matters for the choice of a
 - Each write is one Lua script. It applies the change, appends to the partition's journal
   stream with `XADD ... MINID ~ <now - retention>`, and publishes a wake-up on the
   partition's channel.
+- Scripts are called by hash. A pipeline of redis-py `Script` objects checks that they
+  exist first, which cost a second round trip on every call. If the server loses its
+  scripts, as in a restart, every write in a batch fails, so the batch is sent again.
+  Atomic batches send each script's text instead, because an unknown hash would fail
+  inside `MULTI`, after the writes before it had been applied.
 - `journal_read` subscribes to the wake-up channels of the partitions it follows. It reads
   with `XREAD` only the partitions that were woken, and sweeps all of them every few
   seconds in case a wake-up was lost.
 - The old firehose channel (`listener_channel`) is still published, so the old listener API
-  works. This version pumps messages in a thread, which fixes the bug above. Log appends
-  use a length-prefixed message, because Lua cannot encode base64.
+  works. This version pumps messages in a thread, which fixes the bug above. The scripts
+  build each message: a tag, then the legacy key with its length, then the value. Lua
+  cannot encode base64, and the JSON that older versions sent doubled the size of every
+  value. New listeners still parse that JSON. Old listeners never read the channel, because
+  of the bug, so the change breaks nothing.
 - Not done yet: sending each change in its wake-up message. A reader that stays connected
   would then need `XREAD` only after a reconnect.
 - Not supported yet: Redis Cluster, because legacy keys are not hash-tagged.
@@ -447,7 +454,8 @@ WAL mode does not work on network filesystems, which matters for the choice of a
 
 - The same tables as SQLite, plus a `namespace` column.
 - Writes to one partition are one statement: a call to a PL/pgSQL function, which takes an
-  advisory lock for the partition, applies the operations, and calls `pg_notify`. In
+  advisory lock for the partition, applies the operations, and calls `pg_notify` if it wrote
+  to the journal. In
   autocommit mode a statement is a transaction. psycopg costs about 50 µs per statement
   on the test machine, which is why the statements are combined.
 - Journal rows carry `xid8 DEFAULT pg_current_xact_id()` and a `bigserial`.
@@ -497,7 +505,7 @@ WAL mode does not work on network filesystems, which matters for the choice of a
 ## 6. The per-machine database server
 
 `hypothesis fuzz` starts a parent process that opens the real backend and serves it on a
-local socket: a Unix socket, or a named pipe on Windows, authenticated with a random key
+local socket: a Unix socket, or a named pipe on Windows (untested), authenticated with a random key
 through `multiprocessing.connection`. Worker processes receive
 `settings.database = RemoteDatabase(address, authkey)`.
 
@@ -518,6 +526,10 @@ How the server works:
   `read_many`. For Redis and Postgres, that is one round trip for many clients.
 - While that thread is busy, requests wait in the sockets. When the backend is slow,
   clients block, and nothing queues up without limit.
+- Each pass costs little when nothing happens. Connections stay registered with one
+  selector, and a client that waits for changes is checked only when the buffer has
+  changed. Before those two fixes, four idle followers cut another client's reads from
+  5,300 to 1,000 a second, and 64 idle connections cut them to 3,200.
 - A second thread follows the backend's journal, with one subscription per partition for
   the whole machine, and keeps the changes in memory. Clients read from there.
 - The server issues its own cursors. They name the server instance, so a client that
@@ -984,6 +996,7 @@ Open questions:
    journal lag. Halving them would halve the lag, and cost some batching.
 4. A faster local transport. `multiprocessing.connection` costs about 100 µs per round
    trip on the test machine.
+5. Windows. The local server should work with named pipes there, but nothing tests it.
 
 Decided since the first draft:
 

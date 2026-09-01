@@ -14,7 +14,6 @@ import errno
 import json
 import os
 import random
-import sqlite3
 import struct
 import sys
 import tempfile
@@ -24,11 +23,9 @@ import warnings
 import weakref
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from hashlib import sha384
-from multiprocessing.connection import Client
 from os import PathLike, getenv
 from pathlib import Path, PurePath
 from queue import Queue
@@ -38,7 +35,6 @@ from typing import (
     Any,
     ClassVar,
     Literal,
-    NamedTuple,
     TypeAlias,
     TypeGuard,
     TypeVar,
@@ -68,10 +64,12 @@ from hypothesis.internal.dbcodec import (
     make_entry_id,
     next_entry_id,
     parse_legacy_key,
+    partition_hash,
     short_hash,
     split_cursor,
     split_entry_id,
 )
+from hypothesis.internal.validation import check_valid_size
 from hypothesis.utils.conventions import UniqueIdentifier, not_set
 from hypothesis.utils.deprecation import note_deprecation
 
@@ -100,6 +98,8 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
+    import sqlite3
+
     from watchdog.observers.api import BaseObserver
 
     from hypothesis.internal.dbserver import DatabaseServer
@@ -116,6 +116,8 @@ _DatabaseT = TypeVar("_DatabaseT", bound="ExampleDatabase")
 TTLT: TypeAlias = float | timedelta | None
 
 
+# An enum member keeps its identity when pickled, so ``expect is unset`` still
+# works after RemoteDatabase sends an operation to another process.
 class _Unset(enum.Enum):
     unset = "unset"
 
@@ -160,11 +162,6 @@ def _check_bytes(value: object, name: str) -> bytes:
     return value
 
 
-def _check_count(value: int | None, name: str, *, minimum: int) -> None:
-    if value is not None and (not isinstance(value, int) or value < minimum):
-        raise InvalidArgument(f"{name} must be an integer >= {minimum}, not {value!r}")
-
-
 def _check_entry_ids(*ids: bytes | None) -> None:
     for entry_id in ids:
         if entry_id is not None:
@@ -177,19 +174,54 @@ def _check_log_key(key: KeyTupleT) -> None:
 
 
 class _Op:
-    __slots__ = ()
+    """An immutable value, whose fields are the names in ``__slots__``.
+
+    Dataclasses would do the same, but building nine of them added 5 ms to the
+    time it takes to import Hypothesis.
+    """
+
+    __slots__: tuple[str, ...] = ()
 
     def _init(self, **fields: object) -> None:
         for name, value in fields.items():
             object.__setattr__(self, name, value)
 
+    def _values(self) -> tuple[Any, ...]:
+        return tuple(getattr(self, name) for name in self.__slots__)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"{type(self).__name__} is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"{type(self).__name__} is immutable")
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is type(self) and other._values() == self._values()
+
+    def __hash__(self) -> int:
+        return hash((type(self), self._values()))
+
+    def __repr__(self) -> str:
+        fields = ", ".join(f"{name}={getattr(self, name)!r}" for name in self.__slots__)
+        return f"{type(self).__name__}({fields})"
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (_rebuild, (type(self), self._values()))
+
+
+def _rebuild(cls: type[_Op], values: tuple[Any, ...]) -> _Op:
+    value = object.__new__(cls)
+    value._init(**dict(zip(cls.__slots__, values, strict=True)))
+    return value
+
 
 # Operations accept keys and fields in any form, and store them as tuples.
 
 
-@dataclass(frozen=True, slots=True, init=False)
 class MapGet(_Op):
     """Read one field of a map. The result is the value, or ``None``."""
+
+    __slots__ = ("field", "key")
 
     key: KeyTupleT
     field: KeyTupleT
@@ -199,9 +231,10 @@ class MapGet(_Op):
         self._init(key=normalized, field=_normalize_field(normalized, field))
 
 
-@dataclass(frozen=True, slots=True, init=False)
 class MapItems(_Op):
     """Read every field of a map that extends ``prefix``, as a dict."""
+
+    __slots__ = ("key", "prefix")
 
     key: KeyTupleT
     prefix: KeyTupleT
@@ -213,12 +246,13 @@ class MapItems(_Op):
         )
 
 
-@dataclass(frozen=True, slots=True, init=False)
 class LogRange(_Op):
     """Read log entries as ``(entry_id, value)`` pairs, oldest first unless ``reverse``.
 
     ``after`` and ``before`` are exclusive bounds on the entry id.
     """
+
+    __slots__ = ("after", "before", "key", "limit", "reverse")
 
     key: KeyTupleT
     after: bytes | None
@@ -237,16 +271,17 @@ class LogRange(_Op):
     ) -> None:
         normalized = _normalize_key(key)
         _check_log_key(normalized)
-        _check_count(limit, "limit", minimum=0)
+        check_valid_size(limit, "limit")
         _check_entry_ids(after, before)
         self._init(
             key=normalized, after=after, before=before, limit=limit, reverse=reverse
         )
 
 
-@dataclass(frozen=True, slots=True, init=False)
 class MapPut(_Op):
     """Set a field of a map. See :meth:`ExampleDatabase.map_put`."""
+
+    __slots__ = ("expect", "field", "key", "ttl", "value")
 
     key: KeyTupleT
     field: KeyTupleT
@@ -282,9 +317,10 @@ class MapPut(_Op):
         )
 
 
-@dataclass(frozen=True, slots=True, init=False)
 class MapDelete(_Op):
     """Delete a field of a map, if it exists and matches ``expect``."""
+
+    __slots__ = ("expect", "field", "key")
 
     key: KeyTupleT
     field: KeyTupleT
@@ -301,9 +337,10 @@ class MapDelete(_Op):
         )
 
 
-@dataclass(frozen=True, slots=True, init=False)
 class MapClear(_Op):
     """Delete every field of a map."""
+
+    __slots__ = ("key",)
 
     key: KeyTupleT
 
@@ -311,9 +348,10 @@ class MapClear(_Op):
         self._init(key=_normalize_key(key))
 
 
-@dataclass(frozen=True, slots=True, init=False)
 class LogAppend(_Op):
     """Append an entry to a log. See :meth:`ExampleDatabase.log_append`."""
+
+    __slots__ = ("key", "maxlen", "ttl", "value")
 
     key: KeyTupleT
     value: bytes
@@ -325,7 +363,9 @@ class LogAppend(_Op):
     ) -> None:
         normalized = _normalize_key(key)
         _check_log_key(normalized)
-        _check_count(maxlen, "maxlen", minimum=1)
+        check_valid_size(maxlen, "maxlen")
+        if maxlen == 0:
+            raise InvalidArgument("maxlen must be at least 1, not 0")
         self._init(
             key=normalized,
             value=_check_bytes(value, "value"),
@@ -334,10 +374,11 @@ class LogAppend(_Op):
         )
 
 
-@dataclass(frozen=True, slots=True, init=False)
 class LogTrim(_Op):
     """Remove the entries whose ids are in ``ids``, and the entries before
     ``before``, and then all but the newest ``maxlen`` entries."""
+
+    __slots__ = ("before", "ids", "key", "maxlen")
 
     key: KeyTupleT
     maxlen: int | None
@@ -354,7 +395,7 @@ class LogTrim(_Op):
     ) -> None:
         normalized = _normalize_key(key)
         _check_log_key(normalized)
-        _check_count(maxlen, "maxlen", minimum=0)
+        check_valid_size(maxlen, "maxlen")
         ids = tuple(ids)
         _check_entry_ids(before, *ids)
         self._init(key=normalized, maxlen=maxlen, before=before, ids=ids)
@@ -365,15 +406,26 @@ WriteOpT: TypeAlias = MapPut | MapDelete | MapClear | LogAppend | LogTrim
 ChangeOpT: TypeAlias = Literal["put", "delete", "clear", "append", "invalidate"]
 
 
-@dataclass(frozen=True, slots=True)
-class Change:
+class Change(_Op):
     """One entry in a partition's journal. See :meth:`ExampleDatabase.journal_read`."""
+
+    __slots__ = ("entry_id", "field", "key", "op", "value")
 
     op: ChangeOpT
     key: KeyTupleT
-    field: KeyTupleT | None = None
-    entry_id: bytes | None = None
-    value: bytes | None = None
+    field: KeyTupleT | None
+    entry_id: bytes | None
+    value: bytes | None
+
+    def __init__(
+        self,
+        op: ChangeOpT,
+        key: KeyTupleT,
+        field: KeyTupleT | None = None,
+        entry_id: bytes | None = None,
+        value: bytes | None = None,
+    ) -> None:
+        self._init(op=op, key=key, field=field, entry_id=entry_id, value=value)
 
     @property
     def partition(self) -> KeyPartT:
@@ -483,7 +535,9 @@ def _events_from_change(change: Change) -> list[ListenerEventT]:
         if change.value is None:  # too large to journal
             return [] if change.op == "append" else [("delete", (log_key(ek), None))]
         member = change.entry_id + change.value
-        return [("save" if change.op == "append" else "delete", (log_key(ek), member))]
+        if change.op == "append":
+            return [("save", (log_key(ek), member))]
+        return [("delete", (log_key(ek), member))]
     if change.field is None:
         return [("delete", (index_key(ek), None))]
     fk = field_key(ek, encode(change.field))
@@ -492,17 +546,28 @@ def _events_from_change(change: Change) -> list[ListenerEventT]:
     return [("delete", (fk, None))]
 
 
-class _JournalBatch(NamedTuple):
-    """The result of a journal fetch, which is one of the journal hooks."""
+class _JournalBatch:
+    """The result of a journal fetch, which is one of the journal hooks.
 
-    changes: list[Change]
-    # The position after these changes, for each partition that was asked for.
-    positions: dict[KeyPartT, bytes]
-    # The partitions that the limit cut short, which may have more changes.
-    cut: set[KeyPartT]
-    # Anything the backend's wait needs, to tell whether a change has arrived
-    # since this fetch.
-    token: Any = None
+    ``positions`` holds the position after these changes, for each partition that
+    was asked for. ``cut`` holds the partitions that the limit cut short, which
+    may have more changes. ``token`` is anything that the backend's wait needs,
+    to tell whether a change has arrived since this fetch.
+    """
+
+    __slots__ = ("changes", "cut", "positions", "token")
+
+    def __init__(
+        self,
+        changes: list[Change],
+        positions: dict[KeyPartT, bytes],
+        cut: set[KeyPartT],
+        token: Any = None,
+    ) -> None:
+        self.changes = changes
+        self.positions = positions
+        self.cut = cut
+        self.token = token
 
 
 def _read_journal(
@@ -555,6 +620,32 @@ def _unpack_position(fmt: str, position: bytes) -> tuple[Any, ...]:
         raise InvalidArgument(f"invalid journal position {position!r}") from None
 
 
+def _sql_batch(
+    fmt: str,
+    positions: Mapping[KeyPartT, tuple[int, ...]],
+    rows: Sequence[tuple[tuple[int, ...], KeyPartT, Change]],
+    head: tuple[int, ...],
+    limit: int | None,
+    token: Any = None,
+) -> _JournalBatch:
+    """A journal batch from one query over several partitions, for the SQL backends.
+
+    ``rows`` holds ``(position, partition, change)`` in position order, from the
+    smallest of ``positions``. ``head`` is the position at the end of the journal.
+    """
+    changes = [change for pos, p, change in rows if pos > positions[p]]
+    # Every partition shares one sequence of positions, so a query that the limit
+    # cut short may have cut short any of them.
+    truncated = limit is not None and len(rows) == limit
+    upto = rows[-1][0] if truncated else head
+    return _JournalBatch(
+        changes,
+        {p: struct.pack(fmt, *max(pos, upto)) for p, pos in positions.items()},
+        set(positions) if truncated else set(),
+        token,
+    )
+
+
 class _JournalBuffer:
     """Changes for the partitions that someone is following, held in memory.
 
@@ -575,7 +666,7 @@ class _JournalBuffer:
         self._next_expiry = 0.0
 
     def _position(self, seq: int) -> bytes:
-        return self.token + seq.to_bytes(8, "big")
+        return struct.pack(">8sQ", self.token, seq)
 
     def head(self, partition: KeyPartT) -> bytes:
         return make_cursor(self._journal_position(partition))
@@ -651,11 +742,11 @@ class _JournalBuffer:
             cut = set()
             now = time.monotonic()
             for partition, position in positions.items():
-                seq = int.from_bytes(position[8:16], "big")
+                token, seq = _unpack_position(">8sQ", position)
                 queue = self.queues.get(partition)
                 if (
                     queue is None
-                    or position[:8] != self.token
+                    or token != self.token
                     or seq < self.dropped.get(partition, 0)
                 ):
                     expired.append(partition)
@@ -775,7 +866,11 @@ def _emulated_read(db: "ExampleDatabase", op: ReadOpT) -> Any:
         members = set(db.fetch(cast(bytes, op.key[0])))
         if isinstance(op, MapGet):
             return b"" if op.field[0] in members else None
-        return {(m,): b"" for m in members if _matches_prefix((m,), op.prefix)}
+        return {
+            (m,): b""
+            for m in members
+            if not op.prefix or _matches_prefix((m,), op.prefix)
+        }
     ek = encode(op.key)
     if isinstance(op, MapGet):
         return _pick(db.fetch(field_key(ek, encode(op.field))))
@@ -797,16 +892,26 @@ def _emulated_current(db: "ExampleDatabase", op: MapPut | MapDelete) -> bytes | 
     return _emulated_read(db, MapGet(op.key, op.field))
 
 
-def _emulated_trim(db: "ExampleDatabase", ek: bytes, op: LogTrim) -> int:
-    entries = _emulated_log_entries(db, ek)
-    keep = [
+def _trim_entries(
+    entries: list[tuple[bytes, bytes]], op: LogTrim
+) -> tuple[list[tuple[bytes, bytes]], list[tuple[bytes, bytes]]]:
+    """Apply ``op`` to a log's entries, oldest first. Returns the entries that
+    remain, and the entries that were deleted by id."""
+    ids = set(op.ids)
+    kept = [
         e
         for e in entries
-        if e[0] not in op.ids and (op.before is None or e[0] >= op.before)
+        if e[0] not in ids and (op.before is None or e[0] >= op.before)
     ]
     if op.maxlen is not None:
-        keep = keep[max(0, len(keep) - op.maxlen) :]
-    doomed = set(entries) - set(keep)
+        kept = kept[max(0, len(kept) - op.maxlen) :]
+    return kept, [e for e in entries if e[0] in ids]
+
+
+def _emulated_trim(db: "ExampleDatabase", ek: bytes, op: LogTrim) -> int:
+    entries = _emulated_log_entries(db, ek)
+    kept, _ = _trim_entries(entries, op)
+    doomed = set(entries) - set(kept)
     for entry_id, value in doomed:
         db.delete(log_key(ek), entry_id + value)
     return len(doomed)
@@ -814,20 +919,26 @@ def _emulated_trim(db: "ExampleDatabase", ek: bytes, op: LogTrim) -> int:
 
 def _emulated_write(db: "ExampleDatabase", op: WriteOpT, *, check: bool) -> Any:
     if isinstance(op, (MapPut, MapDelete)):
-        if check and _is_conditional(op) and _emulated_current(db, op) != op.expect:
-            return False
+        # Each branch reads the key once, and checks the condition against that.
+        conditional = check and _is_conditional(op)
         if is_legacy(op.key):
             raw, member = cast(bytes, op.key[0]), cast(bytes, op.field[0])
+            present = (conditional or isinstance(op, MapDelete)) and member in set(
+                db.fetch(raw)
+            )
+            if conditional and (b"" if present else None) != op.expect:
+                return False
             if isinstance(op, MapPut):
                 db.save(raw, member)
                 return True
-            present = member in set(db.fetch(raw))
             if present:
                 db.delete(raw, member)
             return present
         ek, ef = encode(op.key), encode(op.field)
         fk = field_key(ek, ef)
         members = set(db.fetch(fk))
+        if conditional and _pick(members) != op.expect:
+            return False
         if isinstance(op, MapPut):
             # Write the index entry first, so that a crash leaves an index entry
             # with no value, which reads as absent.
@@ -1328,28 +1439,26 @@ class ExampleDatabase(metaclass=_EDMeta):
         """
         return _read_journal(self, cursors, timeout, limit)
 
-    # The journal hooks, which backends override. By default, the journal is
-    # built from the change listener, so it sees only the changes that the
-    # listener reports, and only from when the first cursor was taken.
+    # The journal hooks, which backends override. By default, they read a buffer
+    # that the change listener fills. It sees only the changes that the listener
+    # reports, and only from when the first cursor was taken.
 
     def _journal_position(self, partition: KeyPartT) -> bytes:
         """The position at the current end of ``partition``'s journal."""
-        return self._listener_journal()._journal_position(partition)
+        return self._buffered_journal()._journal_position(partition)
 
     def _journal_fetch(
         self, positions: Mapping[KeyPartT, bytes], limit: int | None
     ) -> _JournalBatch:
         """The changes after each position, at most ``limit`` in all."""
-        return self._listener_journal()._journal_fetch(positions, limit)
+        return self._buffered_journal()._journal_fetch(positions, limit)
 
     def _journal_wait(self, batch: _JournalBatch, timeout: float | None) -> None:
         """Return when a change may have arrived since ``batch`` was fetched, or
         after ``timeout`` seconds. Returning early does no harm."""
-        self._listener_journal()._journal_wait(batch, timeout)
+        self._buffered_journal()._journal_wait(batch, timeout)
 
-    def _listener_journal(self) -> _JournalBuffer:
-        # A journal built from the change listener. It sees only the changes that
-        # the listener reports, and only from when the first cursor was taken.
+    def _buffered_journal(self) -> _JournalBuffer:
         try:
             return self.__dict__["_journal_buffer"]
         except KeyError:
@@ -1535,11 +1644,16 @@ class InMemoryExampleDatabase(_NativeDatabase):
             return _select_entries(log.live(now) if log else [], op)
         if is_legacy(op.key):
             members = self.data.get(cast(bytes, op.key[0]), ())
-            return {(m,): b"" for m in members if _matches_prefix((m,), op.prefix)}
+            return {
+                (m,): b""
+                for m in members
+                if not op.prefix or _matches_prefix((m,), op.prefix)
+            }
         return {
             field: value
             for field, (value, expires) in self._maps.get(op.key, {}).items()
-            if (expires is None or expires > now) and _matches_prefix(field, op.prefix)
+            if (expires is None or expires > now)
+            and (not op.prefix or _matches_prefix(field, op.prefix))
         }
 
     def write_many(self, ops: Sequence[WriteOpT], *, atomic: bool = False) -> list[Any]:
@@ -1547,7 +1661,6 @@ class InMemoryExampleDatabase(_NativeDatabase):
         if atomic:
             _check_atomic(ops)
         now = time.time()
-        changes: list[Change] = []
         with self._lock:
             if atomic and not all(
                 self._live_value(op.key, op.field, now) == op.expect
@@ -1555,6 +1668,10 @@ class InMemoryExampleDatabase(_NativeDatabase):
                 if _is_conditional(op)
             ):
                 return _not_applied(ops)
+            # Record changes only if someone will see them. A reader registers
+            # its partition before it loads the data, so it cannot miss a change.
+            watched = bool(self._journal.queues or self._listeners)
+            changes: list[Change] | None = [] if watched else None
             results = [self._write(op, now, changes, check=not atomic) for op in ops]
             if changes:
                 self._journal.add(changes)
@@ -1566,7 +1683,7 @@ class InMemoryExampleDatabase(_NativeDatabase):
         return results
 
     def _write(
-        self, op: WriteOpT, now: float, changes: list[Change], *, check: bool
+        self, op: WriteOpT, now: float, changes: list[Change] | None, *, check: bool
     ) -> Any:
         if isinstance(op, (MapPut, MapDelete)):
             current = self._live_value(op.key, op.field, now)
@@ -1580,7 +1697,7 @@ class InMemoryExampleDatabase(_NativeDatabase):
                 else:
                     expires = None if op.ttl is None else now + op.ttl
                     self._maps.setdefault(op.key, {})[op.field] = (op.value, expires)
-                if current != op.value:
+                if changes is not None and current != op.value:
                     changes.append(Change("put", op.key, op.field, value=op.value))
                 return True
             if current is None:
@@ -1589,7 +1706,8 @@ class InMemoryExampleDatabase(_NativeDatabase):
                 self.data[cast(bytes, op.key[0])].discard(cast(bytes, op.field[0]))
             else:
                 del self._maps[op.key][op.field]
-            changes.append(Change("delete", op.key, op.field))
+            if changes is not None:
+                changes.append(Change("delete", op.key, op.field))
             return True
         if isinstance(op, MapClear):
             if is_legacy(op.key):
@@ -1600,29 +1718,18 @@ class InMemoryExampleDatabase(_NativeDatabase):
             else:
                 cleared = bool(self._read(MapItems(op.key), now))
                 self._maps.pop(op.key, None)
-            if cleared:
+            if cleared and changes is not None:
                 changes.append(Change("clear", op.key))
             return None
         log = self._logs.setdefault(op.key, _MemoryLog())
         if isinstance(op, LogTrim):
             count = len(log.entries)
-            if op.ids:
-                ids = set(op.ids)
-                kept = []
-                for entry in log.entries:
-                    if entry[0] in ids:
-                        changes.append(
-                            Change("delete", op.key, entry_id=entry[0], value=entry[1])
-                        )
-                    else:
-                        kept.append(entry)
-                log.entries = kept
-            if op.before is not None:
-                del log.entries[
-                    : bisect_left(log.entries, op.before, key=lambda e: e[0])
-                ]
-            if op.maxlen is not None:
-                del log.entries[: max(0, len(log.entries) - op.maxlen)]
+            log.entries, deleted = _trim_entries(log.entries, op)
+            if changes is not None:
+                changes.extend(
+                    Change("delete", op.key, entry_id=entry_id, value=value)
+                    for entry_id, value in deleted
+                )
             return count - len(log.entries)
         entry_id = next_entry_id(log.last_id, int(now * 1000))
         log.entries.append((entry_id, op.value))
@@ -1630,19 +1737,14 @@ class InMemoryExampleDatabase(_NativeDatabase):
         log.ttl = op.ttl
         if op.maxlen is not None and len(log.entries) > op.maxlen:
             del log.entries[: len(log.entries) - op.maxlen]
-        changes.append(Change("append", op.key, entry_id=entry_id, value=op.value))
+        if changes is not None:
+            changes.append(Change("append", op.key, entry_id=entry_id, value=op.value))
         return entry_id
 
-    def _journal_position(self, partition: KeyPartT) -> bytes:
-        return self._journal._journal_position(partition)
-
-    def _journal_fetch(
-        self, positions: Mapping[KeyPartT, bytes], limit: int | None
-    ) -> _JournalBatch:
-        return self._journal._journal_fetch(positions, limit)
-
-    def _journal_wait(self, batch: _JournalBatch, timeout: float | None) -> None:
-        self._journal._journal_wait(batch, timeout)
+    def _buffered_journal(self) -> _JournalBuffer:
+        # Every write to this database goes through this object, so the buffer
+        # sees every change.
+        return self._journal
 
     def _start_listening(self) -> None:
         # Listeners are called directly by write_many, since every write to
@@ -1948,7 +2050,52 @@ class _StorageDirectoryDatabase(DirectoryBasedExampleDatabase):
         self._ensure_directory_exists_called = True
 
 
-class ReadOnlyDatabase(ExampleDatabase):
+class _WrapperDatabase(ExampleDatabase):
+    """Forwards the journal, the clock, listeners, and the rest of the structured
+    API's plumbing to the database in ``_inner``.
+
+    A wrapper that missed one of these would fall back to the emulation, which
+    reads the local clock and builds its own journal, so they are all here.
+    """
+
+    @property
+    def _inner(self) -> ExampleDatabase:
+        raise NotImplementedError
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self._inner.capabilities
+
+    def journal_head(self, partition: KeyPartT) -> bytes:
+        return self._inner.journal_head(partition)
+
+    def journal_read(
+        self,
+        cursors: Mapping[KeyPartT, bytes],
+        *,
+        timeout: float | None = 0,
+        limit: int | None = None,
+    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
+        return self._inner.journal_read(cursors, timeout=timeout, limit=limit)
+
+    def current_time(self) -> float:
+        return self._inner.current_time()
+
+    def flush(self, timeout: float | None = None) -> None:
+        self._inner.flush(timeout)
+
+    def close(self) -> None:
+        super().close()
+        self._inner.close()
+
+    def _start_listening(self) -> None:
+        self._inner.add_listener(self._broadcast_change)
+
+    def _stop_listening(self) -> None:
+        self._inner.remove_listener(self._broadcast_change)
+
+
+class ReadOnlyDatabase(_WrapperDatabase):
     """A wrapper to make the given database read-only.
 
     The implementation passes through ``fetch``, and turns ``save``, ``delete``, and
@@ -1980,33 +2127,14 @@ class ReadOnlyDatabase(ExampleDatabase):
         pass
 
     @property
-    def capabilities(self) -> frozenset[str]:
-        return self._wrapped.capabilities
+    def _inner(self) -> ExampleDatabase:
+        return self._wrapped
 
     def read_many(self, ops: Sequence[ReadOpT]) -> list[Any]:
         return self._wrapped.read_many(ops)
 
     def write_many(self, ops: Sequence[WriteOpT], *, atomic: bool = False) -> list[Any]:
         return _not_applied(list(ops))
-
-    def journal_head(self, partition: KeyPartT) -> bytes:
-        return self._wrapped.journal_head(partition)
-
-    def journal_read(
-        self,
-        cursors: Mapping[KeyPartT, bytes],
-        *,
-        timeout: float | None = 0,
-        limit: int | None = None,
-    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
-        return self._wrapped.journal_read(cursors, timeout=timeout, limit=limit)
-
-    def current_time(self) -> float:
-        return self._wrapped.current_time()
-
-    def close(self) -> None:
-        super().close()
-        self._wrapped.close()
 
     def _start_listening(self) -> None:
         # we're read only, so there are no changes to broadcast.
@@ -2017,22 +2145,18 @@ class ReadOnlyDatabase(ExampleDatabase):
 
 
 def _pack_cursors(cursors: list[bytes]) -> bytes:
-    return make_cursor(b"".join(_pack_uleb128(len(c)) + c for c in cursors))
+    return make_cursor(encode(tuple(cursors)))
 
 
 def _unpack_cursors(cursor: bytes, count: int) -> list[bytes]:
     _, data = split_cursor(cursor)
-    parts = []
     try:
-        while data:
-            used, size = _unpack_uleb128(data)
-            parts.append(data[used : used + size])
-            data = data[used + size :]
+        parts = decode(data)
     except ValueError:
-        pass
-    if len(parts) != count:
+        parts = ()
+    if len(parts) != count or not all(isinstance(p, bytes) for p in parts):
         raise InvalidArgument(f"invalid journal cursor {cursor!r}")
-    return parts
+    return cast(list[bytes], list(parts))
 
 
 class MultiplexedDatabase(ExampleDatabase):
@@ -2520,7 +2644,7 @@ class GitHubArtifactDatabase(ExampleDatabase):
         raise RuntimeError(self._read_only_message)
 
 
-class BackgroundWriteDatabase(ExampleDatabase):
+class BackgroundWriteDatabase(_WrapperDatabase):
     """A wrapper which defers writes on the given database to a background thread.
 
     Calls to :meth:`~hypothesis.database.ExampleDatabase.fetch` wait for any
@@ -2587,8 +2711,8 @@ class BackgroundWriteDatabase(ExampleDatabase):
         self._queue.put(("move", (src, dest, value)))
 
     @property
-    def capabilities(self) -> frozenset[str]:
-        return self._db.capabilities
+    def _inner(self) -> ExampleDatabase:
+        return self._db
 
     def read_many(self, ops: Sequence[ReadOpT]) -> list[Any]:
         self._join()
@@ -2603,21 +2727,6 @@ class BackgroundWriteDatabase(ExampleDatabase):
         self._queue.put(("write_many", (ops,)))
         return [None] * len(ops)
 
-    def journal_head(self, partition: KeyPartT) -> bytes:
-        return self._db.journal_head(partition)
-
-    def journal_read(
-        self,
-        cursors: Mapping[KeyPartT, bytes],
-        *,
-        timeout: float | None = 0,
-        limit: int | None = None,
-    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
-        return self._db.journal_read(cursors, timeout=timeout, limit=limit)
-
-    def current_time(self) -> float:
-        return self._db.current_time()
-
     def close(self) -> None:
         self._join()
         if self._thread is not None:
@@ -2625,26 +2734,18 @@ class BackgroundWriteDatabase(ExampleDatabase):
             self._thread.join()
             self._thread = None
         super().close()
-        self._db.close()
 
     def flush(self, timeout: float | None = None) -> None:
         self._join(timeout)
-        self._db.flush(timeout)
-
-    def _start_listening(self) -> None:
-        self._db.add_listener(self._broadcast_change)
-
-    def _stop_listening(self) -> None:
-        self._db.remove_listener(self._broadcast_change)
+        super().flush(timeout)
 
 
-_PUT, _DELETE, _CLEAR, _APPEND, _INVALIDATE = 1, 2, 3, 4, 5
+_PUT, _DELETE, _CLEAR, _APPEND = 1, 2, 3, 4
 _CHANGE_OPS: dict[int, ChangeOpT] = {
     _PUT: "put",
     _DELETE: "delete",
     _CLEAR: "clear",
     _APPEND: "append",
-    _INVALIDATE: "invalidate",
 }
 #: Journal entries include values up to this size. Larger values arrive as None.
 INLINE_VALUE_LIMIT = 64 * 1024
@@ -2795,7 +2896,9 @@ class SQLiteExampleDatabase(_NativeDatabase):
     def capabilities(self) -> frozenset[str]:
         return frozenset({"native", "atomic", "journal", "blocking", "ttl"})
 
-    def _open(self) -> sqlite3.Connection:
+    def _open(self) -> "sqlite3.Connection":
+        import sqlite3  # imported here, because it slows down importing Hypothesis
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
             self.path, timeout=60, isolation_level=None, check_same_thread=False
@@ -2805,7 +2908,7 @@ class SQLiteExampleDatabase(_NativeDatabase):
         conn.executescript(_SQLITE_SCHEMA)
         return conn
 
-    def _conn(self) -> sqlite3.Connection:
+    def _conn(self) -> "sqlite3.Connection":
         return self._connections.get()
 
     def close(self) -> None:
@@ -2813,7 +2916,9 @@ class SQLiteExampleDatabase(_NativeDatabase):
         self._connections.close()
 
     @staticmethod
-    def _use_wal(conn: sqlite3.Connection) -> None:
+    def _use_wal(conn: "sqlite3.Connection") -> None:
+        import sqlite3
+
         # The journal mode is stored in the file, so check it before setting it.
         # Setting it takes a lock, and SQLite does not wait for that lock, so
         # processes that open a new file together can fail here. Retry them.
@@ -2828,10 +2933,6 @@ class SQLiteExampleDatabase(_NativeDatabase):
                 time.sleep(0.1)
 
     @staticmethod
-    def _partition_hash(key: KeyTupleT) -> bytes:
-        return short_hash(encode(key[:1]))
-
-    @staticmethod
     def _inline(value: bytes) -> bytes | None:
         return value if len(value) <= INLINE_VALUE_LIMIT else None
 
@@ -2843,14 +2944,7 @@ class SQLiteExampleDatabase(_NativeDatabase):
             ek = encode(op.key)
             kh = short_hash(ek)
             if isinstance(op, MapGet):
-                ef = encode(op.field)
-                row = conn.execute(
-                    "SELECT value, exp FROM maps WHERE kh=? AND fh=? AND key=? AND field=?",
-                    (kh, short_hash(ef), ek, ef),
-                ).fetchone()
-                results.append(
-                    row[0] if row and (row[1] is None or row[1] > now) else None
-                )
+                results.append(self._live(self._row(conn, ek, encode(op.field)), now))
             elif isinstance(op, MapItems):
                 prefix = encode(op.prefix)
                 rows = conn.execute(
@@ -2916,22 +3010,26 @@ class SQLiteExampleDatabase(_NativeDatabase):
 
     @staticmethod
     def _row(
-        conn: sqlite3.Connection, ek: bytes, ef: bytes
+        conn: "sqlite3.Connection", ek: bytes, ef: bytes
     ) -> tuple[bytes, float | None] | None:
         return conn.execute(
             "SELECT value, exp FROM maps WHERE kh=? AND fh=? AND key=? AND field=?",
             (short_hash(ek), short_hash(ef), ek, ef),
         ).fetchone()
 
-    def _current(
-        self, conn: sqlite3.Connection, op: MapPut | MapDelete, now: float
-    ) -> bytes | None:
-        row = self._row(conn, encode(op.key), encode(op.field))
+    @staticmethod
+    def _live(row: tuple[bytes, float | None] | None, now: float) -> bytes | None:
+        """The value in a row from _row, unless it has expired."""
         return row[0] if row and (row[1] is None or row[1] > now) else None
+
+    def _current(
+        self, conn: "sqlite3.Connection", op: MapPut | MapDelete, now: float
+    ) -> bytes | None:
+        return self._live(self._row(conn, encode(op.key), encode(op.field)), now)
 
     def _write(
         self,
-        conn: sqlite3.Connection,
+        conn: "sqlite3.Connection",
         op: WriteOpT,
         now: float,
         journal: list[tuple[Any, ...]],
@@ -2940,12 +3038,12 @@ class SQLiteExampleDatabase(_NativeDatabase):
     ) -> Any:
         ek = encode(op.key)
         kh = short_hash(ek)
-        ph = self._partition_hash(op.key)
+        ph = partition_hash(op.key[0])
         if isinstance(op, (MapPut, MapDelete)):
             ef = encode(op.field)
             fh = short_hash(ef)
             row = self._row(conn, ek, ef)
-            current = row[0] if row and (row[1] is None or row[1] > now) else None
+            current = self._live(row, now)
             if check and _is_conditional(op) and current != op.expect:
                 return False
             if isinstance(op, MapPut):
@@ -3009,7 +3107,7 @@ class SQLiteExampleDatabase(_NativeDatabase):
 
     @staticmethod
     def _trim(
-        conn: sqlite3.Connection,
+        conn: "sqlite3.Connection",
         kh: bytes,
         *,
         maxlen: int | None = None,
@@ -3031,7 +3129,7 @@ class SQLiteExampleDatabase(_NativeDatabase):
                 ).rowcount
         return removed
 
-    def _cleanup(self, conn: sqlite3.Connection, now: float) -> None:
+    def _cleanup(self, conn: "sqlite3.Connection", now: float) -> None:
         self._next_cleanup = now + min(10.0, self.journal_retention / 4)
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -3054,7 +3152,7 @@ class SQLiteExampleDatabase(_NativeDatabase):
                 conn.execute("ROLLBACK")
 
     @staticmethod
-    def _head(conn: sqlite3.Connection) -> int:
+    def _head(conn: "sqlite3.Connection") -> int:
         # Ids are assigned in commit order, since SQLite has one writer at a time.
         row = conn.execute(
             "SELECT seq FROM sqlite_sequence WHERE name='journal'"
@@ -3067,8 +3165,8 @@ class SQLiteExampleDatabase(_NativeDatabase):
     def _journal_fetch(
         self, positions: Mapping[KeyPartT, bytes], limit: int | None
     ) -> _JournalBatch:
-        ids = {p: _unpack_position(">q", pos)[0] for p, pos in positions.items()}
-        by_hash = {self._partition_hash((p,)): p for p in ids}
+        unpacked = {p: _unpack_position(">q", pos) for p, pos in positions.items()}
+        by_hash = {partition_hash(p): p for p in unpacked}
         placeholders = ",".join("?" * len(by_hash))
         conn = self._conn()
         # Read the head, the rows, and data_version from one snapshot.
@@ -3078,26 +3176,16 @@ class SQLiteExampleDatabase(_NativeDatabase):
             rows = conn.execute(
                 "SELECT id, ph, op, key, field, eid, value FROM journal "
                 f"WHERE id > ? AND ph IN ({placeholders}) ORDER BY id LIMIT ?",
-                (min(ids.values()), *by_hash, -1 if limit is None else limit),
+                (min(unpacked.values())[0], *by_hash, -1 if limit is None else limit),
             ).fetchall()
             version = conn.execute("PRAGMA data_version").fetchone()[0]
         finally:
             conn.execute("COMMIT")
-        changes = [
-            _journal_change(op, key, field, eid, value)
+        entries = [
+            ((id_,), by_hash[ph], _journal_change(op, key, field, eid, value))
             for id_, ph, op, key, field, eid, value in rows
-            if id_ > ids[by_hash[ph]]
         ]
-        # Ids are shared by every partition, so a read that the limit cut short
-        # may have cut short any of them.
-        truncated = limit is not None and len(rows) == limit
-        upto = rows[-1][0] if truncated else head
-        return _JournalBatch(
-            changes,
-            {p: struct.pack(">q", max(id_, upto)) for p, id_ in ids.items()},
-            set(ids) if truncated else set(),
-            version,
-        )
+        return _sql_batch(">q", unpacked, entries, (head,), limit, version)
 
     def _journal_wait(self, batch: _JournalBatch, timeout: float | None) -> None:
         # Commits from other connections change data_version, which is cheap to poll.
@@ -3114,7 +3202,7 @@ class SQLiteExampleDatabase(_NativeDatabase):
             )
 
 
-class ReadThroughDatabase(ExampleDatabase):
+class ReadThroughDatabase(_WrapperDatabase):
     """Copies data from a ``fallback`` database into ``primary`` as it is read.
 
     The first time a set is read, its members in ``fallback`` are copied into
@@ -3140,8 +3228,8 @@ class ReadThroughDatabase(ExampleDatabase):
         )
 
     @property
-    def capabilities(self) -> frozenset[str]:
-        return self.primary.capabilities
+    def _inner(self) -> ExampleDatabase:
+        return self.primary
 
     def _copy_up(self, keys: Iterable[bytes]) -> None:
         todo = list(dict.fromkeys(k for k in keys if k not in self._checked))
@@ -3192,34 +3280,9 @@ class ReadThroughDatabase(ExampleDatabase):
         )
         return self.primary.write_many(ops, atomic=atomic)
 
-    def journal_head(self, partition: KeyPartT) -> bytes:
-        return self.primary.journal_head(partition)
-
-    def journal_read(
-        self,
-        cursors: Mapping[KeyPartT, bytes],
-        *,
-        timeout: float | None = 0,
-        limit: int | None = None,
-    ) -> tuple[list[Change], dict[KeyPartT, bytes]]:
-        return self.primary.journal_read(cursors, timeout=timeout, limit=limit)
-
-    def current_time(self) -> float:
-        return self.primary.current_time()
-
-    def flush(self, timeout: float | None = None) -> None:
-        self.primary.flush(timeout)
-
     def close(self) -> None:
         super().close()
-        self.primary.close()
         self.fallback.close()
-
-    def _start_listening(self) -> None:
-        self.primary.add_listener(self._broadcast_change)
-
-    def _stop_listening(self) -> None:
-        self.primary.remove_listener(self._broadcast_change)
 
 
 class RemoteDatabase(_NativeDatabase):
@@ -3275,13 +3338,15 @@ class RemoteDatabase(_NativeDatabase):
                 if self._flusher is not me:
                     return
             time.sleep(self.batch_delay)  # let more writes join the batch
-            self._send_pending_later()
+            self._send_pending_or_warn()
 
     def _send_pending(self) -> None:
+        # Sending under the connection's lock keeps this process's writes in order.
         with self._locks[False]:
-            self._send_pending_locked()
+            if ops := self._take_pending():
+                self._connection(journal=False).send((None, (), ops))
 
-    def _send_pending_later(self) -> None:
+    def _send_pending_or_warn(self) -> None:
         try:
             self._send_pending()
         except (OSError, EOFError) as err:
@@ -3297,14 +3362,12 @@ class RemoteDatabase(_NativeDatabase):
             ops, self._pending = self._pending, []
         return ops
 
-    def _send_pending_locked(self) -> None:
-        # The caller holds the connection's lock, so writes are sent in order.
-        if ops := self._take_pending():
-            self._connection(journal=False).send((None, (), ops))
-
     def _connection(self, *, journal: bool) -> Any:
         conn = self._conns.get(journal)
         if conn is None:
+            # Imported here, because it slows down importing Hypothesis.
+            from multiprocessing.connection import Client
+
             conn = self._conns[journal] = Client(self.address, authkey=self._authkey)
         return conn
 
@@ -3370,7 +3433,7 @@ class RemoteDatabase(_NativeDatabase):
 
     def close(self) -> None:
         super().close()
-        self._send_pending_later()
+        self._send_pending_or_warn()
         with self._pending_lock:
             self._flusher = None
             self._pending_lock.notify_all()

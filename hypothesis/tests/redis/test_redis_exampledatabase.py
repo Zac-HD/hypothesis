@@ -16,7 +16,7 @@ from fakeredis import FakeRedis
 from redis import Redis
 
 from hypothesis import settings, strategies as st
-from hypothesis.database import InMemoryExampleDatabase
+from hypothesis.database import InMemoryExampleDatabase, MapPut
 from hypothesis.errors import InvalidArgument
 from hypothesis.extra.redis import RedisExampleDatabase
 from hypothesis.stateful import Bundle, RuleBasedStateMachine, rule
@@ -210,6 +210,23 @@ def test_journal_records_entries_deleted_by_id_fakeredis(wrap):
         journal_records_entries_deleted_by_id(db)
 
 
+def scripts_are_reloaded(db):
+    # After a restart, the server has no scripts. Nothing should be applied twice.
+    db.map_put((b"p", "m"), "f", b"1")
+    db.redis.script_flush()
+    assert db.map_get((b"p", "m"), "f") == b"1"
+    db.redis.script_flush()
+    db.log_append((b"p", "log"), b"once")
+    assert [value for _, value in db.log_range((b"p", "log"))] == [b"once"]
+    db.redis.script_flush()
+    batch = [MapPut((b"p", "m"), "f", b"2", expect=b"1")]
+    assert db.write_many(batch, atomic=True) == [True]
+
+
+def test_scripts_are_reloaded_fakeredis():
+    scripts_are_reloaded(RedisExampleDatabase(FakeRedis(host=uuid.uuid4().hex)))
+
+
 def _real_redis(_path):
     name = uuid.uuid4().hex
     return RedisExampleDatabase(
@@ -224,6 +241,11 @@ def test_structured_api_real_redis():
     conforms_to_structured_api(
         _real_redis, parent_settings=settings(max_examples=50, stateful_step_count=30)
     )
+
+
+@pytest.mark.skipif(REDIS_URL is None, reason="needs HYPOTHESIS_TEST_REDIS_URL")
+def test_scripts_are_reloaded_real_redis():
+    scripts_are_reloaded(_real_redis(None))
 
 
 @pytest.mark.skipif(REDIS_URL is None, reason="needs HYPOTHESIS_TEST_REDIS_URL")

@@ -98,7 +98,7 @@ def fetch_each(db, keys):
     return [list(db.fetch(k)) for k in keys]
 
 
-def core_workload(db, rec, worker, deadline, rate):
+def core_workload(db, rec, deadline, rate):
     ops = 0
     while time.perf_counter() < deadline:
         key = test_key(random.randrange(TESTS))
@@ -116,7 +116,7 @@ def core_workload(db, rec, worker, deadline, rate):
     return ops
 
 
-def fuzz_workload(db, rec, worker, deadline, rate):
+def fuzz_workload(db, rec, deadline, rate):
     """Runs flat out, or at ``rate`` operations per second."""
     tests = random.sample(range(TESTS), TESTS_PER_WORKER)
     worker_id = uuid.uuid4().bytes
@@ -199,7 +199,7 @@ def load_legacy(db, t):
     ]
 
 
-def startup_workload(db, rec, worker, deadline, rate):
+def startup_workload(db, rec, deadline, rate):
     ops = 0
     while time.perf_counter() < deadline:
         t = test_key(random.randrange(STARTUP_TESTS))
@@ -231,14 +231,12 @@ def run_worker(db_or_spec, workload, worker, barrier, seconds, rate, results):
     db = make_backend(db_or_spec) if isinstance(db_or_spec, dict) else db_or_spec
     if isinstance(db_or_spec, dict) and db_or_spec["kind"] == "memory":
         setup(db, workload)  # this process's database is not shared, so set it up here
+    WORKLOADS[workload](db, Recorder(), time.perf_counter() + 0.5, rate)  # warm up
     rec = Recorder()
-    WORKLOADS[workload](
-        db, Recorder(), worker, time.perf_counter() + 0.5, rate
-    )  # warm up
     db.flush()
     barrier.wait()
     start = time.perf_counter()
-    ops = WORKLOADS[workload](db, rec, worker, start + seconds, rate)
+    ops = WORKLOADS[workload](db, rec, start + seconds, rate)
     db.flush()
     elapsed = time.perf_counter() - start
     results.put(

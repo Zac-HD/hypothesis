@@ -9,14 +9,16 @@
 # obtain one at https://mozilla.org/MPL/2.0/.
 
 import base64
+import hashlib
 import json
 import threading
 import time
 from collections.abc import Mapping, Sequence
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 
 from redis import Redis, WatchError
+from redis.exceptions import NoScriptError
 
 from hypothesis.database import (
     INLINE_VALUE_LIMIT,
@@ -31,7 +33,6 @@ from hypothesis.database import (
     ReadOpT,
     WriteOpT,
     _check_atomic,
-    _events_from_change,
     _is_conditional,
     _journal_change,
     _JournalBatch,
@@ -45,6 +46,8 @@ from hypothesis.internal.dbcodec import (
     KeyTupleT,
     decode,
     encode,
+    field_key,
+    index_key,
     is_legacy,
     log_key,
     make_entry_id,
@@ -67,8 +70,10 @@ local function journal(jkey, retention, wake, fields)
   redis.call('PUBLISH', wake, '')
 end
 
-local function firehose(channel, payload)
-  if channel ~= '' then redis.call('PUBLISH', channel, payload) end
+-- A message for old-style listeners: a tag, then the legacy key with its length,
+-- then the rest. See RedisExampleDatabase._handle_message for the tags.
+local function firehose(channel, tag, key, rest)
+  if channel ~= '' then redis.call('PUBLISH', channel, tag .. #key .. ':' .. key .. rest) end
 end
 
 -- Remove expired fields, and expire the whole map when every field has a deadline.
@@ -105,7 +110,7 @@ end
 """
 
 # KEYS: set, journal. ARGV: member, expire_after, ek, ef, retention, wake,
-# firehose channel, firehose payload, expect mode, expect value.
+# firehose channel, legacy key, expect mode, expect value.
 _SET_PUT = """
 local present = redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1
 if ARGV[9] == 'absent' and present then return 0 end
@@ -114,7 +119,7 @@ local added = redis.call('SADD', KEYS[1], ARGV[1])
 redis.call('EXPIRE', KEYS[1], ARGV[2])
 if added == 1 then
   journal(KEYS[2], ARGV[5], ARGV[6], {'o', '1', 'k', ARGV[3], 'f', ARGV[4], 'v', ''})
-  firehose(ARGV[7], ARGV[8])
+  firehose(ARGV[7], 'S', ARGV[8], ARGV[1])
 end
 return 1
 """
@@ -125,21 +130,21 @@ local removed = redis.call('SREM', KEYS[1], ARGV[1])
 redis.call('EXPIRE', KEYS[1], ARGV[2])
 if removed == 0 then return 0 end
 journal(KEYS[2], ARGV[5], ARGV[6], {'o', '2', 'k', ARGV[3], 'f', ARGV[4]})
-firehose(ARGV[7], ARGV[8])
+firehose(ARGV[7], 'X', ARGV[8], ARGV[1])
 return 1
 """
 
-# KEYS: map or set, exp, journal. ARGV: ek, retention, wake, firehose channel, payload.
+# KEYS: map or set, exp, journal. ARGV: ek, retention, wake, firehose channel, legacy key.
 _CLEAR = """
 local removed = redis.call('DEL', KEYS[1], KEYS[2])
 if removed == 0 then return 0 end
 journal(KEYS[3], ARGV[2], ARGV[3], {'o', '3', 'k', ARGV[1]})
-firehose(ARGV[4], ARGV[5])
+firehose(ARGV[4], 'N', ARGV[5], '')
 return 1
 """
 
 # KEYS: map, exp, journal. ARGV: ef, value, ttl_ms, expect mode, expect value,
-# ek, retention, inline limit, wake, firehose channel, firehose payload.
+# ek, retention, inline limit, wake, firehose channel, legacy key.
 _MAP_PUT = """
 local now = now_ms()
 local current = live_value(KEYS[1], KEYS[2], ARGV[1], now)
@@ -159,13 +164,13 @@ if current ~= ARGV[2] then
     table.insert(fields, ARGV[2])
   end
   journal(KEYS[3], ARGV[7], ARGV[9], fields)
-  firehose(ARGV[10], ARGV[11])
+  firehose(ARGV[10], 'S', ARGV[11], ARGV[2])
 end
 return 1
 """
 
 # KEYS: map, exp, journal. ARGV: ef, expect mode, expect value, ek, retention,
-# wake, firehose channel, firehose payload.
+# wake, firehose channel, legacy key.
 _MAP_DELETE = """
 local now = now_ms()
 local current = live_value(KEYS[1], KEYS[2], ARGV[1], now)
@@ -175,7 +180,7 @@ redis.call('HDEL', KEYS[2], ARGV[1])
 expire_fields(KEYS[1], KEYS[2], now)
 if not current then return 0 end
 journal(KEYS[3], ARGV[5], ARGV[6], {'o', '2', 'k', ARGV[4], 'f', ARGV[1]})
-firehose(ARGV[7], ARGV[8])
+firehose(ARGV[7], 'N', ARGV[8], '')
 return 1
 """
 
@@ -200,9 +205,7 @@ if #ARGV[1] <= tonumber(ARGV[6]) then
   table.insert(fields, ARGV[1])
 end
 journal(KEYS[2], ARGV[5], ARGV[7], fields)
--- Lua cannot encode base64, so this message is "A", then two length-prefixed
--- strings, then the value. A deleted entry's message starts with "D".
-firehose(ARGV[8], 'A' .. #ARGV[9] .. ':' .. ARGV[9] .. #id .. ':' .. id .. ARGV[1])
+firehose(ARGV[8], 'A', ARGV[9], #id .. ':' .. id .. ARGV[1])
 return id
 """
 
@@ -248,7 +251,7 @@ for i = 9, #ARGV do
       table.insert(fields, value)
     end
     journal(KEYS[2], ARGV[4], ARGV[5], fields)
-    firehose(ARGV[6], 'D' .. #ARGV[7] .. ':' .. ARGV[7] .. #ARGV[i] .. ':' .. ARGV[i] .. value)
+    firehose(ARGV[6], 'D', ARGV[7], #ARGV[i] .. ':' .. ARGV[i] .. value)
   end
 end
 if ARGV[2] ~= '' then removed = removed + redis.call('XTRIM', KEYS[1], 'MINID', ARGV[2]) end
@@ -259,6 +262,12 @@ return removed
 
 _MIN_ID = make_entry_id(0, 0)
 _MAX_ID = make_entry_id(2**64 - 1, 2**64 - 1)
+
+
+def _split_prefixed(data: bytes) -> tuple[bytes, bytes]:
+    """Split a string with a decimal length and a colon in front of it."""
+    size, rest = data.split(b":", 1)
+    return rest[: int(size)], rest[int(size) :]
 
 
 def _stream_id(entry_id: bytes) -> bytes:
@@ -310,7 +319,7 @@ class RedisExampleDatabase(_NativeDatabase):
         self.journal_retention = journal_retention
         self._sweep_interval = sweep_interval
         self._scripts = {
-            name: redis.register_script(_PRELUDE + body)
+            name: _PRELUDE + body
             for name, body in [
                 ("set_put", _SET_PUT),
                 ("set_delete", _SET_DELETE),
@@ -323,6 +332,12 @@ class RedisExampleDatabase(_NativeDatabase):
                 ("map_items", _MAP_ITEMS),
             ]
         }
+        self._shas = {
+            name: hashlib.sha1(text.encode()).hexdigest()
+            for name, text in self._scripts.items()
+        }
+        self._scripts_loaded = False
+        self._tags: dict[KeyPartT, bytes] = {}
         self._pubsub: Any = None
         self._listen_thread: Any = None
         self._journal_lock = threading.Lock()
@@ -354,17 +369,19 @@ class RedisExampleDatabase(_NativeDatabase):
     # Key layout
 
     def _tag(self, partition: KeyPartT) -> bytes:
-        return (
-            self._prefix
-            + b"{"
-            + base64.urlsafe_b64encode(encode((partition,))).rstrip(b"=")
-            + b"}"
-        )
+        try:
+            return self._tags[partition]
+        except KeyError:
+            encoded = base64.urlsafe_b64encode(encode((partition,))).rstrip(b"=")
+            tag = self._tags[partition] = self._prefix + b"{" + encoded + b"}"
+            return tag
 
     def _data_keys(self, key: KeyTupleT) -> tuple[bytes, bytes]:
-        """The set or hash for ``key``, and the hash of its deadlines."""
+        """The set or hash for ``key``, and the hash of its deadlines. A set has
+        no deadlines, so its key stands in for both."""
         if is_legacy(key):
-            return self._prefix + key[0], self._tag(key[0]) + b"e"  # type: ignore
+            raw = self._prefix + key[0]  # type: ignore
+            return raw, raw
         ek = encode(key)
         tag = self._tag(key[0])
         return tag + b"m" + ek, tag + b"e" + ek
@@ -378,21 +395,24 @@ class RedisExampleDatabase(_NativeDatabase):
     def _wake_channel(self, partition: KeyPartT) -> bytes:
         return self._tag(partition) + b"w"
 
-    def _firehose(self, change: Change) -> tuple[str, str]:
-        if not self.listener_channel:
-            return "", ""
-        events = _events_from_change(change)
-        if not events:
-            return "", ""
-        kind, (key, value) = events[0]
-        payload = [
-            kind,
-            [self._encode(key), None if value is None else self._encode(value)],
-        ]
-        return self.listener_channel, json.dumps(payload)
+    def _eval(
+        self, pipe: Any, name: str, keys: list, args: list, *, by_sha: bool
+    ) -> None:
+        # Redis keeps scripts by hash. A pipeline of Script objects would ask
+        # whether they exist first, which costs a round trip on every call.
+        if by_sha:
+            pipe.evalsha(self._shas[name], len(keys), *keys, *args)
+        else:
+            pipe.eval(self._scripts[name], len(keys), *keys, *args)
 
-    def _encode(self, value: bytes) -> str:
-        return base64.b64encode(value).decode("ascii")
+    def _load_scripts(self) -> None:
+        # Load every script at once, so that a server that loses them, as in a
+        # restart, loses them all, and a batch that needs them fails as a whole.
+        pipe = self.redis.pipeline(transaction=False)
+        for text in self._scripts.values():
+            pipe.script_load(text)
+        pipe.execute()
+        self._scripts_loaded = True
 
     def _decode(self, value: str) -> bytes:
         return base64.b64decode(value)
@@ -401,6 +421,45 @@ class RedisExampleDatabase(_NativeDatabase):
 
     def read_many(self, ops: Sequence[ReadOpT]) -> list[Any]:
         ops = list(ops)
+        if not self._scripts_loaded:
+            self._load_scripts()
+        try:
+            replies = iter(self._pipeline_reads(ops))
+        except NoScriptError:
+            # The server has lost its scripts, as after a restart. Reads can repeat.
+            self._load_scripts()
+            replies = iter(self._pipeline_reads(ops))
+        results: list[Any] = []
+        for op in ops:
+            reply = next(replies)
+            if isinstance(op, LogRange):
+                results.append(
+                    [] if reply == b"" else [(_entry_id(i), f[b"v"]) for i, f in reply]
+                )
+                continue
+            if is_legacy(op.key):
+                next(replies)  # the reply to EXPIRE
+                if isinstance(op, MapGet):
+                    results.append(b"" if reply else None)
+                else:
+                    results.append(
+                        {
+                            (m,): b""
+                            for m in reply
+                            if not op.prefix or _matches_prefix((m,), op.prefix)
+                        }
+                    )
+            elif isinstance(op, MapGet):
+                results.append(reply)
+            else:
+                prefix = encode(op.prefix)
+                pairs = zip(reply[::2], reply[1::2], strict=True)
+                results.append(
+                    {decode(ef): value for ef, value in pairs if ef.startswith(prefix)}
+                )
+        return results
+
+    def _pipeline_reads(self, ops: list[ReadOpT]) -> list[Any]:
         expire = int(self._expire_after.total_seconds())
         pipe = self.redis.pipeline(transaction=False)
         for op in ops:
@@ -424,148 +483,98 @@ class RedisExampleDatabase(_NativeDatabase):
                     pipe.smembers(data)
                 pipe.expire(data, expire)
             elif isinstance(op, MapGet):
-                self._scripts["map_get"](
-                    keys=[data, exp], args=[encode(op.field)], client=pipe
+                self._eval(
+                    pipe, "map_get", [data, exp], [encode(op.field)], by_sha=True
                 )
             else:
-                self._scripts["map_items"](keys=[data, exp], client=pipe)
-        replies = iter(pipe.execute())
-        results: list[Any] = []
-        for op in ops:
-            reply = next(replies)
-            if isinstance(op, LogRange):
-                results.append(
-                    [] if reply == b"" else [(_entry_id(i), f[b"v"]) for i, f in reply]
-                )
-                continue
-            if is_legacy(op.key):
-                next(replies)  # the reply to EXPIRE
-                if isinstance(op, MapGet):
-                    results.append(b"" if reply else None)
-                else:
-                    results.append(
-                        {(m,): b"" for m in reply if _matches_prefix((m,), op.prefix)}
-                    )
-            elif isinstance(op, MapGet):
-                results.append(reply)
-            else:
-                prefix = encode(op.prefix)
-                pairs = zip(reply[::2], reply[1::2], strict=True)
-                results.append(
-                    {decode(ef): value for ef, value in pairs if ef.startswith(prefix)}
-                )
-        return results
+                self._eval(pipe, "map_items", [data, exp], [], by_sha=True)
+        return pipe.execute()
 
     # Writes
 
-    def _queue_write(self, pipe: Any, op: WriteOpT, *, check: bool) -> None:
+    def _queue_write(
+        self, pipe: Any, op: WriteOpT, *, check: bool, by_sha: bool
+    ) -> None:
         retention = int(self.journal_retention * 1000)
         wake = self._wake_channel(op.key[0])
         journal = self._journal_key(op.key[0])
+        channel = self.listener_channel
         ek = encode(op.key)
         if isinstance(op, LogTrim):
-            self._scripts["log_trim"](
-                keys=[self._log_key(op.key), journal],
-                args=[
-                    "" if op.maxlen is None else op.maxlen,
-                    "" if op.before is None else _stream_id(op.before),
-                    ek,
-                    retention,
-                    wake,
-                    self.listener_channel,
-                    log_key(ek),
-                    INLINE_VALUE_LIMIT,
-                    *map(_stream_id, op.ids),
-                ],
-                client=pipe,
-            )
+            args = [
+                "" if op.maxlen is None else op.maxlen,
+                "" if op.before is None else _stream_id(op.before),
+                ek,
+                retention,
+                wake,
+                channel,
+                log_key(ek),
+                INLINE_VALUE_LIMIT,
+                *map(_stream_id, op.ids),
+            ]
+            keys = [self._log_key(op.key), journal]
+            self._eval(pipe, "log_trim", keys, args, by_sha=by_sha)
             return
         if isinstance(op, LogAppend):
-            self._scripts["log_append"](
-                keys=[self._log_key(op.key), journal],
-                args=[
-                    op.value,
-                    "" if op.maxlen is None else op.maxlen,
-                    "" if op.ttl is None else int(op.ttl * 1000),
-                    ek,
-                    retention,
-                    INLINE_VALUE_LIMIT,
-                    wake,
-                    self.listener_channel,
-                    log_key(ek),
-                ],
-                client=pipe,
-            )
+            args = [
+                op.value,
+                "" if op.maxlen is None else op.maxlen,
+                "" if op.ttl is None else int(op.ttl * 1000),
+                ek,
+                retention,
+                INLINE_VALUE_LIMIT,
+                wake,
+                channel,
+                log_key(ek),
+            ]
+            keys = [self._log_key(op.key), journal]
+            self._eval(pipe, "log_append", keys, args, by_sha=by_sha)
             return
         data, exp = self._data_keys(op.key)
+        legacy = is_legacy(op.key)
         if isinstance(op, MapClear):
-            channel, payload = self._firehose(Change("clear", op.key))
-            self._scripts["clear"](
-                keys=[data, exp if not is_legacy(op.key) else data, journal],
-                args=[ek, retention, wake, channel, payload],
-                client=pipe,
-            )
+            # The legacy key that old-style listeners hear about.
+            heard = cast(bytes, op.key[0]) if legacy else index_key(ek)
+            args = [ek, retention, wake, channel, heard]
+            self._eval(pipe, "clear", [data, exp, journal], args, by_sha=by_sha)
             return
         mode, expected = "", b""
         if check and op.expect is not unset:
             mode, expected = ("absent", b"") if op.expect is None else ("eq", op.expect)
-        if isinstance(op, MapPut):
-            channel, payload = self._firehose(
-                Change("put", op.key, op.field, value=op.value)
-            )
-        else:
-            channel, payload = self._firehose(Change("delete", op.key, op.field))
-        if is_legacy(op.key):
+        ef = encode(op.field)
+        if legacy:
+            args = [
+                op.field[0],
+                int(self._expire_after.total_seconds()),
+                ek,
+                ef,
+                retention,
+                wake,
+                channel,
+                op.key[0],
+                mode,
+                expected,
+            ]
             script = "set_put" if isinstance(op, MapPut) else "set_delete"
-            self._scripts[script](
-                keys=[data, journal],
-                args=[
-                    op.field[0],
-                    int(self._expire_after.total_seconds()),
-                    ek,
-                    encode(op.field),
-                    retention,
-                    wake,
-                    channel,
-                    payload,
-                    mode,
-                    expected,
-                ],
-                client=pipe,
-            )
+            self._eval(pipe, script, [data, journal], args, by_sha=by_sha)
         elif isinstance(op, MapPut):
-            self._scripts["map_put"](
-                keys=[data, exp, journal],
-                args=[
-                    encode(op.field),
-                    op.value,
-                    "" if op.ttl is None else int(op.ttl * 1000),
-                    mode,
-                    expected,
-                    ek,
-                    retention,
-                    INLINE_VALUE_LIMIT,
-                    wake,
-                    channel,
-                    payload,
-                ],
-                client=pipe,
-            )
+            args = [
+                ef,
+                op.value,
+                "" if op.ttl is None else int(op.ttl * 1000),
+                mode,
+                expected,
+                ek,
+                retention,
+                INLINE_VALUE_LIMIT,
+                wake,
+                channel,
+                field_key(ek, ef),
+            ]
+            self._eval(pipe, "map_put", [data, exp, journal], args, by_sha=by_sha)
         else:
-            self._scripts["map_delete"](
-                keys=[data, exp, journal],
-                args=[
-                    encode(op.field),
-                    mode,
-                    expected,
-                    ek,
-                    retention,
-                    wake,
-                    channel,
-                    payload,
-                ],
-                client=pipe,
-            )
+            args = [ef, mode, expected, ek, retention, wake, channel, field_key(ek, ef)]
+            self._eval(pipe, "map_delete", [data, exp, journal], args, by_sha=by_sha)
 
     @staticmethod
     def _result(op: WriteOpT, reply: Any) -> Any:
@@ -581,13 +590,29 @@ class RedisExampleDatabase(_NativeDatabase):
         ops = list(ops)
         if not ops:
             return []
-        if not atomic:
+        if atomic:
+            return self._write_atomically(ops)
+        if not self._scripts_loaded:
+            self._load_scripts()
+        for attempt in range(2):
             pipe = self.redis.pipeline(transaction=False)
             for op in ops:
-                self._queue_write(pipe, op, check=True)
-            return [
-                self._result(op, r) for op, r in zip(ops, pipe.execute(), strict=True)
-            ]
+                self._queue_write(pipe, op, check=True, by_sha=True)
+            replies = pipe.execute(raise_on_error=False)
+            if attempt == 0 and all(isinstance(r, NoScriptError) for r in replies):
+                # The server has lost its scripts, as after a restart. Every write
+                # failed, so none was applied, and the batch can be sent again.
+                self._load_scripts()
+                continue
+            for reply in replies:
+                if isinstance(reply, Exception):
+                    raise reply
+            break
+        return [self._result(op, r) for op, r in zip(ops, replies, strict=True)]
+
+    def _write_atomically(self, ops: list[WriteOpT]) -> list[Any]:
+        # This sends each script's text, not its hash. An unknown hash would fail
+        # inside MULTI, after the writes before it had been applied.
         _check_atomic(ops)
         conditional = [op for op in ops if _is_conditional(op)]
         watched = sorted({k for op in conditional for k in self._data_keys(op.key)})
@@ -607,7 +632,7 @@ class RedisExampleDatabase(_NativeDatabase):
                             return _not_applied(ops)
                         pipe.multi()
                     for op in ops:
-                        self._queue_write(pipe, op, check=False)
+                        self._queue_write(pipe, op, check=False, by_sha=False)
                     replies = pipe.execute()
                     return [
                         self._result(op, r) for op, r in zip(ops, replies, strict=True)
@@ -616,17 +641,15 @@ class RedisExampleDatabase(_NativeDatabase):
                     pipe.reset()
 
     def _currents(self, pipe: Any, ops: list[MapPut | MapDelete]) -> list[bytes | None]:
+        # The pipeline is watching, so each command runs at once.
         currents: list[bytes | None] = []
         for op in ops:
             data, exp = self._data_keys(op.key)
             if is_legacy(op.key):
                 currents.append(b"" if pipe.sismember(data, op.field[0]) else None)
             else:
-                currents.append(
-                    self._scripts["map_get"](
-                        keys=[data, exp], args=[encode(op.field)], client=pipe
-                    )
-                )
+                script = self._scripts["map_get"]
+                currents.append(pipe.eval(script, 2, data, exp, encode(op.field)))
         return currents
 
     def current_time(self) -> float:
@@ -747,21 +770,27 @@ class RedisExampleDatabase(_NativeDatabase):
         # sent to the client, but not to the pubsub channel.
         assert message["type"] == "message"
         data = message["data"]
-        if data[:1] in (b"A", b"D"):  # a log entry, appended or deleted
-            size, rest = data[1:].split(b":", 1)
-            key, rest = rest[: int(size)], rest[int(size) :]
-            size, rest = rest.split(b":", 1)
-            stream_id, value = rest[: int(size)], rest[int(size) :]
-            kind = "save" if data[:1] == b"A" else "delete"
-            self._broadcast_change((kind, (key, _entry_id(stream_id) + value)))
-            return
-        event_type, (key, value) = json.loads(data)
-        self._broadcast_change(
-            (
-                event_type,
-                (self._decode(key), None if value is None else self._decode(value)),
+        if data.startswith(b"["):  # JSON, from an older version
+            event_type, (key, value) = json.loads(data)
+            self._broadcast_change(
+                (
+                    event_type,
+                    (self._decode(key), None if value is None else self._decode(value)),
+                )
             )
-        )
+            return
+        # A tag, then the legacy key with its length, then the rest. The tags are
+        # S for a save, X for a delete, N for a delete of an unknown value, and A
+        # or D for a log entry appended or deleted, whose id comes first.
+        tag = data[:1]
+        key, rest = _split_prefixed(data[1:])
+        if tag in (b"A", b"D"):
+            stream_id, value = _split_prefixed(rest)
+            rest = _entry_id(stream_id) + value
+        if tag in (b"S", b"A"):
+            self._broadcast_change(("save", (key, rest)))
+        else:
+            self._broadcast_change(("delete", (key, None if tag == b"N" else rest)))
 
     def _start_listening(self) -> None:
         self._pubsub = self.redis.pubsub(ignore_subscribe_messages=True)

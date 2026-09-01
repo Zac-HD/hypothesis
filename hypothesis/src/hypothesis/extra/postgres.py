@@ -51,13 +51,14 @@ from hypothesis.database import (
     _ListenerThread,
     _NativeDatabase,
     _not_applied,
+    _sql_batch,
     _unpack_position,
 )
 from hypothesis.internal.dbcodec import (
     KeyPartT,
-    KeyTupleT,
     decode,
     encode,
+    partition_hash,
     short_hash,
 )
 
@@ -90,7 +91,6 @@ CREATE INDEX IF NOT EXISTS hypothesis_journal_at ON hypothesis_journal (at);
 """
 
 _LIVE = f"(exp IS NULL OR exp > {_NOW})"
-_WHERE_FIELD = "ns = %(ns)s AND kh = %(kh)s AND fh = %(fh)s AND key = %(key)s AND field = %(field)s"
 
 # Applies every operation for one partition, in one statement, which is one
 # transaction. Returns NULL if the batch is atomic and a condition failed.
@@ -140,7 +140,12 @@ BEGIN
                 p_fhs[i], p_values[i], p_ttls[i], p_counts[i], p_befores[i], p_ids[i]));
         END LOOP;
     END IF;
-    PERFORM pg_notify(p_channel, '');
+    -- Wake readers only if this transaction wrote to the journal.
+    IF EXISTS (
+        SELECT 1 FROM hypothesis_journal WHERE xid = pg_current_xact_id_if_assigned()
+    ) THEN
+        PERFORM pg_notify(p_channel, '');
+    END IF;
     RETURN results;
 END $$;
 
@@ -169,7 +174,9 @@ BEGIN
     IF p_op = 1 THEN
         INSERT INTO hypothesis_maps (ns, kh, fh, key, field, value, exp)
         VALUES (p_ns, p_kh, p_fh, p_key, p_field, p_value, now_s + p_ttl)
-        ON CONFLICT (ns, kh, fh) DO UPDATE SET value = EXCLUDED.value, exp = EXCLUDED.exp;
+        ON CONFLICT (ns, kh, fh) DO UPDATE SET value = EXCLUDED.value, exp = EXCLUDED.exp
+        WHERE hypothesis_maps.value IS DISTINCT FROM EXCLUDED.value
+        OR hypothesis_maps.exp IS DISTINCT FROM EXCLUDED.exp;
         IF NOT present OR cur IS DISTINCT FROM p_value THEN
             INSERT INTO hypothesis_journal (ns, at, ph, op, key, field, value)
             VALUES (p_ns, now_s, p_ph, 1, p_key, p_field,
@@ -274,9 +281,10 @@ FROM s LEFT JOIN LATERAL (
 class _PostgresListener(_ListenerThread):
     """Follows every partition in the namespace, for the old listener API."""
 
+    db: "PostgresExampleDatabase"
+
     def __init__(self, db: "PostgresExampleDatabase") -> None:
         super().__init__(db)
-        self.pg = db
         self.conn = db._connect()
         self.listen_conn = psycopg.connect(db.conninfo, autocommit=True)
         for i in range(_CHANNELS):
@@ -284,7 +292,7 @@ class _PostgresListener(_ListenerThread):
         self.position = db._xmin_position(self.conn)
 
     def fetch(self) -> list[Change]:
-        _, rows = self.pg._read_journal(self.conn, self.position, None, 1000)
+        _, rows = self.db._read_journal(self.conn, self.position, None, 1000)
         if rows:
             self.position = (rows[-1][0], rows[-1][1])
         return [_row_change(row) for row in rows]
@@ -352,12 +360,7 @@ class PostgresExampleDatabase(_NativeDatabase):
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        self.__init__(  # type: ignore
-            state["conninfo"],
-            namespace=state["namespace"],
-            journal_retention=state["journal_retention"],
-            synchronous_commit=state["synchronous_commit"],
-        )
+        self.__init__(**state)  # type: ignore
 
     @property
     def capabilities(self) -> frozenset[str]:
@@ -390,19 +393,6 @@ class PostgresExampleDatabase(_NativeDatabase):
     def _conn(self) -> psycopg.Connection:
         return self._connections.get()
 
-    def _params(self, key: KeyTupleT) -> dict[str, Any]:
-        ek = encode(key)
-        return {
-            "ns": self.namespace,
-            "key": ek,
-            "kh": short_hash(ek),
-            "ph": self._partition_hash(key[0]),
-        }
-
-    @staticmethod
-    def _partition_hash(partition: KeyPartT) -> bytes:
-        return short_hash(encode((partition,)))
-
     def _channel_name(self, index: int) -> str:
         return f"hypothesis_{self._ns_hash}_{index}"
 
@@ -422,11 +412,19 @@ class PostgresExampleDatabase(_NativeDatabase):
         cursors = []
         with conn.pipeline():
             for op in ops:
-                params = self._params(op.key)
+                ek = encode(op.key)
+                params: dict[str, Any] = {
+                    "ns": self.namespace,
+                    "key": ek,
+                    "kh": short_hash(ek),
+                }
                 if isinstance(op, MapGet):
                     ef = encode(op.field)
                     params.update(field=ef, fh=short_hash(ef))
-                    sql = f"SELECT value FROM hypothesis_maps WHERE {_WHERE_FIELD} AND {_LIVE}"
+                    sql = (
+                        "SELECT value FROM hypothesis_maps WHERE ns = %(ns)s AND kh = %(kh)s "
+                        f"AND fh = %(fh)s AND key = %(key)s AND field = %(field)s AND {_LIVE}"
+                    )
                 elif isinstance(op, MapItems):
                     sql = (
                         "SELECT field, value FROM hypothesis_maps WHERE ns = %(ns)s "
@@ -507,7 +505,7 @@ class PostgresExampleDatabase(_NativeDatabase):
             _check_atomic(ops)
         groups: dict[bytes, list[int]] = {}
         for i, op in enumerate(ops):
-            groups.setdefault(self._partition_hash(op.key[0]), []).append(i)
+            groups.setdefault(partition_hash(op.key[0]), []).append(i)
         conn = self._conn()
         cursors = {}
         with conn.pipeline():
@@ -629,24 +627,16 @@ class PostgresExampleDatabase(_NativeDatabase):
         self, positions: Mapping[KeyPartT, bytes], limit: int | None
     ) -> _JournalBatch:
         unpacked = {p: _unpack_position(">qq", pos) for p, pos in positions.items()}
-        by_hash = {self._partition_hash(p): p for p in unpacked}
+        by_hash = {partition_hash(p): p for p in unpacked}
         # LISTEN before reading, so that no wake-up is missed.
         self._listen({self._channel(ph) for ph in by_hash})
         xmin, rows = self._read_journal(
             self._conn(), min(unpacked.values()), list(by_hash), limit
         )
-        changes = [
-            _row_change(row)
-            for row in rows
-            if (row[0], row[1]) > unpacked[by_hash[bytes(row[2])]]
+        entries = [
+            ((row[0], row[1]), by_hash[bytes(row[2])], _row_change(row)) for row in rows
         ]
-        truncated = limit is not None and len(rows) == limit
-        upto = (rows[-1][0], rows[-1][1]) if truncated else (xmin - 1, _MAX_ID)
-        return _JournalBatch(
-            changes,
-            {p: struct.pack(">qq", *max(pos, upto)) for p, pos in unpacked.items()},
-            set(unpacked) if truncated else set(),
-        )
+        return _sql_batch(">qq", unpacked, entries, (xmin - 1, _MAX_ID), limit)
 
     def _journal_wait(self, batch: _JournalBatch, timeout: float | None) -> None:
         wait = 1.0 if timeout is None else min(timeout, 1.0)

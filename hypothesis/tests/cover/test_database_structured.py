@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from hypothesis import HealthCheck, settings, strategies as st
+from hypothesis import HealthCheck, given, settings, strategies as st
 from hypothesis.database import (
     BackgroundWriteDatabase,
     DirectoryBasedExampleDatabase,
@@ -42,7 +42,13 @@ from hypothesis.database import (
     unset,
 )
 from hypothesis.errors import InvalidArgument
-from hypothesis.internal.dbcodec import is_legacy, make_cursor
+from hypothesis.internal.dbcodec import (
+    decode,
+    encode,
+    is_legacy,
+    make_cursor,
+    split_cursor,
+)
 from hypothesis.stateful import (
     RuleBasedStateMachine,
     precondition,
@@ -456,8 +462,7 @@ def test_invalid_arguments(call):
 @pytest.mark.parametrize("name", ["memory", "sqlite", "remote-memory"])
 def test_old_cursors_expire(name, tmp_path):
     db = BACKENDS[name](tmp_path)
-    cursor = db.journal_head("p")
-    _, position = cursor[:8], cursor[8:]
+    _, position = split_cursor(db.journal_head("p"))
     stale = make_cursor(position, issued_at=time.time() - db.journal_retention)
     with pytest.raises(JournalCursorExpired) as info:
         db.journal_read({"p": stale})
@@ -525,6 +530,22 @@ def test_a_closed_database_opens_new_connections(tmp_path):
     db.close()
     assert db.map_get(("p", "m"), "f") == b"v"
     db.close()
+
+
+key_parts = st.one_of(st.binary(), st.text(), st.integers(-(2**63), 2**63 - 1))
+keys = st.lists(key_parts, max_size=4).map(tuple)
+
+
+@given(keys)
+def test_keys_survive_encoding(key):
+    assert decode(encode(key)) == key
+
+
+@given(keys, keys)
+def test_encoded_prefixes_are_tuple_prefixes(a, b):
+    # Prefix queries on encoded fields rely on this, in both directions.
+    assert encode(a + b).startswith(encode(a))
+    assert encode(b).startswith(encode(a)) == (b[: len(a)] == a)
 
 
 def test_only_the_journal_of_followed_partitions_is_read():

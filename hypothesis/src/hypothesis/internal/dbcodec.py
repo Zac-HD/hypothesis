@@ -90,6 +90,12 @@ def is_legacy(key: KeyTupleT) -> bool:
 
 
 def encode(parts: KeyTupleT) -> bytes:
+    """Encode a key or field. Components are self-delimiting, so a byte prefix
+    of an encoding is the encoding of a tuple prefix.
+
+    Keys have their own format, not that of choices_to_bytes, because stored
+    keys must not change when the choice format does.
+    """
     out = bytearray()
     for part in parts:
         if isinstance(part, bytes):
@@ -133,13 +139,13 @@ def decode(data: bytes) -> KeyTupleT:
     return tuple(parts)
 
 
-def has_prefix(encoded: bytes, encoded_prefix: bytes) -> bool:
-    # Components are self-delimiting, so a byte prefix is a tuple prefix.
-    return encoded.startswith(encoded_prefix)
-
-
 def short_hash(data: bytes) -> bytes:
     return blake2b(data, digest_size=16).digest()
+
+
+def partition_hash(partition: KeyPartT) -> bytes:
+    """The hash that the SQL backends store, to find a partition's journal."""
+    return short_hash(encode((partition,)))
 
 
 # Reserved legacy keys, used to store structured data through the old methods.

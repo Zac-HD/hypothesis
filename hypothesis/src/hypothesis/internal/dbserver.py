@@ -24,6 +24,7 @@ The benchmarks showed that passing work between threads cost more than the work.
 
 import os
 import queue
+import selectors
 import socket
 import threading
 import time
@@ -52,6 +53,9 @@ class _JournalWait:
         self.deadline = deadline
         self.changes: list = []
         self.ready_at: float | None = None
+        # The buffer's sequence number at the last read, and when to read anyway.
+        self.seen = -1
+        self.next_read = 0.0
 
 
 class _Client:
@@ -169,6 +173,11 @@ class DatabaseServer:
         self._wake_recv, self._wake_send = socket.socketpair()
         self._wake_recv.setblocking(False)
         self._wake_send.setblocking(False)
+        # One selector, so that each pass does not register every connection
+        # again. A selector cannot wait for a named pipe, so Windows uses wait().
+        self._selector = None if WINDOWS else selectors.DefaultSelector()
+        if self._selector is not None:
+            self._selector.register(self._wake_recv, selectors.EVENT_READ)
         self._closed = threading.Event()
         self._hub = _JournalHub(db, poll_timeout, linger, self._wake)
         self._threads = [
@@ -266,17 +275,22 @@ class DatabaseServer:
                 while not self._new_conns.empty():
                     conn = self._new_conns.get()
                     clients[conn] = _Client(conn)
-                readable = [c.conn for c in clients.values() if c.pending is None]
-                found = wait([*readable, self._wake_recv], self._timeout(clients))
-                for ready in found:
+                    if self._selector is not None:
+                        self._selector.register(conn, selectors.EVENT_READ)
+                for ready in self._ready(clients):
                     if ready is self._wake_recv:
                         try:
                             while self._wake_recv.recv(4096):
                                 pass
                         except OSError:
                             pass
+                    elif clients[ready].pending is None:
+                        self._receive(clients, clients[ready])
                     else:
-                        self._receive(clients, clients[ready])  # type: ignore
+                        # A client waits for each reply before it sends more, so
+                        # a connection with a request pending is readable only
+                        # when the client has gone.
+                        self._drop(clients, clients[ready])
                 # While this runs, clients wait, and their writes queue up in the
                 # sockets. That is the backpressure.
                 self._apply_writes()
@@ -284,6 +298,21 @@ class DatabaseServer:
         finally:
             for conn in clients:
                 conn.close()
+            if self._selector is not None:
+                self._selector.close()
+
+    def _ready(self, clients: dict[Connection, _Client]) -> list[Any]:
+        timeout = self._timeout(clients)
+        if self._selector is None:  # pragma: no cover
+            idle = [c.conn for c in clients.values() if c.pending is None]
+            return wait([*idle, self._wake_recv], timeout)
+        return [key.fileobj for key, _ in self._selector.select(timeout)]
+
+    def _drop(self, clients: dict[Connection, _Client], client: _Client) -> None:
+        del clients[client.conn]
+        if self._selector is not None:
+            self._selector.unregister(client.conn)
+        client.conn.close()
 
     @staticmethod
     def _timeout(clients: dict[Connection, _Client]) -> float:
@@ -307,19 +336,15 @@ class DatabaseServer:
             try:
                 method, args, writes = client.conn.recv()
             except (EOFError, OSError):
-                del clients[client.conn]
-                client.conn.close()
+                self._drop(clients, client)
                 return
             if writes:
                 self._writes.append((client, writes))
-            if method is None:
-                pass  # only queued writes, which need no reply
-            elif method == "journal_read":
+            if method == "journal_read":
                 cursors, timeout, limit = args
                 deadline = None if timeout is None else time.monotonic() + timeout
                 client.journal = _JournalWait(cursors, limit, deadline)
-                client.pending = (method, args)
-            else:
+            if method is not None:  # a message with no method needs no reply
                 client.pending = (method, args)
             try:
                 if not client.conn.poll(0):
@@ -343,7 +368,7 @@ class DatabaseServer:
     def _answer(self, clients: dict[Connection, _Client]) -> None:
         """Answer every request. Queued writes have been applied already."""
         readers = []
-        for client in list(clients.values()):
+        for client in clients.values():
             if client.pending is None:
                 continue
             method, args = client.pending
@@ -376,18 +401,25 @@ class DatabaseServer:
     def _answer_journal(self, client: _Client) -> None:
         waiting = client.journal
         assert waiting is not None
-        room = None if waiting.limit is None else waiting.limit - len(waiting.changes)
-        try:
-            changes, waiting.cursors = self._hub.buffer.read(waiting.cursors, 0, room)
-        except Exception as err:
-            self._reply(client, False, err)
-            return
         now = time.monotonic()
-        if changes:
-            waiting.changes.extend(changes)
-            if waiting.ready_at is None:
-                # Wait briefly for more changes, so that one reply carries them all.
-                waiting.ready_at = now + self._linger
+        buffer = self._hub.buffer
+        # Read only when the buffer has changed, or every few seconds. Reading
+        # keeps the cursors, and the buffer's partitions, from expiring.
+        if buffer.seq != waiting.seen or now >= waiting.next_read:
+            waiting.seen, waiting.next_read = buffer.seq, now + 10
+            room = (
+                None if waiting.limit is None else waiting.limit - len(waiting.changes)
+            )
+            try:
+                changes, waiting.cursors = buffer.read(waiting.cursors, 0, room)
+            except Exception as err:
+                self._reply(client, False, err)
+                return
+            if changes:
+                waiting.changes.extend(changes)
+                if waiting.ready_at is None:
+                    # Wait briefly for more changes, so that one reply has them all.
+                    waiting.ready_at = now + self._linger
         full = waiting.limit is not None and len(waiting.changes) >= waiting.limit
         ready = waiting.ready_at is not None and (now >= waiting.ready_at or full)
         expired = waiting.deadline is not None and now >= waiting.deadline
