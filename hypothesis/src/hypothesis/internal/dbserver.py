@@ -30,7 +30,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from multiprocessing.connection import Client, Connection, Listener, wait
+from multiprocessing.connection import Client, Connection, Listener, Pipe, wait
 from typing import Any
 
 from hypothesis.database import (
@@ -170,9 +170,10 @@ class DatabaseServer:
         self._linger = linger
         self._writes: list[tuple[_Client, list[WriteOpT]]] = []
         self._new_conns: queue.Queue[Connection] = queue.Queue()
-        self._wake_recv, self._wake_send = socket.socketpair()
-        self._wake_recv.setblocking(False)
-        self._wake_send.setblocking(False)
+        # A pipe, not a socket, because on Windows wait() reads each object with an
+        # overlapped ReadFile, which a socket handle does not support.
+        self._wake_recv, self._wake_send = Pipe(duplex=False)
+        self._wake_lock = threading.Lock()
         # One selector, so that each pass does not register every connection
         # again. A selector cannot wait for a named pipe, so Windows uses wait().
         self._selector = None if WINDOWS else selectors.DefaultSelector()
@@ -219,10 +220,13 @@ class DatabaseServer:
         self.close()
 
     def _wake(self) -> None:
+        # Two threads wake the loop, and a Connection frames each message, so the
+        # send is locked to keep two frames from interleaving.
         try:
-            self._wake_send.send(b"\0")
+            with self._wake_lock:
+                self._wake_send.send_bytes(b"")
         except OSError:
-            pass  # a wake-up is already pending, or the server is closed
+            pass  # the server is closed
 
     def _interrupt_accept(self) -> None:
         # Closing a listening socket does not interrupt accept(), so connect to it.
@@ -280,8 +284,8 @@ class DatabaseServer:
                 for ready in self._ready(clients):
                     if ready is self._wake_recv:
                         try:
-                            while self._wake_recv.recv(4096):
-                                pass
+                            while self._wake_recv.poll(0):
+                                self._wake_recv.recv_bytes()
                         except OSError:
                             pass
                     elif clients[ready].pending is None:

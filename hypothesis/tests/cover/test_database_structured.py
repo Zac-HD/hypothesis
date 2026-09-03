@@ -593,3 +593,98 @@ def test_remote_database_can_be_pickled(tmp_path):
         db.save(b"k", b"v")
         assert list(db.fetch(b"k")) == [b"v"]
         assert "native" in db.capabilities
+
+
+# These server tests are fast and deterministic, so they run on every platform,
+# including Windows, where the local server uses named pipes instead of sockets.
+# Through the server, unconditional writes are queued and return None, so these
+# read the value back instead of checking the return.
+
+
+def test_server_round_trips_every_operation():
+    with serve_database(InMemoryExampleDatabase()) as server:
+        db = server.client()
+        try:
+            db.map_put(("p", "m"), "f", b"v")
+            assert db.map_get(("p", "m"), "f") == b"v"  # a read sees its own writes
+            assert db.map_items(("p", "m")) == {("f",): b"v"}
+            db.log_append(("p", "log"), b"e")
+            db.flush()
+            ((entry_id, value),) = db.log_range(("p", "log"))
+            assert value == b"e"
+            db.log_trim(("p", "log"), ids=[entry_id])
+            db.flush()
+            assert db.log_range(("p", "log")) == []
+            db.map_delete(("p", "m"), "f")
+            assert db.map_get(("p", "m"), "f") is None
+            assert db.map_put(("p", "m"), "g", b"w", expect=None)  # conditional: a bool
+            db.save(b"legacy", b"member")
+            assert list(db.fetch(b"legacy")) == [b"member"]
+        finally:
+            db.close()
+
+
+def test_server_serves_many_clients_at_once():
+    # Several connections at once exercise the loop's connection handling and the
+    # cross-thread wake, which differ by platform.
+    with serve_database(InMemoryExampleDatabase()) as server:
+        errors = []
+
+        def worker(i):
+            db = server.client()
+            try:
+                for j in range(20):
+                    db.map_put(("index", "m"), (i, j), b"%d-%d" % (i, j))
+                db.flush()
+                assert len(db.map_items(("index", "m"), prefix=(i,))) == 20
+            except Exception as err:  # pragma: no cover
+                errors.append(err)
+            finally:
+                db.close()
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors
+        reader = server.client()
+        try:
+            assert len(reader.map_items(("index", "m"))) == 160
+        finally:
+            reader.close()
+
+
+def test_server_blocking_journal_read_wakes_up():
+    with serve_database(InMemoryExampleDatabase()) as server:
+        db = server.client()
+        writer = server.client()
+        try:
+            cursors = {"p": db.journal_head("p")}
+            timer = threading.Timer(
+                0.2, lambda: (writer.map_put(("p", "m"), "f", b"v"), writer.flush())
+            )
+            timer.start()
+            changes, _ = db.journal_read(cursors, timeout=30)
+            timer.join()
+            assert [(c.op, c.key, c.value) for c in changes] == [
+                ("put", ("p", "m"), b"v")
+            ]
+        finally:
+            db.close()
+            writer.close()
+
+
+def test_server_can_be_closed_and_reused():
+    server = serve_database(InMemoryExampleDatabase())
+    client = server.client()
+    client.save(b"k", b"v")
+    client.close()
+    server.close()
+    server.close()  # idempotent
+    with serve_database(InMemoryExampleDatabase()) as second:
+        reader = second.client()
+        try:
+            assert list(reader.fetch(b"k")) == []
+        finally:
+            reader.close()
