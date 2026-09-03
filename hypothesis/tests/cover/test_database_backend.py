@@ -39,8 +39,12 @@ from hypothesis.database import (
     InMemoryExampleDatabase,
     MultiplexedDatabase,
     ReadOnlyDatabase,
+    ReadThroughDatabase,
+    SQLiteExampleDatabase,
     _db_for_path,
+    _default_database,
     _hash,
+    _network_mount,
     _pack_uleb128,
     _unpack_uleb128,
     choices_from_bytes,
@@ -106,6 +110,84 @@ def test_default_on_disk_database_is_dir(tmp_path):
         assert isinstance(
             ExampleDatabase(tmp_path.joinpath("foo")), DirectoryBasedExampleDatabase
         )
+
+
+@pytest.fixture
+def home_dir(tmp_path, monkeypatch):
+    # A fresh, empty .hypothesis home directory for the default-database tests.
+    monkeypatch.setattr(configuration, "__hypothesis_home_directory", tmp_path / ".h")
+    return tmp_path / ".h"
+
+
+def test_default_database_is_sqlite(home_dir):
+    db = _default_database()
+    try:
+        assert isinstance(db, SQLiteExampleDatabase)
+        db.save(b"key", b"value")
+        assert (home_dir / "examples.sqlite").exists()
+        assert (home_dir / ".gitignore").exists()
+    finally:
+        db.close()
+
+
+def test_default_database_reads_an_existing_directory(home_dir):
+    old = DirectoryBasedExampleDatabase(home_dir / "examples")
+    old.save(b"key", b"saved-before-the-upgrade")
+    old.close()
+    db = _default_database()
+    try:
+        assert isinstance(db, ReadThroughDatabase)
+        # The pre-existing failure is found, and copied into the new SQLite file.
+        assert list(db.fetch(b"key")) == [b"saved-before-the-upgrade"]
+        assert isinstance(db.primary, SQLiteExampleDatabase)
+        assert list(db.primary.fetch(b"key")) == [b"saved-before-the-upgrade"]
+    finally:
+        db.close()
+
+
+def test_default_database_falls_back_on_a_network_filesystem(home_dir, monkeypatch):
+    monkeypatch.setattr("hypothesis.database._on_network_filesystem", lambda path: True)
+    db = _default_database()
+    try:
+        assert isinstance(db, DirectoryBasedExampleDatabase)
+        assert not isinstance(db, SQLiteExampleDatabase)
+    finally:
+        db.close()
+
+
+def test_default_sqlite_database_pickles_as_a_plain_sqlite(home_dir):
+    import pickle
+
+    db = _default_database()
+    try:
+        db.save(b"key", b"value")
+        copy = pickle.loads(pickle.dumps(db))
+        assert type(copy) is SQLiteExampleDatabase
+        assert list(copy.fetch(b"key")) == [b"value"]
+        copy.close()
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "path, network",
+    [
+        ("/home/user/proj/.hypothesis", False),
+        ("/mnt/share/proj/.hypothesis", True),
+        ("/mnt/share", True),
+        ("/mnt/smb dir/proj", True),  # a space in the mount point
+        ("/tmp/proj", False),
+        ("/mnt/proj", False),  # under /, not the deeper nfs mount
+    ],
+)
+def test_network_mount_parsing(path, network):
+    mounts = (
+        "/dev/sda1 / ext4 rw 0 0\n"
+        "tmpfs /tmp tmpfs rw 0 0\n"
+        "server:/export /mnt/share nfs4 rw 0 0\n"
+        "//host/share /mnt/smb\\040dir cifs rw 0 0\n"
+    )
+    assert _network_mount(mounts, Path(path)) is network
 
 
 def test_does_not_error_when_fetching_when_not_exist(tmp_path):

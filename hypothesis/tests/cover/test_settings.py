@@ -282,7 +282,7 @@ ASSERT_DATABASE_PATH = """
 import tempfile
 from hypothesis import settings
 from hypothesis.configuration import set_hypothesis_home_dir
-from hypothesis.database import DirectoryBasedExampleDatabase
+from hypothesis.database import SQLiteExampleDatabase
 
 settings.load_profile("default")
 settings.default.database
@@ -291,7 +291,7 @@ if __name__ == '__main__':
     new_home = tempfile.mkdtemp()
     set_hypothesis_home_dir(new_home)
     db = settings.default.database
-    assert isinstance(db, DirectoryBasedExampleDatabase), db
+    assert isinstance(db, SQLiteExampleDatabase), db
     assert db.path.is_relative_to(new_home), (db.path, new_home)
 """
 

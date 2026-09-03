@@ -413,8 +413,8 @@ use. The journal comes from watchdog, so deletions arrive as `invalidate`.
   microseconds. Within one process, a condition variable wakes readers.
 - Expired rows are filtered on read and deleted every few seconds.
 
-WAL mode does not work on network filesystems, which matters for the choice of a default
-(section 13).
+WAL mode does not work on network filesystems, because it needs shared memory. So SQLite
+is the default only on a local filesystem; see section 7.
 
 ### Redis (6.2 or later)
 
@@ -505,7 +505,7 @@ WAL mode does not work on network filesystems, which matters for the choice of a
 ## 6. The per-machine database server
 
 `hypothesis fuzz` starts a parent process that opens the real backend and serves it on a
-local socket: a Unix socket, or a named pipe on Windows (untested), authenticated with a random key
+local socket: a Unix socket, or a named pipe on Windows, authenticated with a random key
 through `multiprocessing.connection`. Worker processes receive
 `settings.database = RemoteDatabase(address, authkey)`.
 
@@ -534,6 +534,10 @@ How the server works:
   the whole machine, and keeps the changes in memory. Clients read from there.
 - The server issues its own cursors. They name the server instance, so a client that
   outlives a server restart gets `JournalCursorExpired` and reloads.
+- The loop is woken between passes through a pipe, not a socket. On Windows, `wait()` reads
+  each waited object with an overlapped `ReadFile`, which a socket handle does not support,
+  so a socket wake would break the server there. The conformance tests run on Windows in
+  CI, over named pipes, so this is covered.
 - Not yet: caching reads for partitions it already follows, so that a recycled worker
   reloads its corpus from memory.
 
@@ -568,6 +572,27 @@ Reloading a worker takes seconds, with no collection step.
 - Writes stay synchronous. Writing in the background during shrinking is future work.
 - Keys and values do not change, so plain Hypothesis and HypoFuzz still see each other's
   failures.
+
+The default database:
+
+- On a local filesystem, the default is now `SQLiteExampleDatabase` at
+  `.hypothesis/examples.sqlite`, because it reads about twice as fast (section 13).
+- On a network filesystem, the default stays the directory database, because WAL needs
+  local shared memory. Network filesystems are detected on Linux through `/proc/mounts`;
+  elsewhere the check assumes local, so a network filesystem there needs the database set
+  explicitly. A missed one is worse than a false alarm, so the check errs toward local
+  only where it cannot tell.
+- A pre-existing `.hypothesis/examples` directory is still read. The default then wraps the
+  SQLite database in a `ReadThroughDatabase` over the directory, so failures saved before
+  the upgrade are found and copied across as they are read. The directory is never written
+  to again, and can be deleted once its contents are no longer needed.
+- The whole `.hypothesis` directory is gitignored by default, which is the project's
+  recommendation. A user who wants to commit examples deletes that `.gitignore`; for them
+  the directory database, which merges, suits version control better than one SQLite file,
+  and setting the database explicitly keeps it.
+- HypoFuzz makes its own choice. It runs many workers, so it should warn when the store is
+  a poor fit: `"shared" not in db.capabilities` means the store is one machine's, and
+  `SQLiteExampleDatabase` is such a store. The dashboard can surface the same warning.
 
 ## 8. HypoFuzz schema
 
@@ -638,9 +663,12 @@ That flapping is limited to `passing_since`. Users who care should use a namespa
 
 - Loading is one `map_items((T, "corpus"))`, with observations included.
 - Evicting an entry is one `map_delete`.
-- Open question, which does not affect the interface: should values also carry the
-  coverage fingerprint? A new worker could then start mutating at once and replay the corpus
-  gradually, instead of replaying it all before doing useful work.
+- Corpus values do not carry the coverage fingerprint. Carrying it would let a new worker
+  mutate at once and replay the corpus gradually, rather than replay it all first, but it
+  costs storage on every entry, even as a content-addressed link. The same amortized start
+  comes from a worker subscribing to a subset of tests and starting them one at a time, so
+  the fingerprint is not worth the storage. This is a policy in HypoFuzz, and does not
+  affect the interface, so it can change later.
 
 ### 8.5 Reports and history
 
@@ -957,15 +985,20 @@ For HypoFuzz, behind the local server:
 - SQLite's journal works, with a p50 lag of 5 ms. The directory database's journal comes
   from watchdog, whose tests are skipped as flaky.
 
-Status: undecided. For HypoFuzz, the evidence favors SQLite. For plain Hypothesis, the gain
-is real but small, and so are the compatibility costs. This evidence would settle it:
+Decision: SQLite is the default on a local filesystem, for both. The read speed is the main
+reason, and the write speed matters for HypoFuzz. The two compatibility costs are handled
+rather than avoided: a network filesystem falls back to the directory database, and a
+project that commits its examples keeps the directory database by setting it explicitly,
+because the default gitignores `.hypothesis` anyway. Section 7 has the selection rules.
 
-- How many projects commit `.hypothesis/examples` to version control, or keep it on a
-  network filesystem. A code search for committed example directories would give a count.
-- Whether the directory database's many small files cause trouble, such as slow CI caches
-  or inode limits.
-- The time per test on a large real suite, with each backend. The benchmark here is
-  synthetic.
+Residual risks, none blocking:
+
+- Network-filesystem detection is Linux-only, and best-effort even there. On another
+  platform a network share is treated as local, so SQLite may misbehave; the fix is to set
+  the database explicitly. A probe that opened SQLite and checked WAL took effect was
+  considered, but it would not catch a filesystem that accepts WAL and then breaks under
+  concurrency, and it costs a connection on every startup, so it was left out.
+- A large real suite has not been measured, only the synthetic benchmark here.
 
 ### Bugs the benchmarks found
 
@@ -991,16 +1024,27 @@ Not in version 1:
 
 Open questions:
 
-1. Whether corpus values carry fingerprints (section 8.4).
-2. Whether to make SQLite the default, for HypoFuzz and for plain Hypothesis. Section 13
-   has the evidence so far, and what would settle it.
-3. The batching windows in the local server. Three windows of 5 ms give 11 to 25 ms of
-   journal lag. Halving them would halve the lag, and cost some batching.
-4. A faster local transport. `multiprocessing.connection` costs about 100 µs per round
-   trip on the test machine.
-5. Windows. The local server should work with named pipes there, but nothing tests it.
+1. The batching windows in the local server. In steady state, longer delays are fine, and
+   almost all of a campaign's progress happens before steady state, so the windows matter
+   mainly for the startup burst: how fast a new worker loads its corpus, and how soon it
+   sees another worker's first results. That is an empirical trade between delay and lost
+   fuzzing time, best settled by simulating a machine's traffic, not by picking a number
+   here. The windows are tunable (section 11), so the default can change without a code
+   change.
 
 Decided since the first draft:
 
 - `close()` is part of the interface (section 4).
 - Each test's report log is capped, by a tunable control (section 11).
+- Corpus values do not carry the coverage fingerprint (section 8.4).
+- SQLite is the default for plain Hypothesis, on a local filesystem (section 5 and 7).
+- The local server works on Windows, over named pipes. Its wake is a pipe, not a socket,
+  because `wait()` cannot wait on a socket there. The conformance and server tests run on
+  Windows in CI.
+- The local transport stays `multiprocessing.connection`. A raw socket with the same
+  length-prefixed framing is about 25% faster per round trip on the test machine (72 µs
+  against 100 µs), and pickle is only 3 µs of that, so a hand-rolled binary codec would
+  save almost nothing. The gain is not worth reimplementing the authenticated handshake
+  and the Windows named-pipe support that `multiprocessing.connection` provides, especially
+  since reads are already batched and writes are queued, so the round trip matters mostly
+  at startup. If it becomes a bottleneck, the buffered raw socket is the change to make.

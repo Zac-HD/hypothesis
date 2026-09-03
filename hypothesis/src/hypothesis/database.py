@@ -14,6 +14,7 @@ import errno
 import json
 import os
 import random
+import re
 import struct
 import sys
 import tempfile
@@ -1000,6 +1001,107 @@ def _usable_dir(path: StrPathT) -> bool:
         return False
 
 
+# Filesystems where SQLite's write-ahead log does not work, because it needs
+# shared memory. The directory database is used on these instead.
+_NETWORK_FILESYSTEMS = frozenset(
+    {
+        "9p",
+        "afs",
+        "beegfs",
+        "ceph",
+        "cifs",
+        "coda",
+        "davfs",
+        "fhgfs",
+        "fuse.davfs",
+        "fuse.glusterfs",
+        "fuse.sshfs",
+        "fuse.vmhgfs-fuse",
+        "glusterfs",
+        "gpfs",
+        "lustre",
+        "ncpfs",
+        "nfs",
+        "nfs3",
+        "nfs4",
+        "prl_fs",
+        "smb2",
+        "smb3",
+        "smbfs",
+        "vboxsf",
+        "vmhgfs",
+    }
+)
+
+
+def _nearest_existing(path: Path) -> Path:
+    while not path.exists():
+        if path.parent == path:  # the root always exists
+            return path
+        path = path.parent
+    return path
+
+
+def _network_mount(mounts: str, target: Path) -> bool:
+    """Whether ``target``'s deepest mount point in ``mounts`` is a network one.
+
+    ``mounts`` is the content of ``/proc/mounts``, one mount per line, as
+    ``device point fstype options ...``. Its points are absolute and canonical.
+    """
+    best, network = -1, False
+    for line in mounts.splitlines():
+        fields = line.split(" ")
+        if len(fields) < 3:
+            continue
+        # A space in a mount point is written \040, a tab \011, and so on.
+        point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[1])
+        mount = Path(point)
+        if (mount == target or mount in target.parents) and len(mount.parts) > best:
+            best = len(mount.parts)
+            network = fields[2].lower() in _NETWORK_FILESYSTEMS
+    return network
+
+
+def _on_network_filesystem(path: StrPathT) -> bool:
+    """Best-effort: is ``path`` on a filesystem where SQLite's WAL does not work?
+
+    Only Linux is checked, through ``/proc/mounts``. Elsewhere, and on any error,
+    this returns ``False``, so a network filesystem there needs the database set
+    explicitly. It is better to miss one than to send a local database to the slow
+    directory backend by mistake.
+    """
+    try:
+        target = _nearest_existing(Path(path).resolve())
+        mounts = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace")
+    except OSError:  # pragma: no cover
+        return False
+    return _network_mount(mounts, target)
+
+
+def _default_database() -> "ExampleDatabase":
+    # examples/ is the historic directory database. examples.sqlite is the default
+    # now, because it is faster, but it needs a local filesystem.
+    storage_dir = storage_directory("examples", intent_to_write=False)
+    if not _usable_dir(storage_dir.path):  # pragma: no cover
+        warnings.warn(
+            "The database setting is not configured, and the default "
+            "location is unusable - falling back to an in-memory "
+            f"database for this session.  path={storage_dir.path!r}",
+            HypothesisWarning,
+            stacklevel=4,
+        )
+        return InMemoryExampleDatabase()
+    if _on_network_filesystem(storage_dir.path):  # pragma: no cover
+        return _StorageDirectoryDatabase(storage_dir)
+    sqlite = _StorageDirectorySQLite(storage_dir)
+    examples = storage_dir.path
+    if examples.exists() and any(examples.iterdir()):
+        # Read the existing directory database too, and copy each key up as it is
+        # read, so that failures saved before the upgrade are still found.
+        return ReadThroughDatabase(sqlite, _StorageDirectoryDatabase(storage_dir))
+    return sqlite
+
+
 def _db_for_path(
     path: StrPathT | UniqueIdentifier | Literal[":memory:"] | None = None,
 ) -> "ExampleDatabase":
@@ -1010,18 +1112,7 @@ def _db_for_path(
                 "effect.  Configure your database location via a settings profile instead.\n"
                 "https://hypothesis.readthedocs.io/en/latest/settings.html#settings-profiles"
             )
-
-        storage_dir = storage_directory("examples", intent_to_write=False)
-        if not _usable_dir(storage_dir.path):  # pragma: no cover
-            warnings.warn(
-                "The database setting is not configured, and the default "
-                "location is unusable - falling back to an in-memory "
-                f"database for this session.  path={storage_dir.path!r}",
-                HypothesisWarning,
-                stacklevel=3,
-            )
-            return InMemoryExampleDatabase()
-        return _StorageDirectoryDatabase(storage_dir)
+        return _default_database()
     if path in (None, ":memory:"):
         return InMemoryExampleDatabase()
     path = cast(StrPathT, path)
@@ -2890,7 +2981,12 @@ class SQLiteExampleDatabase(_NativeDatabase):
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        self.__init__(**state)  # type: ignore
+        # From __getstate__ (full kwargs) or from a subclass __reduce__ (a few
+        # attributes, after __init__ has run with the path).
+        if "path" in state:
+            self.__init__(**state)  # type: ignore
+        else:
+            self.journal_retention = state["journal_retention"]
 
     @property
     def capabilities(self) -> frozenset[str]:
@@ -3200,6 +3296,29 @@ class SQLiteExampleDatabase(_NativeDatabase):
                 if remaining is None
                 else min(self._poll_interval, remaining)
             )
+
+
+class _StorageDirectorySQLite(SQLiteExampleDatabase):
+    # A SQLite database at .hypothesis/examples.sqlite, which writes the .gitignore
+    # for the storage directory before it creates the file, like the directory
+    # database at .hypothesis/examples does.
+
+    def __init__(self, storage_dir: StorageDirectory) -> None:
+        super().__init__(storage_dir.path.with_name("examples.sqlite"))
+        self._storage_dir = storage_dir
+
+    def _open(self) -> "sqlite3.Connection":
+        self._storage_dir.create_if_missing()
+        return super()._open()
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Unpickles as a plain SQLite database at the same path: a subprocess has
+        # no storage directory to hook, and .hypothesis already exists by then.
+        return (
+            SQLiteExampleDatabase,
+            (self.path,),
+            {"journal_retention": self.journal_retention},
+        )
 
 
 class ReadThroughDatabase(_WrapperDatabase):
