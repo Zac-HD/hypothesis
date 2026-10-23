@@ -12,8 +12,7 @@ import inspect
 import math
 import random
 from collections import defaultdict
-from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
 from types import TracebackType
 from typing import Any, Literal, NoReturn, Optional, Self, overload
 from weakref import WeakKeyDictionary
@@ -109,13 +108,13 @@ def current_build_context() -> "BuildContext":
     return context
 
 
-@contextmanager
-def deprecate_random_in_strategy(fmt: str, *args: Any) -> Generator[None, None, None]:
+def _note_random_use(
+    state_before: object, state_after: object, fmt: str, args: tuple[Any, ...]
+) -> None:
+    if state_after == state_before:
+        return
     from hypothesis.internal import entropy
 
-    state_before = random.getstate()
-    yield
-    state_after = random.getstate()
     if (
         # there is a threading race condition here with deterministic_PRNG. Say
         # we have two threads 1 and 2. We start in global random state A, and
@@ -135,8 +134,8 @@ def deprecate_random_in_strategy(fmt: str, *args: Any) -> Generator[None, None, 
         #
         # To fix this, we track the known random states set by deterministic_PRNG,
         # and will not note a deprecation if it matches one of those.
-        state_after != state_before
-        and hash(state_after) not in entropy._known_random_state_hashes
+        hash(state_after)
+        not in entropy._known_random_state_hashes
     ):
         note_deprecation(
             "Do not use the `random` module inside strategies; instead "
@@ -145,6 +144,28 @@ def deprecate_random_in_strategy(fmt: str, *args: Any) -> Generator[None, None, 
             has_codemod=False,
             stacklevel=1,
         )
+
+
+class deprecate_random_in_strategy:
+    # A class rather than @contextmanager, because this is on the hot path for
+    # every draw and generator-based context managers are much slower.
+    __slots__ = ("args", "fmt", "state_before")
+
+    def __init__(self, fmt: str, *args: Any) -> None:
+        self.fmt = fmt
+        self.args = args
+
+    def __enter__(self) -> None:
+        self.state_before = random.getstate()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if exc_type is None:
+            _note_random_use(self.state_before, random.getstate(), self.fmt, self.args)
 
 
 class BuildContext:
@@ -194,13 +215,18 @@ class BuildContext:
         arg_labels: ArgLabelsT = {}
         kwargs: dict[str, Any] = {}
 
+        # This inlines data.track_arg_label and deprecate_random_in_strategy,
+        # reusing each random state snapshot for the next argument.
+        data = self.data
+        state = random.getstate() if kwarg_strategies else None
         for k, s in kwarg_strategies.items():
-            with (
-                self.data.track_arg_label(k) as arg_label,
-                deprecate_random_in_strategy("from {}={!r}", k, s),
-            ):
-                kwargs[k] = self.data.draw(s, observe_as=f"generate:{k}")
-            arg_labels |= arg_label
+            span_index = data.next_span_index
+            kwargs[k] = data.draw(s, observe_as=f"generate:{k}")
+            new_state = random.getstate()
+            _note_random_use(state, new_state, "from {}={!r}", (k, s))
+            state = new_state
+            data.arg_spans.add(span_index)
+            arg_labels[k] = span_index
 
         return kwargs, arg_labels
 

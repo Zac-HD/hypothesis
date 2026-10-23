@@ -9,8 +9,7 @@
 # obtain one at https://mozilla.org/MPL/2.0/.
 
 import threading
-from collections.abc import Generator
-from contextlib import contextmanager
+from types import TracebackType
 from typing import Generic, TypeVar
 
 T = TypeVar("T")
@@ -29,11 +28,30 @@ class DynamicVariable(Generic[T]):
     def value(self, value: T) -> None:
         self.data.value = value
 
-    @contextmanager
-    def with_value(self, value: T) -> Generator[None, None, None]:
-        old_value = self.value
-        try:
-            self.data.value = value
-            yield
-        finally:
-            self.data.value = old_value
+    def with_value(self, value: T) -> "_WithValue[T]":
+        return _WithValue(self, value)
+
+
+class _WithValue(Generic[T]):
+    # A class rather than @contextmanager, because this is on the hot path for
+    # every test case and generator-based context managers are much slower.
+    __slots__ = ("_old_value", "_value", "_variable")
+
+    def __init__(self, variable: DynamicVariable[T], value: T) -> None:
+        self._variable = variable
+        self._value = value
+
+    def __enter__(self) -> None:
+        self._old_value = self._variable.value
+        self._variable.data.value = self._value
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._variable.data.value = self._old_value
+        # Like a generator-based context manager, we're single-use, and dropping
+        # these references avoids reference cycles (e.g. via BuildContext).
+        del self._old_value, self._value

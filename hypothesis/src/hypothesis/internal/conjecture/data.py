@@ -14,8 +14,7 @@ import time
 import types
 import weakref
 from collections import defaultdict
-from collections.abc import Callable, Generator, Hashable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from functools import cached_property
@@ -1395,8 +1394,7 @@ class ConjectureData:
         in start order, so this also counts the spans started so far."""
         return self.__span_record.span_count
 
-    @contextmanager
-    def track_arg_span(self) -> Generator[int]:
+    def track_arg_span(self) -> "_TrackArgSpan":
         # Record the span opened by the draw inside this block in ``arg_spans``,
         # for the shrinker's explain phase to vary and comment on.
         #
@@ -1404,20 +1402,12 @@ class ConjectureData:
         # objects are only materialized after the test case is completed. (If the
         # draw raises instead, we skip recording, along with the rest of the test
         # case.)
-        span_index = self.next_span_index
-        yield span_index
-        self.arg_spans.add(span_index)
+        return _TrackArgSpan(self)
 
-    @contextmanager
-    def track_arg_label(self, label: str) -> Generator[ArgLabelsT]:
-        arg_labels: ArgLabelsT = {}
-
-        with self.track_arg_span() as span_index:
-            yield arg_labels
-
-        # Mutate the arg_labels dict so that the pretty-printer knows where to
-        # place the which-parts-matter comments later.
-        arg_labels[label] = span_index
+    def track_arg_label(self, label: str) -> "_TrackArgLabel":
+        # Like track_arg_span, but yields a dict which is mutated on exit so that
+        # the pretty-printer knows where to place the which-parts-matter comments.
+        return _TrackArgLabel(self, label)
 
     def start_span(self, label: int) -> None:
         self.provider.span_start(label)
@@ -1556,3 +1546,48 @@ def draw_choice(
 ) -> ChoiceT:
     cd = ConjectureData(random=random)
     return cast(ChoiceT, getattr(cd.provider, f"draw_{choice_type}")(**constraints))
+
+
+# These are classes rather than @contextmanager, because they're on the hot path
+# for every argument and generator-based context managers are much slower.
+class _TrackArgSpan:
+    __slots__ = ("data", "span_index")
+
+    def __init__(self, data: ConjectureData) -> None:
+        self.data = data
+
+    def __enter__(self) -> int:
+        self.span_index = self.data.next_span_index
+        return self.span_index
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        tb: types.TracebackType | None,
+    ) -> None:
+        if exc_type is None:
+            self.data.arg_spans.add(self.span_index)
+
+
+class _TrackArgLabel:
+    __slots__ = ("arg_labels", "data", "label", "span_index")
+
+    def __init__(self, data: ConjectureData, label: str) -> None:
+        self.data = data
+        self.label = label
+
+    def __enter__(self) -> ArgLabelsT:
+        self.span_index = self.data.next_span_index
+        self.arg_labels: ArgLabelsT = {}
+        return self.arg_labels
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        tb: types.TracebackType | None,
+    ) -> None:
+        if exc_type is None:
+            self.data.arg_spans.add(self.span_index)
+            self.arg_labels[self.label] = self.span_index

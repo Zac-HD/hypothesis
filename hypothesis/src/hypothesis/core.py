@@ -26,7 +26,7 @@ import unittest
 import warnings
 import zlib
 from collections import defaultdict
-from collections.abc import Callable, Coroutine, Generator, Hashable, Iterable, Sequence
+from collections.abc import Callable, Coroutine, Hashable, Iterable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from inspect import Parameter
@@ -871,18 +871,28 @@ def _flatten_group(excgroup: BaseExceptionGroup[T]) -> list[T]:
     return found_exceptions
 
 
-@contextlib.contextmanager
-def unwrap_markers_from_group() -> Generator[None, None, None]:
-    try:
-        yield
-    except BaseExceptionGroup as excgroup:
+class unwrap_markers_from_group:
+    # A class rather than @contextmanager, because this is on the hot path for
+    # every test case and generator-based context managers are much slower.
+    # Returning from __exit__ re-raises the original exception unchanged.
+    def __enter__(self) -> None:
+        pass
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        excgroup: BaseException | None,
+        tb: types.TracebackType | None,
+    ) -> None:
+        if not isinstance(excgroup, BaseExceptionGroup):
+            return
         _frozen_exceptions, non_frozen_exceptions = excgroup.split(Frozen)
 
         # group only contains Frozen, reraise the group
         # it doesn't matter what we raise, since any exceptions get disregarded
         # and reraised as StopTest if data got frozen.
         if non_frozen_exceptions is None:
-            raise
+            return
         # in all other cases they are discarded
 
         # Can RewindRecursive end up in this group?
@@ -892,7 +902,7 @@ def unwrap_markers_from_group() -> Generator[None, None, None]:
 
         # this might contain marker exceptions, or internal errors, but not frozen.
         if user_exceptions is not None:
-            raise
+            return
 
         # single marker exception - reraise it
         flattened_non_frozen_exceptions: list[BaseException] = _flatten_group(

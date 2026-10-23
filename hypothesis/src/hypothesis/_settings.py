@@ -14,13 +14,13 @@ Either an explicit settings object can be used or the default object on
 this module can be modified.
 """
 
-import contextlib
 import datetime
 import inspect
 import os
-from collections.abc import Collection, Generator, Sequence
+from collections.abc import Collection, Sequence
 from enum import Enum, EnumMeta, unique
 from functools import total_ordering
+from types import TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -1200,10 +1200,28 @@ class settings(metaclass=settingsMeta):
         return settings._current_profile
 
 
-@contextlib.contextmanager
-def local_settings(s: settings) -> Generator[settings, None, None]:
-    with default_variable.with_value(s):
-        yield s
+class local_settings:
+    """Context manager which makes ``s`` the default settings while active."""
+
+    # A class rather than @contextmanager, because this is on the hot path for
+    # every test case and generator-based context managers are much slower.
+    __slots__ = ("_settings", "_with_value")
+
+    def __init__(self, s: settings) -> None:
+        self._settings = s
+        self._with_value = default_variable.with_value(s)
+
+    def __enter__(self) -> settings:
+        self._with_value.__enter__()
+        return self._settings
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._with_value.__exit__(exc_type, exc_value, tb)
 
 
 default = settings(
